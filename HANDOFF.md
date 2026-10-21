@@ -30,6 +30,48 @@ work:
 - Policy: 0.5.0 loads `/config/policy.json` (add-on config folder); edits
   need a restart, not a rebuild.
 
+## 0b. Next: approved redesign (not started; findings verified 2026-10-21)
+
+The user approved fixing these, in this order:
+1. **Claude reads HA via tools, not a fixed snapshot.** The bot runs a local MCP
+   proxy (127.0.0.1, per-request bearer token) that exposes only allowlisted read
+   tools and forwards them upstream:
+   - ha-mcp: `ha_search`, `ha_get_state`, `ha_get_overview` (without
+     `system_info`), `ha_get_history` (entity_ids, start_time, limit,
+     minimal_response);
+   - built-in HA MCP server: `GetLiveContext`.
+
+   The proxy keeps the read-only upstream check. Claude never gets HA
+   credentials.
+
+   **Verified with Claude Code 2.1.306:** `--safe-mode` silently drops
+   `--mcp-config`. This combination works:
+   `--tools '' --setting-sources '' --disable-slash-commands --mcp-config <json with headers> --strict-mcp-config --allowedTools mcp__ha__<tool>... --permission-mode dontAsk --permission-prompts none`.
+   The broker builds this command with a fixed proxy URL; the bot passes only
+   the token.
+2. **Generic actions.** Policy entries become
+   `{service, entities (exact or domain.*), fields {name: {min,max}|{values}|{type:boolean}}, senders, contexts}`.
+   Allowed domains are a fixed list (light, switch, fan, cover, climate,
+   humidifier, water_heater, media_player, scene, script, input_*, button,
+   vacuum, select, number). Never lock, alarm, camera, notify, HA
+   administration or shell. Claude proposes `{service, entity_id, data}`.
+3. **+ 4. Setup in HA's UI (ingress, port 8099).** Accept connections only
+   from 172.30.32.2 and require a custom header on POST. The UI covers:
+   - registration via the daemon in multi-account mode (`register`
+     `{account, captcha}`, `verify` `{account, verificationCode, pin}`);
+   - people and groups recently seen, with "add" buttons;
+   - safety-number verification (`trust` `{recipient, verifiedSafetyNumber}`);
+   - the policy editor.
+
+   Household settings live in `/data/homebot/settings.json`. Options keep only
+   secrets and connections. Remove `setup_mode` and the policy file. Get the bot
+   ACI from `listAccounts` (`{number, aci}`). Connect the SSE stream with
+   `?account=` once registered.
+5. **Confirm by reply or reaction.** Store the prompt's send timestamp on the
+   approval. Accept a 👍/✅ reaction (`reaction.targetSentTimestamp`,
+   `targetAuthorUuid` = bot), a quoted reply (`quote.id`) saying yes/no, or a
+   bare yes/no when exactly one approval is pending. DM only, fresh only.
+
 ## 1. Objective and scope
 
 Build an inexpensive, self-hosted Home Assistant OS (HAOS, amd64) add-on for a household Signal assistant:
