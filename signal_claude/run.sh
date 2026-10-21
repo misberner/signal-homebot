@@ -104,6 +104,11 @@ case "${SETUP_MODE}" in
       | python3 -u scripts/show_sender_ids.py
     ;;
   inspect)
+    echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+    echo "x86-64 levels: $(/lib64/ld-linux-x86-64.so.2 --help | grep -oE 'x86-64-v[0-9] \(supported' | cut -d' ' -f1 | tr '\n' ' ')"
+    echo -n "Signal crypto library: "
+    as_user signal env -i PATH="$BASE_PATH" HOME=/data/signal java -cp "/opt/signal-cli/lib/*" \
+      /opt/homebot/scripts/LibsignalCheck.java 2>&1 | tail -1
     echo "Signal accounts (registration must be completed first):"
     signal_cli --output=json listAccounts || true
     if [[ -n "${SIGNAL_ACCOUNT}" ]]; then

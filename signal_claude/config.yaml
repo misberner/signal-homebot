@@ -1,6 +1,6 @@
 name: "Signal HomeBot (Claude)"
 description: "Private Signal bot powered by Claude Code and Home Assistant MCP"
-version: "0.5.0"
+version: "0.5.1"
 slug: "signal_claude"
 url: "https://github.com/misberner/signal-homebot"
 arch:
@@ -8,9 +8,9 @@ arch:
 startup: application
 boot: manual
 init: false
-# /config = addon_configs/<slug> on the host: holds the editable policy.json.
+# /config = the app's config folder on the host: holds the editable policy.json.
 map:
-  - type: addon_config
+  - type: app_config
     read_only: false
 # Deliberately NO host port mappings. /notify is internal to the app network.
 options:

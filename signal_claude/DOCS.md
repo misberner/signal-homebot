@@ -1,7 +1,7 @@
 # Installing Signal HomeBot (Claude Code) on Home Assistant OS
 
 This is an **experimental local app**, not a published community app. It
-packages native `signal-cli` 0.14.9, Claude Code CLI 2.1.306, Python 3.13 and
+packages `signal-cli` 0.14.9 (Java build, on Java 25), Claude Code CLI 2.1.306, Python 3.13 and
 the bot inside one amd64 container. It is **read-only by default**. See
 [Test evidence](#test-evidence) for what has and has not been verified.
 
@@ -143,7 +143,7 @@ Writes need **all** of:
 
 1. `allow_writes: true` in the app options.
 2. An entry in `policy.json` in the app's config folder (Samba/File editor:
-   `addon_configs/<id>_signal_claude/policy.json`; created on first start
+   `app_configs/<id>_signal_claude/policy.json`, `addon_configs` on older systems; created on first start
    with no entities; **restart the app** after editing, no rebuild needed):
 
    ```json
@@ -293,7 +293,7 @@ Verified on 2026-10-21 (see CHANGELOG.md):
   `/readonly` alias.
 - signal-cli 0.14.9 source: changed identity keys are rejected on receive
   (`IdentityKeyStore.isTrustedIdentity`); `trust -v` verifies the number.
-- Inside the image, the native `signal-cli` daemon answers `/api/v1/check`,
+- Inside the image, the `signal-cli` daemon answers `/api/v1/check`,
   JSON-RPC `version` and `/api/v1/events` (`text/event-stream`).
 - Claude Code 2.1.306: the exact bot flags return `structured_output`. An
   invalid OAuth token yields `api_error_status: 401`, classified as `auth`,
@@ -305,7 +305,7 @@ Verified on 2026-10-21 (see CHANGELOG.md):
 mentions, `listIdentities`/`listGroups`/`trust` against a real account, the
 HA built-in MCP server live, the bot reaching ha-mcp at `homeassistant:9584`
 from inside the app (standard Supervisor routing, not yet exercised), HA REST
-writes, Supervisor install/backup and the `addon_config` mapping, whether Supervisor's container security options
+writes, Supervisor install/backup and the `app_config` mapping, whether Supervisor's container security options
 permit `setpriv`, n8n, and Claude with a real subscription token inside the
 container. Do the checklist above.
 

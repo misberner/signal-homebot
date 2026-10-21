@@ -2,14 +2,14 @@
 # Base image pinned by digest (node:22-trixie-slim, multi-arch index).
 FROM node:22-trixie-slim@sha256:8eb619e402eaede1748a3c8173bffab391592812e85136452f781741c7242ddf
 
-ARG BUILD_VERSION=0.5.0
+ARG BUILD_VERSION=0.5.1
 ARG BUILD_ARCH=amd64
 LABEL io.hass.version="${BUILD_VERSION}" \
       io.hass.type="app" \
       io.hass.arch="${BUILD_ARCH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-venv curl ca-certificates libatomic1 libstdc++6 util-linux \
+      python3 python3-venv curl ca-certificates util-linux openjdk-25-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
 # One unprivileged user per process (node, uid 1000, comes with the image and
@@ -19,16 +19,20 @@ RUN groupadd --system signal && useradd --system --gid signal --home-dir /data/s
     groupadd --system homebot && useradd --system --gid homebot --home-dir /data/homebot \
       --no-create-home --shell /usr/sbin/nologin homebot
 
-# Upstream x86-64 Linux-native build; no Java runtime needed. The checksum
-# matches the digest GitHub publishes for the v0.14.9 release asset.
+# signal-cli's Java distribution on Debian's Java 25. Not the Linux-native
+# build: that one requires x86-64-v3 CPUs and fails on older HA boxes with
+# "CPU ISA level is lower than required". The checksum matches the digest
+# GitHub publishes for the v0.14.9 release asset.
 ARG SIGNAL_CLI_VERSION=0.14.9
-ARG SIGNAL_CLI_SHA256=a8fab78b5e8053abf3db5725272957ad11d1745b9a16848ddb2ace4743dfa5d5
+ARG SIGNAL_CLI_SHA256=c32b87f587198cbd277c9d71228716ee6047ee2b63e8e88728e8280d9407d65a
 RUN set -eux; \
-    curl -fsSL "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" -o /tmp/signal-cli.tar.gz; \
+    curl -fsSL "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}.tar.gz" -o /tmp/signal-cli.tar.gz; \
     echo "${SIGNAL_CLI_SHA256}  /tmp/signal-cli.tar.gz" | sha256sum -c -; \
-    tar xzf /tmp/signal-cli.tar.gz -C /usr/local/bin/; \
-    chmod 755 /usr/local/bin/signal-cli; \
-    rm /tmp/signal-cli.tar.gz
+    tar xzf /tmp/signal-cli.tar.gz -C /opt; \
+    ln -s "/opt/signal-cli-${SIGNAL_CLI_VERSION}" /opt/signal-cli; \
+    ln -s /opt/signal-cli/bin/signal-cli /usr/local/bin/signal-cli; \
+    rm /tmp/signal-cli.tar.gz; \
+    signal-cli --version
 
 # Pinned: the CLI flags and JSON envelope were verified with this version.
 ARG CLAUDE_CODE_VERSION=2.1.306
@@ -43,6 +47,10 @@ COPY scripts/ /opt/homebot/scripts/
 COPY policy.json /opt/homebot/
 COPY run.sh /run.sh
 RUN chmod 755 /run.sh
+
+# Supervisor builds on the HA box itself, so this exercises libsignal's native
+# code on the CPU that will run it.
+RUN java -cp "/opt/signal-cli/lib/*" scripts/LibsignalCheck.java
 
 # Fail the build if the test suite fails in the exact runtime environment.
 COPY tests/ /opt/homebot/tests/

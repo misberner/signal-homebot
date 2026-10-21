@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.1 — 2026-10-21
+
+### Fixed
+- **signal-cli failed on the first real HA box** with "CPU ISA level is
+  lower than required": the Linux-native build needs an x86-64-v3 CPU. The
+  app now uses signal-cli's Java distribution (same version, checksum
+  verified) on Debian's `openjdk-25-jre-headless`. libsignal's x86_64 library
+  targets baseline x86-64.
+- The image build now loads libsignal and generates a key pair. Supervisor
+  builds on the HA box, so an incompatible CPU fails the install instead of
+  the running bot.
+- `inspect` shows the CPU model, the supported x86-64 levels and the
+  libsignal check.
+- Config folder mapping renamed `addon_config` → `app_config` (current
+  Supervisor name).
+
+### Verified on the HA box (0.5.0 install)
+Supervisor build, the policy file being created in the config folder,
+Claude Code 2.1.306, and `setpriv` user switching under HA's default
+AppArmor profile all work.
+
+
 ## 0.5.0 — 2026-10-21 (closing the 0.4.0 open issues; still not production-verified)
 
 ### Trusted accounts
