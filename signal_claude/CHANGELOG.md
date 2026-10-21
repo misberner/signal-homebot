@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.8.0 — 2026-10-22
+
+### Fixed
+- **Message text in the app log (all earlier versions).** signal-cli printed
+  every received message, including its text, to stdout and therefore the
+  HA app log. The daemon now runs with `--no-receive-stdout`, and a test
+  guards the flag.
+- **Times were UTC.** `run.sh` cleared Supervisor's `TZ`. It is now passed to
+  the bot and Claude, the image includes `tzdata`, and each request states
+  the local date and time.
+- **The bot forgot its own answers.** Sent replies are now part of the
+  history (same retention, disappearing timer and `/reset`).
+- **Unverified people heard nothing,** so their phone never showed a safety
+  number. They now get one short "please verify me" note (rate-limited), and
+  the setup page has **Send hello**.
+- **"Control is not enabled" dead ends.** Claude now still names the entity
+  and service it would use.
+- **Presence and other custom data.** Search guidance now covers attributes
+  and custom integrations (`pyscript.*`, Bermuda `*_area`).
+
+### New
+- **Scheduling:**
+  - Actions with `at` (up to 7 days ahead) are confirmed now and run later,
+    durably in SQLite, re-checked against the policy when due.
+  - A job more than 10 minutes overdue is reported "missed", never run late.
+  - Reminders (no confirmation).
+  - `/scheduled` and `/cancel N`, or ask Claude.
+- **Progress in one message:** "⏳ Looking into it…" is edited as Claude
+  uses tools (Claude Code `stream-json`), then becomes the answer. Also read
+  receipts and a typing indicator.
+- **`/reset`** (`/clear`) forgets a chat's history.
+- **Model choice** (`opus` by default, `fable`, `sonnet`, `haiku`); the model
+  that answered is logged.
+- **Notes for the assistant** in the setup page (trusted, in the system
+  prompt).
+- **Prompt caching:** a fixed working directory (Claude Code puts the cwd
+  into its system prompt) and constant instructions via
+  `--append-system-prompt`. Measured 2.8k instead of 1.1k cached tokens.
+
+
 ## 0.7.0 — 2026-10-22
 
 **Breaking:** setup moved to the new setup page. The old `setup_mode`,

@@ -46,19 +46,27 @@ it.
    by an earlier version is picked up automatically.
 2. **People.** Each person sends the bot any message. They then appear under
    **Recently seen** (only their Signal ID and profile name are kept, never
-   the text). Give them a short lowercase name and click **Add**. Verify
-   their safety number: on their phone, open the chat with the bot → tap its
-   name → **View safety number**, compare it with the number shown, and enter
-   it. Until a person is verified, the bot ignores them (you can switch this
-   off in Settings, but don't).
+   the text). Give them a short lowercase name and click **Add**. Then verify
+   their safety number. Signal shows it only once the bot has written to
+   them: the bot does that by itself when an unverified person messages it,
+   or click **Send hello**. On their phone, open the chat with the bot → tap
+   its name → **View safety number**, compare it with the number shown, and
+   enter it. Until a person is verified, the bot answers them only with that
+   note (you can switch verification off in Settings, but don't).
 3. **Groups (optional).** Add the bot's number to a Signal group and post
    something there. The group appears under **Groups the bot is in**, with its
    members. Add it with a name. The bot answers there when addressed with
    `/ha`, `!ha` or an @-mention, and only while every member is a configured
    person.
 4. **What the bot may change.** Off by default. See [Changes](#changes).
-5. **Settings.** Bot name, request age limit, history retention. **Test Home
-   Assistant** and **Test Claude** check the connections.
+5. **Settings.**
+   - Bot name, request age limit, history retention.
+   - **Claude model:** Opus by default; Fable is the most capable and uses
+     more of your plan.
+   - **Notes for the assistant:** trusted context Claude always gets, e.g.
+     "Room presence: `pyscript.presence_<name>`, attribute `area`" or what
+     your rooms and devices are called.
+   - **Test Home Assistant** and **Test Claude** check the connections.
 
 Each person should also enable **Registration Lock** (Signal → Settings →
 Account), so their number can't be re-registered by someone else.
@@ -117,6 +125,17 @@ Changes need **all** of:
    to reply) or react to it. Questions expire after 2 minutes and work once.
    Nobody else can answer them, and neither can a group.
 
+**Later and on a schedule.** Ask for a time ("turn on the hot water at
+2:45") and the question says "… at Thu 23.10. 02:45". Your yes schedules it,
+for up to 7 days ahead. When it's due, the bot checks the action rules
+again, runs it once and tells you the result. If the bot was offline and the
+time passed by more than 10 minutes, it doesn't run late; it reports
+"missed". Reminders ("remind us at 8 to …") need no confirmation and arrive
+in the chat they were asked in. `/scheduled` lists your pending items and
+`/cancel 12` cancels one (or just ask). Scheduling is done by the bot,
+durably, not by Claude: Claude Code's own scheduling only lives as long as
+one Claude process, and the bot starts a fresh one per message.
+
 Outcomes: **Done**, **did not perform** (HA rejected the call or was
 unreachable), or **UNKNOWN** (timeout, server error, restart mid-call).
 Unknown outcomes are reported and never retried.
@@ -149,17 +168,30 @@ account or devices (an unlocked phone, a linked Signal Desktop).
 - Claude runs for every private message, and for group messages that start
   with `/ha` or `!ha`, mention `@HomeBot`, or @-mention the bot. Other group
   messages are only kept as context.
+- While working, the bot marks your message read, shows "typing…" and posts
+  one "⏳ Looking into it…" message. It updates that message as Claude looks
+  things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.
+- Commands, which never go to Claude:
+  - `/reset` (or `/clear`) forgets this chat's history;
+  - `/scheduled` lists your pending items;
+  - `/cancel N` cancels one.
+
+  In groups, write them with a leading `/` or `/ha`.
 - Each Signal message is processed at most once.
 - A request interrupted by a restart is reported as not completed, not
   re-run.
 - Replies wait in a durable outbox and are retried for up to an hour. A
   retried send can at worst duplicate a text, never an action.
-- Claude gets the last 60 messages of the *same* conversation, labelled with
-  people's names rather than IDs. Group history never reaches a private chat.
+- Claude gets the last 60 messages of the *same* conversation, both sides
+  (its own earlier answers too), labelled with people's names rather than
+  IDs, plus the current local date and time (your HA timezone). Group history
+  never reaches a private chat.
 - "Delete for everyone" removes a message from the archive. Disappearing
   timers are honoured. History is kept for 7 days by default.
-- Each answer starts a fresh Claude process and its tool calls. Expect
-  10–30 seconds on a small CPU.
+- Each answer starts a fresh Claude process (no long-lived Claude
+  session). Its instructions and tools are identical every time, so that part
+  is prompt-cached. Expect roughly 5–30 seconds, depending on how much it
+  needs to look up.
 
 ## Process isolation
 
@@ -230,6 +262,12 @@ Don't run another signal-cli for the same number. If you used the older
 ## Test evidence
 
 Verified on 2026-10-22 (see CHANGELOG.md):
+
+- **0.8.0:** 103 tests pass. A real Claude Code run through the streaming
+  broker delivered a progress event after 2.5 s, used Opus 5.5, and finished
+  in 5.7 s.
+- **Prompt caching (measured):** with a fixed working directory, ~2.8k
+  tokens came from the cache instead of ~1.1k.
 
 - **Image:** the amd64 build succeeds, with signal-cli 0.14.9 (checksum
   matches GitHub's digest), Claude Code 2.1.306, Debian's Java 25 and locked

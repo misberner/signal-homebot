@@ -94,7 +94,15 @@
         <input type="number" id="command_max_age" min="30" max="3600"></div>
       <div><label for="history_days">Keep chat history (days)</label>
         <input type="number" id="history_days" min="1" max="30"></div>
+      <div><label for="model">Claude model</label>
+        <select id="model" style="width:100%;padding:8px;font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:7px">
+          <option value="opus">Opus (default)</option><option value="fable">Fable (most capable, uses more of your plan)</option>
+          <option value="sonnet">Sonnet (faster)</option><option value="haiku">Haiku (fastest)</option></select></div>
     </div>
+    <label for="notes">Notes for the assistant (optional)</label>
+    <textarea id="notes" style="min-height:90px" placeholder="e.g. Room presence: pyscript.presence_&lt;name&gt;, attribute area. Anna is my partner."></textarea>
+    <p class="hint">Context Claude should always know about your home: where data lives, what rooms or
+      devices are called. Trusted: only admins can edit it.</p>
     <label class="checks"><label><input type="checkbox" id="require_verified_identity">
       Only accept people with a verified safety number (recommended)</label></label>
     <div class="row" style="margin-top:12px">
@@ -197,7 +205,10 @@ function renderUsers() {
       el('td', {}, trustBadge(u.trust)),
       el('td', {}, u.safety_number ? el('code', {}, u.safety_number) : el('span', {class: 'muted'}, '—'),
         u.trust && u.trust !== 'TRUSTED_VERIFIED' ? el('div', {class: 'row', style: 'margin-top:6px'}, sn,
-          el('button', {class: 'small', onclick: () => act('trust', {name: u.name, safety_number: sn.value})}, 'Verify')) : ''),
+          el('button', {class: 'small', onclick: () => act('trust', {name: u.name, safety_number: sn.value})}, 'Verify')) : '',
+        u.trust !== 'TRUSTED_VERIFIED' ? el('div', {style: 'margin-top:6px'},
+          el('button', {class: 'small', onclick: () => act('hello', {name: u.name})}, 'Send hello'),
+          el('span', {class: 'muted'}, ' Signal shows the safety number only after the bot has written to them.')) : ''),
       el('td', {}, el('button', {class: 'small', onclick: () => confirm('Remove ' + u.name + '?') && act('users/remove', {name: u.name})}, 'Remove'))));
   }
   const s = document.getElementById('seen');
@@ -294,6 +305,8 @@ function renderSettings() {
   document.getElementById('bot_name').value = state.account.bot_name;
   document.getElementById('command_max_age').value = state.command_max_age;
   document.getElementById('history_days').value = state.history_days;
+  document.getElementById('notes').value = state.notes || '';
+  document.getElementById('model').value = state.model || 'opus';
   document.getElementById('write-token-hint').textContent = state.ha.write_token ? '' :
     'Changes also need an ha_token in the app Configuration tab.';
   const box = document.getElementById('actions');
@@ -309,6 +322,8 @@ async function saveSettings() {
       bot_name: document.getElementById('bot_name').value.trim(),
       command_max_age: Number(document.getElementById('command_max_age').value),
       history_days: Number(document.getElementById('history_days').value),
+      notes: document.getElementById('notes').value,
+      model: document.getElementById('model').value,
     });
     dirty = false; toast('Saved.'); await load();
   } catch (e) { toast(e.message, true); }

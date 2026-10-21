@@ -9,6 +9,7 @@ Security model (see HANDOFF.md section 4):
 """
 from __future__ import annotations
 import json
+import os
 import re
 import sqlite3
 import time
@@ -17,6 +18,9 @@ from pathlib import Path
 
 MAX_TEXT = 4000
 APPROVAL_TTL = 120
+SCHEDULE_MAX_AHEAD = 7 * 86400   # actions/reminders may be scheduled up to a week ahead
+SCHEDULE_GRACE = 600             # a job more than 10 min overdue (bot was down) is skipped, not run late
+REMIND = 'homebot.remind'        # internal "service" for reminders: a message, never an HA call
 OUTBOX_MAX_AGE = 3600
 OUTBOX_MAX_ATTEMPTS = 8
 OBJECT_REPLACEMENT = '￼'  # Signal puts this where an @mention was
@@ -347,7 +351,7 @@ def validate_action(action: object, rules: list[dict]) -> tuple[str, dict]:
     ``rules`` must come from ``permitted()`` for the authenticated sender.
     Returns (service, service_data) where service_data includes entity_id.
     """
-    if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data'}:
+    if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at'}:
         raise Denied('unexpected action fields')
     service, entity_id, data = action.get('service'), action.get('entity_id'), action.get('data') or {}
     if not isinstance(service, str) or not isinstance(entity_id, str) or not isinstance(data, dict):
@@ -364,8 +368,35 @@ def validate_action(action: object, rules: list[dict]) -> tuple[str, dict]:
 
 
 def describe(service: str, data: dict) -> str:
+    if service == REMIND:
+        return f'reminder "{data.get("text", "")}"'
     extra = ', '.join(f'{k}={v}' for k, v in data.items() if k != 'entity_id')
     return f'{service} on {data["entity_id"]}' + (f' ({extra})' if extra else '')
+
+
+def parse_when(value: object, now: float) -> int | None:
+    """Parse an optional local 'YYYY-MM-DDTHH:MM[:SS]' into epoch seconds.
+
+    None/'' means "now". Must lie between 30 s and SCHEDULE_MAX_AHEAD ahead.
+    """
+    if value in (None, ''):
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d\d-\d\d[T ]\d\d:\d\d(:\d\d)?', value):
+        raise Denied('time must look like 2026-10-23T02:45')
+    fmt = '%Y-%m-%dT%H:%M:%S' if value.count(':') == 2 else '%Y-%m-%dT%H:%M'
+    try:
+        when = int(time.mktime(time.strptime(value.replace(' ', 'T'), fmt)))
+    except (ValueError, OverflowError):
+        raise Denied('invalid time') from None
+    if when < now + 30:
+        raise Denied('that time is not in the future')
+    if when > now + SCHEDULE_MAX_AHEAD:
+        raise Denied('can schedule at most 7 days ahead')
+    return when
+
+
+def local_time(epoch: float) -> str:
+    return time.strftime('%a %d.%m. %H:%M', time.localtime(epoch))
 
 
 def describe_rule(rule: dict) -> str:
@@ -393,14 +424,19 @@ def build_schema(rules: list[dict]) -> dict:
             'service': {'type': 'string', 'enum': sorted({r['service'] for r in rules}) or ['none']},
             'entity_id': {'type': 'string'},
             'data': {'type': 'object'},
+            'at': {'type': ['string', 'null']},
         },
         'required': ['service', 'entity_id', 'data'],
         'additionalProperties': False,
     }
     actions = {'type': 'array', 'items': item, 'maxItems': 3 if rules else 0}
+    reminder = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'text': {'type': 'string'}},
+                'required': ['at', 'text'], 'additionalProperties': False}
     return {
         'type': 'object',
-        'properties': {'reply': {'type': 'string'}, 'actions': actions},
+        'properties': {'reply': {'type': 'string'}, 'actions': actions,
+                       'reminders': {'type': 'array', 'items': reminder, 'maxItems': 3},
+                       'cancel': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 5}},
         'required': ['reply', 'actions'],
         'additionalProperties': False,
     }
@@ -482,13 +518,17 @@ def parse_claude_output(stdout: bytes, returncode: int = 0) -> dict:
             raise ClaudeError('unavailable', f'status {status}')
         raise ClaudeError('invalid', f'subtype {envelope.get("subtype")}')
     obj = envelope.get('structured_output')
-    if not isinstance(obj, dict) or set(obj) != {'reply', 'actions'}:
+    if (not isinstance(obj, dict) or not {'reply', 'actions'} <= set(obj)
+            or set(obj) - {'reply', 'actions', 'reminders', 'cancel'}):
         raise ClaudeError('invalid', 'missing structured output')
-    if not isinstance(obj['reply'], str) or not isinstance(obj['actions'], list):
+    obj = {'reminders': [], 'cancel': [], **obj}
+    if (not isinstance(obj['reply'], str) or not isinstance(obj['actions'], list)
+            or not isinstance(obj['reminders'], list) or not isinstance(obj['cancel'], list)):
         raise ClaudeError('invalid', 'output does not match the schema')
-    for action in obj['actions']:
-        if not isinstance(action, dict):
-            raise ClaudeError('invalid', 'actions must be JSON objects')
+    if not all(isinstance(a, dict) for a in obj['actions'] + obj['reminders']):
+        raise ClaudeError('invalid', 'actions and reminders must be JSON objects')
+    if not all(isinstance(n, int) and not isinstance(n, bool) for n in obj['cancel']):
+        raise ClaudeError('invalid', 'cancel must list numbers')
     return obj
 
 
@@ -546,7 +586,9 @@ class Store:
           );
         ''')
         # v3: the confirmation prompt's Signal timestamp, to match replies/reactions.
-        for table, column in (('approvals', 'prompt_ts INTEGER'), ('outbox', 'approval_code TEXT')):
+        for table, column in (('approvals', 'prompt_ts INTEGER'), ('outbox', 'approval_code TEXT'),
+                              ('approvals', 'run_at INTEGER'), ('actions', 'run_at INTEGER'),
+                              ('outbox', 'edit_ts INTEGER')):
             have = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
             if column.split()[0] not in have:
                 self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column}')
@@ -580,11 +622,32 @@ class Store:
                             (msg.conv, msg.sender, msg.timestamp, 'pending', now))
             return True
 
-    def finish_job(self, msg: Incoming, outgoing: list[tuple[str, str]], now: int) -> None:
+    def finish_job(self, msg: Incoming, outgoing: list[tuple[str, str]], now: int,
+                   edit_ts: int | None = None) -> None:
+        """Mark the request done and queue its replies; the first reply to the
+        request's chat replaces the status message ``edit_ts`` if given."""
         with self._tx():
             self.db.execute("UPDATE jobs SET status='done' WHERE conv=? AND sender=? AND timestamp=?",
                             (msg.conv, msg.sender, msg.timestamp))
+            if edit_ts and outgoing and outgoing[0][0] == msg.conv:
+                self._enqueue(outgoing[:1], now, edit_ts=edit_ts)
+                outgoing = outgoing[1:]
             self._enqueue(outgoing, now)
+
+    def add_outgoing(self, conv: str, sender: str, timestamp: int, text: str, settings: Settings = Settings()) -> None:
+        """Remember a reply the bot sent, so Claude sees both sides of the chat.
+        It inherits the chat's disappearing timer (from the latest incoming message)."""
+        row = self.db.execute('SELECT timestamp, expires_at FROM messages WHERE conv=? AND sender!=? '
+                              'ORDER BY timestamp DESC LIMIT 1', (conv, sender)).fetchone()
+        expires = 0
+        if row and row[1] - row[0] // 1000 < settings.history_days * 86400:
+            expires = max(1, row[1] - row[0] // 1000)
+        self.add(Incoming(sender, conv, conv.startswith('group:'), timestamp, text[:MAX_TEXT], expires), settings)
+
+    def clear_conversation(self, conv: str) -> int:
+        """Forget a conversation's stored history (the /reset command)."""
+        with self._tx():
+            return self.db.execute('DELETE FROM messages WHERE conv=?', (conv,)).rowcount
 
     def remote_delete(self, deletion: RemoteDelete) -> bool:
         with self._tx():
@@ -597,16 +660,17 @@ class Store:
                                (conv, sender, timestamp)).fetchone() is not None
 
     def context(self, conv: str, now: int | None = None, labels: dict[str, str] | None = None,
-                limit: int = 60, max_chars: int = 18000) -> str:
+                limit: int = 60, max_chars: int = 18000, exclude: tuple[str, int] | None = None) -> str:
         now = int(time.time()) if now is None else now
         with self._tx():
             self.db.execute('DELETE FROM messages WHERE expires_at <= ?', (now,))
-        rows = self.db.execute('SELECT sender,timestamp,text FROM messages '
-                               'WHERE conv=? AND expires_at > ? ORDER BY timestamp DESC LIMIT ?',
+        rows = self.db.execute("SELECT sender,timestamp,text FROM messages "
+                               "WHERE conv=? AND expires_at > ? AND text != '' ORDER BY timestamp DESC LIMIT ?",
                                (conv, now, limit)).fetchall()
         labels = labels or {}
         lines = [f'[{time.strftime("%Y-%m-%d %H:%M", time.localtime(ms / 1000))}] '
-                 f'{labels.get(sender, sender)}: {body}' for sender, ms, body in reversed(rows)]
+                 f'{labels.get(sender, sender)}: {body}' for sender, ms, body in reversed(rows)
+                 if (sender, ms) != exclude]
         return '\n'.join(lines)[-max_chars:]
 
     # -- SSE cursor -------------------------------------------------------
@@ -623,13 +687,13 @@ class Store:
     # -- approvals and the action journal ---------------------------------
 
     def add_approval(self, code: str, sender: str, request_conv: str, service: str,
-                     data: dict, now: int, prompt: str) -> None:
+                     data: dict, now: int, prompt: str, run_at: int | None = None) -> None:
         """Record a pending approval and queue its private DM atomically."""
         with self._tx():
             self.db.execute('INSERT INTO approvals(code,sender,request_conv,service,data_json,created_at,'
-                            'expires_at,status) VALUES(?,?,?,?,?,?,?,?)',
+                            'expires_at,status,run_at) VALUES(?,?,?,?,?,?,?,?,?)',
                             (code, sender, request_conv, service, json.dumps(data),
-                             now, now + APPROVAL_TTL, 'pending'))
+                             now, now + APPROVAL_TTL, 'pending', run_at))
             self._enqueue([(f'dm:{sender}', prompt)], now, approval_code=code)
 
     PROMPT_AMBIGUOUS = 'ambiguous'
@@ -656,22 +720,67 @@ class Store:
                                   (conv, sender, timestamp, now))
             return cur.rowcount == 1
 
-    def consume_approval(self, code: str, sender: str, now: int) -> tuple[int, str, str, dict] | None:
-        """Single use: atomically mark consumed and journal the action as executing.
+    def consume_approval(self, code: str, sender: str, now: int) -> tuple[int, str, str, dict, int | None] | None:
+        """Single use: atomically mark consumed and journal the action as
+        executing (or scheduled, if it has a run time).
 
-        Returns (action_id, request_conv, service, data) or None.
+        Returns (action_id, request_conv, service, data, run_at) or None.
         """
         with self._tx():
-            row = self.db.execute("SELECT request_conv,service,data_json FROM approvals "
+            row = self.db.execute("SELECT request_conv,service,data_json,run_at FROM approvals "
                                   "WHERE code=? AND sender=? AND status='pending' AND expires_at>?",
                                   (code, sender, now)).fetchone()
             if not row:
                 return None
             self.db.execute("UPDATE approvals SET status='consumed' WHERE code=?", (code,))
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,"
-                                  "data_json,status,created_at) VALUES(?,?,?,?,?,'executing',?)",
-                                  (code, sender, row[0], row[1], row[2], now))
-            return cur.lastrowid, row[0], row[1], json.loads(row[2])
+                                  "data_json,status,created_at,run_at) VALUES(?,?,?,?,?,?,?,?)",
+                                  (code, sender, row[0], row[1], row[2],
+                                   'scheduled' if row[3] else 'executing', now, row[3]))
+            return cur.lastrowid, row[0], row[1], json.loads(row[2]), row[3]
+
+    def add_scheduled(self, sender: str, request_conv: str, service: str, data: dict,
+                      run_at: int, now: int) -> int:
+        """A job that needs no confirmation (reminders)."""
+        with self._tx():
+            cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
+                                  "status,created_at,run_at) VALUES(?,?,?,?,?,'scheduled',?,?)",
+                                  (f'job-{now}-{os.urandom(6).hex()}', sender, request_conv, service,
+                                   json.dumps(data), now, run_at))
+            return cur.lastrowid
+
+    def scheduled(self, sender: str | None = None) -> list[tuple[int, str, str, str, dict, int]]:
+        """Pending jobs (all, or one sender's): (id, sender, request_conv, service, data, run_at)."""
+        query = "SELECT id,sender,request_conv,service,data_json,run_at FROM actions WHERE status='scheduled'"
+        rows = self.db.execute(query + (' AND sender=?' if sender else '') + ' ORDER BY run_at',
+                               (sender,) if sender else ()).fetchall()
+        return [(i, s, c, svc, json.loads(d), r) for i, s, c, svc, d, r in rows]
+
+    def due_scheduled(self, now: int) -> list[tuple[int, str, str, str, dict, int]]:
+        return [job for job in self.scheduled() if job[5] <= now]
+
+    def start_scheduled(self, action_id: int) -> bool:
+        """Claim a due job exactly once (scheduled -> executing)."""
+        with self._tx():
+            return self.db.execute("UPDATE actions SET status='executing' WHERE id=? AND status='scheduled'",
+                                   (action_id,)).rowcount == 1
+
+    def end_scheduled(self, action_id: int, status: str, detail: str,
+                      outgoing: list[tuple[str, str]], now: int) -> bool:
+        """Cancel or mark missed (only while still scheduled)."""
+        assert status in ('cancelled', 'missed')
+        with self._tx():
+            ok = self.db.execute("UPDATE actions SET status=?, detail=?, finished_at=? "
+                                 "WHERE id=? AND status='scheduled'", (status, detail, now, action_id)).rowcount == 1
+            if ok:
+                self._enqueue(outgoing, now)
+            return ok
+
+    def cancel_scheduled(self, action_id: int, sender: str, now: int) -> bool:
+        with self._tx():
+            return self.db.execute("UPDATE actions SET status='cancelled', detail='cancelled by user', "
+                                   "finished_at=? WHERE id=? AND sender=? AND status='scheduled'",
+                                   (now, action_id, sender)).rowcount == 1
 
     def cancel_approval(self, code: str, sender: str) -> bool:
         with self._tx():
@@ -681,7 +790,7 @@ class Store:
 
     def finish_action(self, action_id: int, status: str, detail: str,
                       outgoing: list[tuple[str, str]], now: int) -> None:
-        assert status in ('succeeded', 'failed', 'unknown')
+        assert status in ('succeeded', 'failed', 'unknown', 'scheduled')
         with self._tx():
             self.db.execute('UPDATE actions SET status=?, detail=?, finished_at=? WHERE id=?',
                             (status, detail[:200], now, action_id))
@@ -722,16 +831,23 @@ class Store:
         with self._tx():
             self._enqueue(outgoing, now)
 
-    def _enqueue(self, outgoing: list[tuple[str, str]], now: int, approval_code: str | None = None) -> None:
+    def _enqueue(self, outgoing: list[tuple[str, str]], now: int, approval_code: str | None = None,
+                 edit_ts: int | None = None) -> None:
         for dest, text in outgoing:
             if text.strip():
-                self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt,approval_code) '
-                                'VALUES(?,?,?,?,?)', (dest, text[:MAX_TEXT], now, now, approval_code))
+                self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt,approval_code,edit_ts) '
+                                'VALUES(?,?,?,?,?,?)', (dest, text[:MAX_TEXT], now, now, approval_code, edit_ts))
 
-    def due_outbox(self, now: int, limit: int = 20) -> list[tuple[int, str, str, int, int]]:
-        return self.db.execute("SELECT id,dest,text,attempts,created_at FROM outbox "
+    def due_outbox(self, now: int, limit: int = 20) -> list[tuple[int, str, str, int, int, int | None]]:
+        """(id, dest, text, attempts, created_at, edit_ts) of messages due to be sent."""
+        return self.db.execute("SELECT id,dest,text,attempts,created_at,edit_ts FROM outbox "
                                "WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT ?",
                                (now, limit)).fetchall()
+
+    def outbox_unedit(self, item_id: int) -> None:
+        """Editing the status message failed: send the text as a new message."""
+        with self._tx():
+            self.db.execute('UPDATE outbox SET edit_ts=NULL WHERE id=?', (item_id,))
 
     def next_outbox_time(self) -> int | None:
         row = self.db.execute("SELECT MIN(next_attempt) FROM outbox WHERE status='pending'").fetchone()

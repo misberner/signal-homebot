@@ -71,6 +71,9 @@ class FakeSignalDaemon:
         self.group_members = [BOT, USER1, USER2]
         self.pending_members: list[str] = []
         self.rpc_methods: list[str] = []
+        self.indicators: list[tuple[str, dict]] = []
+        self.reject_edits = False
+        self.edits: list[tuple[int, str]] = []
         self.runner: web.AppRunner | None = None
         self.url = ''
 
@@ -123,6 +126,9 @@ class FakeSignalDaemon:
                         'safetyNumber': ' '.join(sn[i:i + 5] for i in range(0, 60, 5)),
                         'scannableSafetyNumber': None, 'trustLevel': self.identities[aci],
                         'addedTimestamp': 1}] if aci in self.identities else [])
+        if method in ('sendTyping', 'sendReceipt'):
+            self.indicators.append((method, params))
+            return ok({})
         if method == 'listAccounts':  # ListAccountsCommand JsonAccount(number, aci)
             return ok(self.accounts)
         if method == 'register':  # RegistrationParams(voice, captcha, ...)
@@ -159,7 +165,16 @@ class FakeSignalDaemon:
             self.rpc_failures -= 1
             return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
                                       'error': {'code': -5, 'message': 'Failed to send message due to rate limiting'}})
-        self.next_ts += 1
+        self.next_ts = max(self.next_ts + 1, int(time.time() * 1000))
+        edit_of = body['params'].get('editTimestamp')
+        if edit_of is not None:  # like a phone: show the edited text in place of the original
+            original = next((m for m in self.sent if m['_ts'] == edit_of), None)
+            if original is None or self.reject_edits:
+                return error('Failed to send message: edit target not found')
+            self.edits.append((edit_of, body['params']['message']))
+            original['message'] = body['params']['message']
+            original['_edits'] = original.get('_edits', 0) + 1
+            return ok({'timestamp': self.next_ts, 'results': [{'type': 'SUCCESS'}]})
         self.sent.append({**body['params'], '_ts': self.next_ts})
         recipients = body['params'].get('recipient') or [USER1, USER2]
         return ok({'timestamp': self.next_ts,
@@ -425,8 +440,20 @@ if mode == 'garbage':
 out = dict(spec.get('output', {{'reply': 'ok', 'actions': []}}))
 if tool_text is not None:
     out['reply'] = tool_text
+stream = '--output-format' in argv and argv[argv.index('--output-format') + 1] == 'stream-json'
+if stream:
+    print(json.dumps({{'type': 'system', 'subtype': 'init'}}))
+    if spec.get('call_tool'):
+        print(json.dumps({{'type': 'assistant', 'message': {{'content': [{{
+            'type': 'tool_use', 'name': 'mcp__ha__' + spec['call_tool']['name'],
+            'input': spec['call_tool']['args']}}]}}}}))
+    for name in spec.get('progress', []):
+        print(json.dumps({{'type': 'assistant', 'message': {{'content': [{{
+            'type': 'tool_use', 'name': name, 'input': {{'query': 'presence'}}}}]}}}}), flush=True)
+        time.sleep(spec.get('progress_delay', 0))
 print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 2,
-                  'result': json.dumps(out), 'structured_output': out, 'api_error_status': None}}))
+                  'result': json.dumps(out), 'structured_output': out, 'api_error_status': None,
+                  'modelUsage': {{'claude-opus-5-5': {{}}}}}}))
 '''
 
 
@@ -434,14 +461,15 @@ class FakeClaude:
     def __init__(self, directory: Path):
         self.spec = directory / 'claude_spec.json'
         self.record = directory / 'claude_calls.jsonl'
-        self.path = directory / 'claude'
+        self.path = directory / 'fake-claude'
         self.path.write_text(FAKE_CLAUDE.format(python=sys.executable, spec=str(self.spec),
                                                 record=str(self.record)))
         self.path.chmod(self.path.stat().st_mode | stat.S_IEXEC)
         self.set()
 
-    def set(self, reply='ok', actions=(), mode='ok', call_tool=None):
-        self.spec.write_text(json.dumps({'mode': mode, 'call_tool': call_tool,
+    def set(self, reply='ok', actions=(), mode='ok', call_tool=None, progress=(), progress_delay=0):
+        self.spec.write_text(json.dumps({'mode': mode, 'call_tool': call_tool, 'progress': list(progress),
+                                         'progress_delay': progress_delay,
                                          'output': {'reply': reply, 'actions': list(actions)}}))
 
     @property

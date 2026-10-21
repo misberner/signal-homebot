@@ -36,7 +36,7 @@ def make_app(bot) -> web.Application:
     app.router.add_get('/', lambda _: web.FileResponse(INDEX, headers={'Cache-Control': 'no-store'}))
     app.router.add_get('/api/state', ui.state)
     for name in ('register', 'verify', 'users/add', 'users/remove', 'groups/add', 'groups/remove',
-                 'trust', 'settings', 'test'):
+                 'trust', 'hello', 'settings', 'test'):
         app.router.add_post(f'/api/{name}', getattr(ui, name.replace('/', '_')))
     return app
 
@@ -120,6 +120,8 @@ class SetupApi:
             'require_verified_identity': house.require_verified_identity,
             'command_max_age': house.command_max_age,
             'history_days': house.history_days,
+            'notes': house.notes,
+            'model': house.model,
             'ha': {'kind': bot.cfg.mcp_kind, 'write_token': bool(bot.cfg.ha_token)},
             'claude_configured': bot.cfg.claude_configured,
         })
@@ -200,6 +202,18 @@ class SetupApi:
         await self.rpc('trust', {'recipient': aci, 'verifiedSafetyNumber': number})
         return web.json_response({'ok': True, 'message': f'{name} is verified.'})
 
+    async def hello(self, request: web.Request) -> web.Response:
+        """Message a person so their phone shows the bot's safety number."""
+        name = text(await body(request), 'name')
+        aci = self.bot.house.users.get(name)
+        if not aci:
+            raise HouseholdError('Unknown user')
+        if not self.bot.house.signal_account:
+            raise HouseholdError('Register the bot first')
+        self.bot.enqueue((f'dm:{aci}', self.bot.verify_note()))
+        return web.json_response({'ok': True, 'message': f'Sent a message to {name}. Their phone now shows '
+                                                         'the safety number in the chat with the bot.'})
+
     # ---------------------------------------------------------------- settings and tests
 
     async def settings(self, request: web.Request) -> web.Response:
@@ -207,7 +221,8 @@ class SetupApi:
         house = self.bot.house
         changes = {}
         for key, typ in (('bot_name', str), ('allow_writes', bool), ('require_verified_identity', bool),
-                         ('command_max_age', int), ('history_days', int), ('actions', list)):
+                         ('command_max_age', int), ('history_days', int), ('actions', list), ('notes', str),
+                         ('model', str)):
             if key in data:
                 value = data[key]
                 if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):

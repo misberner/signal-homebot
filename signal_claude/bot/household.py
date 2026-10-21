@@ -16,6 +16,7 @@ from .core import NAME_RE, Settings, load_policy
 
 ACI_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 PHONE_RE = r'\+[1-9][0-9]{6,14}'
+MODELS = ('opus', 'fable', 'sonnet', 'haiku')  # Claude Code aliases for the latest models
 
 
 class HouseholdError(ValueError):
@@ -35,6 +36,8 @@ class Household:
     require_verified_identity: bool = True
     command_max_age: int = 300
     history_days: int = 7
+    notes: str = ''  # admin-written hints for Claude (trusted), e.g. where presence data lives
+    model: str = 'opus'  # Claude Code model alias
 
     @property
     def policy(self) -> list[dict]:
@@ -84,6 +87,10 @@ class Household:
         unknown = sorted({u for rule in policy for u in rule['senders']} - set(self.users))
         if unknown:
             raise HouseholdError(f'Actions name unknown users: {", ".join(unknown)}')
+        if self.model not in MODELS:
+            raise HouseholdError(f'Model must be one of {", ".join(MODELS)}')
+        if len(self.notes) > 4000:
+            raise HouseholdError('Notes: at most 4000 characters')
         if not 30 <= self.command_max_age <= 3600 or not 1 <= self.history_days <= 30:
             raise HouseholdError('Request age must be 30-3600 s and history 1-30 days')
 
@@ -100,7 +107,8 @@ class Household:
             raise HouseholdError(str(err)) from None
         types = {'signal_account': str, 'pending_account': str, 'bot_aci': str, 'bot_name': str,
                  'users': dict, 'groups': dict, 'actions': list, 'allow_writes': bool,
-                 'require_verified_identity': bool, 'command_max_age': int, 'history_days': int}
+                 'require_verified_identity': bool, 'command_max_age': int, 'history_days': int,
+                 'notes': str, 'model': str}
         for key, typ in types.items():
             value = getattr(house, key)
             if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):

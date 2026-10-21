@@ -14,6 +14,8 @@ cd /opt/homebot
 eval "$(python3 scripts/options_to_env.py)"
 
 BASE_PATH="/opt/homebot/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+# Supervisor sets TZ to Home Assistant's timezone; keep it across `env -i`.
+TZ="${TZ:-UTC}"
 CLAUDE_SOCKET=/run/homebot-claude/claude.sock
 
 # Replace the current (sub)shell with "$@" running as a user with no
@@ -55,9 +57,11 @@ cleanup() {
 trap cleanup EXIT TERM INT
 
 # Multi-account mode: the setup page registers the number through the daemon.
+# --no-receive-stdout: signal-cli otherwise prints every received message,
+# including its text, into the app log.
 echo "Starting Signal daemon"
 run_as signal env -i PATH="$BASE_PATH" HOME=/data/signal LANG=C.UTF-8 \
-  signal-cli --config /data/signal daemon --http=127.0.0.1:7583 &
+  signal-cli --config /data/signal daemon --http=127.0.0.1:7583 --no-receive-stdout &
 sig_pid=$!
 for n in $(seq 1 90); do
   if curl -fsS http://127.0.0.1:7583/api/v1/check >/dev/null 2>&1; then break; fi
@@ -69,7 +73,7 @@ curl -fsS http://127.0.0.1:7583/api/v1/check >/dev/null
 broker_pid=''
 if [[ -n "${CLAUDE_OAUTH_TOKEN}" ]]; then
   echo 'Starting Claude broker'
-  run_as node env -i PATH="$BASE_PATH" HOME=/data/claude LANG=C.UTF-8 PYTHONUNBUFFERED=1 \
+  run_as node env -i PATH="$BASE_PATH" HOME=/data/claude LANG=C.UTF-8 TZ="$TZ" PYTHONUNBUFFERED=1 \
     CLAUDE_HOME=/data/claude CLAUDE_SOCKET="$CLAUDE_SOCKET" BROKER_ALLOWED_UID="$(id -u homebot)" \
     CLAUDE_MCP_URL=http://127.0.0.1:8765/mcp \
     CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_OAUTH_TOKEN}" python3 -m bot.claude_broker &
@@ -81,7 +85,7 @@ else
 fi
 
 echo 'Starting HomeBot (setup page: Open Web UI)'
-run_as homebot env -i PATH="$BASE_PATH" HOME=/data/homebot LANG=C.UTF-8 PYTHONUNBUFFERED=1 \
+run_as homebot env -i PATH="$BASE_PATH" HOME=/data/homebot LANG=C.UTF-8 TZ="$TZ" PYTHONUNBUFFERED=1 \
   SIGNAL_DAEMON_URL=http://127.0.0.1:7583 \
   HA_BASE_URL="${HA_BASE_URL}" HA_MCP_URL="${HA_MCP_URL}" HA_MCP_KIND="${HA_MCP_KIND}" \
   HA_MCP_DOMAINS="${HA_MCP_DOMAINS}" HA_TOKEN="${HA_TOKEN}" NOTIFY_TOKEN="${NOTIFY_TOKEN}" \

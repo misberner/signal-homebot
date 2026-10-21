@@ -3,7 +3,9 @@
 Runs as the unprivileged ``node`` user and owns the subscription OAuth token;
 the bot (``homebot`` user) never holds it and needs no privileges to switch
 users. The bot sends one JSON line ``{"prompt": str, "schema": object}`` over a
-Unix socket and receives ``{"returncode": int, "stdout": str}`` or
+Unix socket. While Claude works, the broker sends progress lines
+``{"progress": {"tool": name, "detail": str}}`` (one per allowed tool call);
+the last line is ``{"returncode": int, "stdout": <final result JSON>}`` or
 ``{"error": "timeout" | "bad_request" | "busy" | "spawn"}``. Optionally the
 request carries ``mcp_token`` and ``tools``: Claude then gets exactly those
 read tools of the bot's local Home Assistant proxy (``CLAUDE_MCP_URL``).
@@ -18,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -34,8 +37,11 @@ TOOL_RE = r'[a-z_]{1,40}'
 TOKEN_RE = r'[A-Za-z0-9_-]{20,64}'
 
 
+MODELS = ('opus', 'fable', 'sonnet', 'haiku')
+
+
 def claude_command(claude_bin: str, schema: dict, mcp_config: str | None = None,
-                   tools: list[str] = ()) -> list[str]:
+                   tools: list[str] = (), system: str = '', model: str = '') -> list[str]:
     """Verified with Claude Code 2.1.306. --tools '' removes every built-in tool
     (shell, files, web); --setting-sources '' loads no user/project settings
     (hooks, permissions, MCP servers); --strict-mcp-config limits MCP servers
@@ -45,9 +51,29 @@ def claude_command(claude_bin: str, schema: dict, mcp_config: str | None = None,
            '--strict-mcp-config']
     if mcp_config and tools:
         cmd += ['--mcp-config', mcp_config, '--allowedTools', ','.join(f'mcp__ha__{t}' for t in tools)]
+    if system:
+        cmd += ['--append-system-prompt', system]
+    if model:
+        cmd += ['--model', model]
+    # stream-json (needs --verbose) reports tool calls as they happen; its final
+    # "result" event is the same envelope as --output-format json.
     return cmd + ['--permission-mode', 'dontAsk', '--permission-prompts', 'none',
                   '--no-session-persistence', '--max-turns', '12',
-                  '--output-format', 'json', '--json-schema', json.dumps(schema)]
+                  '--output-format', 'stream-json', '--verbose', '--json-schema', json.dumps(schema)]
+
+
+def progress_detail(args: object) -> str:
+    """A short, plain summary of a tool call's arguments for the status message."""
+    if not isinstance(args, dict):
+        return ''
+    for key in ('query', 'entity_ids', 'domains'):
+        value = args.get(key)
+        if isinstance(value, list) and value:
+            first = str(value[0])[:40]
+            return first if len(value) == 1 else f'{first} +{len(value) - 1}'
+        if isinstance(value, str) and value:
+            return value[:40]
+    return ''
 
 
 @dataclass
@@ -67,7 +93,7 @@ class Broker:
     def env(self) -> dict[str, str]:
         # Built from scratch: never ANTHROPIC_API_KEY (usage billing) or any
         # other inherited secret.
-        env = {key: os.environ[key] for key in ('PATH', 'LANG', 'SSL_CERT_FILE') if key in os.environ}
+        env = {key: os.environ[key] for key in ('PATH', 'LANG', 'TZ', 'SSL_CERT_FILE') if key in os.environ}
         env.update({
             'HOME': self.claude_home,
             'CLAUDE_CONFIG_DIR': f'{self.claude_home}/config',
@@ -102,8 +128,12 @@ class Broker:
             if self.busy.locked():
                 return await self.reply(writer, {'error': 'busy'})
             async with self.busy:
+                async def progress(event: dict) -> None:
+                    await self.reply(writer, {'progress': event})
                 await self.reply(writer, await self.run(request['prompt'], request['schema'],
-                                                        request.get('mcp_token'), request.get('tools') or []))
+                                                        request.get('mcp_token'), request.get('tools') or [],
+                                                        request.get('system', ''), request.get('model', ''),
+                                                        progress))
         except (ConnectionError, OSError):
             pass
         finally:
@@ -112,10 +142,15 @@ class Broker:
     def valid_request(self, request: object) -> bool:
         import re
         if (not isinstance(request, dict) or not {'prompt', 'schema'} <= set(request)
-                or set(request) - {'prompt', 'schema', 'mcp_token', 'tools'}):
+                or set(request) - {'prompt', 'schema', 'mcp_token', 'tools', 'system', 'model'}):
             return False
         if (not isinstance(request['prompt'], str) or len(request['prompt']) > MAX_PROMPT
                 or not isinstance(request['schema'], dict)):
+            return False
+        system = request.get('system', '')
+        if not isinstance(system, str) or len(system) > 20_000:
+            return False
+        if request.get('model', '') not in ('', *MODELS):
             return False
         token, tools = request.get('mcp_token'), request.get('tools')
         if token is not None and (not isinstance(token, str) or not re.fullmatch(TOKEN_RE, token)):
@@ -126,34 +161,71 @@ class Broker:
         return True
 
     async def run(self, prompt: str, schema: dict, mcp_token: str | None = None,
-                  tools: list[str] = ()) -> dict:
-        with tempfile.TemporaryDirectory(prefix='homebot-claude-') as work:
-            env = {**self.env(), 'TMPDIR': work}
+                  tools: list[str] = (), system: str = '', model: str = '', progress=None) -> dict:
+        # A fixed, emptied working directory: Claude Code puts the cwd into its
+        # system prompt, so a random one per request defeats prompt caching
+        # (measured: 1.1k vs 2.8k cached tokens). Requests are serialized.
+        work = os.path.join(self.claude_home, 'work')
+        try:
+            shutil.rmtree(work, ignore_errors=True)
+            os.makedirs(work, mode=0o700)
+        except OSError as err:
+            LOG.error('Cannot prepare the work directory: %s', type(err).__name__)
+            return {'error': 'spawn'}
+        with tempfile.TemporaryDirectory(prefix='homebot-mcp-') as private:
+            env = {**self.env(), 'TMPDIR': private}
             mcp_config = None
             if mcp_token and tools:
-                # A file in the private work dir, not argv: argv is visible to
-                # every user in the container.
-                mcp_config = os.path.join(work, 'mcp.json')
+                # A private file, not argv: argv is visible to every user in the container.
+                mcp_config = os.path.join(private, 'mcp.json')
                 with open(mcp_config, 'w') as f:
                     json.dump({'mcpServers': {'ha': {
                         'type': 'http', 'url': self.mcp_url,
                         'headers': {'Authorization': f'Bearer {mcp_token}'}}}}, f)
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *claude_command(self.claude_bin, schema, mcp_config, tools), cwd=work, env=env,
+                    *claude_command(self.claude_bin, schema, mcp_config, tools, system, model), cwd=work, env=env,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL)
             except OSError as err:
                 LOG.error('Cannot start Claude: %s', type(err).__name__)
                 return {'error': 'spawn'}
             try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout=self.timeout)
+                result = await asyncio.wait_for(self.collect(proc, prompt, set(tools), progress),
+                                                timeout=self.timeout)
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.communicate()
                 return {'error': 'timeout'}
-            return {'returncode': proc.returncode,
-                    'stdout': stdout[:MAX_OUTPUT].decode('utf-8', errors='replace')}
+            return {'returncode': proc.returncode, 'stdout': result}
+
+    async def collect(self, proc, prompt: str, tools: set[str], progress) -> str:
+        """Feed the prompt, relay allowed tool calls as progress, return the
+        final "result" event (or '' if Claude produced none)."""
+        proc.stdin.write(prompt.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+        result, read = '', 0
+        while line := await proc.stdout.readline():
+            read += len(line)
+            if read > 4 * MAX_OUTPUT:
+                break
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get('type') == 'result':
+                result = line[:MAX_OUTPUT].decode('utf-8', errors='replace')
+            elif event.get('type') == 'assistant' and progress is not None:
+                for block in (event.get('message') or {}).get('content') or []:
+                    name = str(block.get('name', '')) if isinstance(block, dict) else ''
+                    if block.get('type') == 'tool_use' and name.removeprefix('mcp__ha__') in tools:
+                        await progress({'tool': name.removeprefix('mcp__ha__'),
+                                        'detail': progress_detail(block.get('input'))})
+        await proc.wait()
+        return result
 
     @staticmethod
     async def reply(writer: asyncio.StreamWriter, obj: dict) -> None:

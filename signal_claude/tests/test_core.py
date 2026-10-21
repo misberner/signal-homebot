@@ -239,7 +239,7 @@ class HouseholdTests(unittest.TestCase):
                        {'signal_account': '015112345678'}, {'bot_name': 'Home Bot!'},
                        {'actions': [{'service': 'light.turn_on', 'entities': ['light.x'], 'senders': ['anna']}]},
                        {'actions': [{'service': 'lock.unlock', 'entities': ['lock.x']}]},
-                       {'command_max_age': 5}, {'history_days': 99}):
+                       {'command_max_age': 5}, {'history_days': 99}, {'notes': 'x' * 4001}, {'model': 'gpt'}):
             with self.assertRaises(HouseholdError, msg=change):
                 base.change(**change)
 
@@ -310,6 +310,29 @@ class OverviewTests(unittest.TestCase):
                 render_overview(bad)
 
 
+def run_script() -> str:
+    """run.sh from the repository, or /run.sh inside the image."""
+    for path in (Path(__file__).parent.parent / 'run.sh', Path('/run.sh')):
+        if path.exists():
+            return path.read_text()
+    raise FileNotFoundError('run.sh')
+
+
+class StartupScriptTests(unittest.TestCase):
+    def test_signal_daemon_never_logs_messages(self):
+        script = run_script()
+        daemon_lines = [line for line in script.splitlines() if ' daemon ' in line and 'signal-cli' in line]
+        self.assertTrue(daemon_lines)
+        for line in daemon_lines:
+            self.assertIn('--no-receive-stdout', line)
+
+    def test_timezone_reaches_bot_and_claude(self):
+        script = run_script()
+        for marker in ('python3 -m bot.claude_broker', 'python3 -m bot.server'):
+            block = script[:script.index(marker)].rsplit('run_as ', 1)[1]
+            self.assertIn('TZ="$TZ"', block, marker)
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -351,7 +374,8 @@ class StoreTests(unittest.TestCase):
         data = {'entity_id': 'light.test_lamp'}
         self.db.add_approval('code123', USER1, 'group:' + GROUP, 'light.turn_on', data, self.now, 'prompt')
         self.assertIsNone(self.db.consume_approval('code123', USER2, self.now))
-        action_id, conv, service, got = self.db.consume_approval('code123', USER1, self.now)
+        action_id, conv, service, got, run_at = self.db.consume_approval('code123', USER1, self.now)
+        self.assertIsNone(run_at)
         self.assertEqual((conv, service, got), ('group:' + GROUP, 'light.turn_on', data))
         self.assertEqual(self.db.action_status(action_id), 'executing')
         self.assertIsNone(self.db.consume_approval('code123', USER1, self.now))
@@ -380,7 +404,7 @@ class StoreTests(unittest.TestCase):
 
     def test_outbox_backoff_and_dead_letter(self):
         self.db.enqueue([('dm:' + USER1, 'hi')], self.now)
-        [(item, _, _, attempts, created)] = self.db.due_outbox(self.now)
+        [(item, _, _, attempts, created, _)] = self.db.due_outbox(self.now)
         self.assertEqual(self.db.outbox_failed(item, attempts, created, 'E', self.now), 'pending')
         self.assertEqual(self.db.due_outbox(self.now), [])
         self.assertEqual(len(self.db.due_outbox(self.now + 5)), 1)
