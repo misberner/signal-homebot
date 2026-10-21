@@ -1,0 +1,378 @@
+"""Realistic fakes for integration tests. No real Signal, Claude or HA is used.
+
+- FakeSignalDaemon mirrors signal-cli 0.14.9 HttpServerHandler/SseEventBuffer:
+  GET /api/v1/check, POST /api/v1/rpc (JSON-RPC 2.0), GET /api/v1/events
+  (``id:<start>-<seq>``, ``event:receive``, ``data:{"account","envelope"}``,
+  Last-Event-ID replay of buffered events, ``:`` keep-alives).
+- FakeHomeAssistant records REST service calls and serves a real MCP SDK
+  streamable-HTTP server (uvicorn) exposing GetLiveContext plus a write tool
+  that must never be called.
+- make_fake_claude writes an executable standing in for ``claude -p``.
+"""
+from __future__ import annotations
+import asyncio
+import json
+import os
+import socket
+import stat
+import sys
+import threading
+import time
+from pathlib import Path
+
+from aiohttp import web
+
+from tests.ids import ACCOUNT, BOT, GROUP, STRANGER, USER1, USER2  # noqa: F401
+HA_MCP_SECRET_PATH = '/private_testsecret'
+
+
+def envelope(sender=USER1, text='hello', ts=None, group=None, server_ts=None,
+             expires=0, mentions=None, **data_extra) -> dict:
+    """A receive event as signal-cli 0.14.9 serializes it (message-envelope.schema.json)."""
+    ts = ts if ts is not None else int(time.time() * 1000)
+    dm = {'timestamp': ts, 'message': text, 'expiresInSeconds': expires,
+          'viewOnce': False, **data_extra}
+    if text is None:
+        del dm['message']
+    if group is not None:
+        dm['groupInfo'] = {'groupId': group, 'groupName': 'Home', 'revision': 3, 'type': 'DELIVER'}
+    if mentions is not None:
+        dm['mentions'] = mentions
+    return {'account': ACCOUNT, 'envelope': {
+        'source': sender, 'sourceNumber': None, 'sourceUuid': sender, 'sourceName': 'Someone',
+        'sourceDevice': 1, 'timestamp': ts,
+        'serverReceivedTimestamp': server_ts if server_ts is not None else ts + 50,
+        'serverDeliveredTimestamp': (server_ts if server_ts is not None else ts) + 80,
+        'dataMessage': dm}}
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+class FakeSignalDaemon:
+    def __init__(self):
+        self.prefix = f'{int(time.time() * 1000)}-'
+        self.events: list[tuple[int, str]] = []
+        self.seq = 0
+        self.clients: list[asyncio.Queue] = []
+        self.sent: list[dict] = []
+        self.rpc_failures = 0          # next N sends fail with a JSON-RPC error
+        self.send_results = 'SUCCESS'  # or e.g. 'NETWORK_FAILURE'
+        self.connects: list[str | None] = []
+        self.identities = {USER1: 'TRUSTED_VERIFIED', USER2: 'TRUSTED_VERIFIED'}
+        self.group_members = [BOT, USER1, USER2]
+        self.pending_members: list[str] = []
+        self.rpc_methods: list[str] = []
+        self.runner: web.AppRunner | None = None
+        self.url = ''
+
+    async def start(self):
+        app = web.Application()
+        app.router.add_get('/api/v1/check', lambda _: web.Response(status=200))
+        app.router.add_post('/api/v1/rpc', self.rpc)
+        app.router.add_get('/api/v1/events', self.events_endpoint)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        port = free_port()
+        await web.TCPSite(self.runner, '127.0.0.1', port).start()
+        self.url = f'http://127.0.0.1:{port}'
+
+    async def stop(self):
+        for q in self.clients:
+            q.put_nowait(None)
+        await self.runner.cleanup()
+
+    def push(self, payload: dict | str) -> str:
+        self.seq += 1
+        data = payload if isinstance(payload, str) else json.dumps(payload)
+        self.events.append((self.seq, data))
+        for q in self.clients:
+            q.put_nowait((self.seq, data))
+        return self.prefix + str(self.seq)
+
+    def drop_connections(self):
+        for q in self.clients:
+            q.put_nowait(None)
+
+    async def rpc(self, req: web.Request) -> web.Response:
+        if not req.content_type.startswith('application/json'):
+            return web.Response(status=415)
+        body = await req.json()
+        assert body['jsonrpc'] == '2.0' and 'id' in body
+        self.rpc_methods.append(body['method'])
+        params = body.get('params') or {}
+        if body['method'] == 'listIdentities':  # ListIdentitiesCommand JsonIdentity
+            aci = params.get('number')
+            result = [{'number': None, 'uuid': aci, 'fingerprint': 'ab' * 33,
+                       'safetyNumber': '12345 ' * 12, 'scannableSafetyNumber': None,
+                       'trustLevel': self.identities[aci], 'addedTimestamp': 1}] if aci in self.identities else []
+            return web.json_response({'jsonrpc': '2.0', 'id': body['id'], 'result': result})
+        if body['method'] == 'listGroups':  # ListGroupsCommand JsonGroup
+            group = {'id': GROUP, 'name': 'Home', 'description': None, 'isMember': True, 'isBlocked': False,
+                     'messageExpirationTime': 0,
+                     'members': [{'number': None, 'uuid': u, 'isAdmin': u == USER1} for u in self.group_members],
+                     'pendingMembers': [{'number': None, 'uuid': u} for u in self.pending_members],
+                     'requestingMembers': [], 'admins': [], 'banned': [], 'permissionAddMember': 'ONLY_ADMINS',
+                     'permissionEditDetails': 'ONLY_ADMINS', 'permissionSendMessage': 'EVERY_MEMBER',
+                     'groupInviteLink': None, 'isTerminated': False}
+            wanted = params.get('groupId') or [GROUP]
+            return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
+                                      'result': [group] if GROUP in wanted else []})
+        if body['method'] != 'send':
+            return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
+                                      'error': {'code': -32601, 'message': 'Method not implemented'}})
+        if self.rpc_failures:
+            self.rpc_failures -= 1
+            return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
+                                      'error': {'code': -5, 'message': 'Failed to send message due to rate limiting'}})
+        self.sent.append(body['params'])
+        recipients = body['params'].get('recipient') or [USER1, USER2]
+        return web.json_response({'jsonrpc': '2.0', 'id': body['id'], 'result': {
+            'timestamp': int(time.time() * 1000),
+            'results': [{'recipientAddress': {'uuid': r}, 'type': self.send_results} for r in recipients]}})
+
+    async def events_endpoint(self, req: web.Request) -> web.StreamResponse:
+        last = req.headers.get('Last-Event-ID')
+        self.connects.append(last)
+        resp = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
+        await resp.prepare(req)
+        q: asyncio.Queue = asyncio.Queue()
+        if last is not None:
+            last_seq = int(last[len(self.prefix):]) if last.startswith(self.prefix) else 0
+            for seq, data in self.events:
+                if seq > last_seq:
+                    q.put_nowait((seq, data))
+        self.clients.append(q)
+        try:
+            await resp.write(b':\n')
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                seq, data = item
+                await resp.write(f'id:{self.prefix}{seq}\nevent:receive\ndata:{data}\n\n'.encode())
+        finally:
+            self.clients.remove(q)
+        return resp
+
+    def texts_to(self, dest: str) -> list[str]:
+        out = []
+        for p in self.sent:
+            if (dest.startswith('group:') and p.get('groupId') == dest[6:]) or \
+               (dest.startswith('dm:') and p.get('recipient') == [dest[3:]]):
+                out.append(p['message'])
+        return out
+
+
+class FakeHomeAssistant:
+    """HA REST service endpoint + a real MCP SDK server on /api/mcp/assist.
+
+    The MCP server (uvicorn thread) is shared by all tests; it serves whichever
+    FakeHomeAssistant is ``active``.
+    """
+    active: 'FakeHomeAssistant | None' = None
+    _urls: dict[str, str] = {}
+
+    def __init__(self, token='ha-test-token', live_text='light.test_lamp: off'):
+        self.token = token
+        self.live_text = live_text
+        self.calls: list[tuple[str, dict]] = []
+        self.mode = 'ok'  # ok | 400 | 500 | slow | drop
+        self.mcp_calls: list[str] = []
+        self.mcp_args: list[dict] = []
+        self.mcp_auth_headers: list[str | None] = []
+        self.mcp_fail = False
+        self.overview: dict | None = None  # ha-mcp ha_get_overview result override
+        self.runner = None
+        self.url = ''
+
+    @property
+    def mcp_url(self) -> str:
+        return FakeHomeAssistant._urls['admin'] + '/api/mcp/assist'
+
+    @property
+    def ha_mcp_url(self) -> str:
+        """ha-mcp admin endpoint: authenticated only by its secret path."""
+        return FakeHomeAssistant._urls['admin'] + HA_MCP_SECRET_PATH
+
+    @property
+    def ha_mcp_readonly_url(self) -> str:
+        """ha-mcp's per-connection /readonly alias: write tools hidden."""
+        return FakeHomeAssistant._urls['readonly'] + HA_MCP_SECRET_PATH + '/readonly'
+
+    async def start(self):
+        app = web.Application()
+        app.router.add_post('/api/services/{domain}/{service}', self.service)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        port = free_port()
+        await web.TCPSite(self.runner, '127.0.0.1', port).start()
+        self.url = f'http://127.0.0.1:{port}'
+        FakeHomeAssistant.active = self
+        if not FakeHomeAssistant._urls:
+            FakeHomeAssistant._urls = {'admin': _start_mcp(False), 'readonly': _start_mcp(True)}
+
+    async def stop(self):
+        FakeHomeAssistant.active = None
+        await self.runner.cleanup()
+
+    async def service(self, req: web.Request) -> web.Response:
+        if req.headers.get('Authorization') != f'Bearer {self.token}':
+            return web.Response(status=401)
+        name = f'{req.match_info["domain"]}.{req.match_info["service"]}'
+        self.calls.append((name, await req.json()))
+        if self.mode == 'slow':
+            await asyncio.sleep(5)
+        if self.mode == 'drop' and req.transport:
+            req.transport.close()
+            await asyncio.sleep(1)
+        if self.mode in ('400', '500'):
+            return web.Response(status=int(self.mode))
+        return web.json_response([])
+
+
+def _start_mcp(read_only: bool) -> str:
+    """One MCP server per mode, like ha-mcp's normal and /readonly endpoints."""
+    import uvicorn
+    from mcp.server import MCPServer
+    server = MCPServer('fake-home-assistant')
+
+    @server.tool(name='homeassistant__GetLiveContext')
+    def get_live_context() -> str:
+        """Provides real-time information about the CURRENT state of devices."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('homeassistant__GetLiveContext')
+        if fake.mcp_fail:
+            raise RuntimeError('boom')
+        return fake.live_text
+
+    @server.tool(name='HassTurnOn')
+    def hass_turn_on(name: str) -> str:
+        """Turns on a device. The bot must never call this."""
+        FakeHomeAssistant.active.mcp_calls.append('HassTurnOn')
+        return 'ok'
+
+    # ha-mcp (homeassistant-ai/ha-mcp 8.7.0) tool names and result shape.
+    @server.tool(name='ha_get_overview')
+    def ha_get_overview(detail_level: str = 'minimal', domains: list[str] | None = None,
+                        limit: int | None = None, include_entity_id: bool | None = None,
+                        include_state: bool | None = None, include_notifications: bool = True,
+                        fields: list[str] | None = None) -> str:
+        """Get AI-friendly system overview."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_get_overview')
+        fake.mcp_args.append({'detail_level': detail_level, 'domains': domains, 'limit': limit,
+                              'include_entity_id': include_entity_id, 'include_state': include_state,
+                              'include_notifications': include_notifications, 'fields': fields})
+        result = fake.overview or {'success': True, 'domain_stats': {'light': {
+            'count': 1, 'states_summary': {'off': 1},
+            'entities': [{'friendly_name': 'Test Lamp', 'entity_id': 'light.test_lamp', 'state': 'off'}]}},
+            'pagination': {'has_more': False}}
+        if fields and 'system_info' in fields:
+            result = {**result, 'system_info': {'latitude': 51.0, 'longitude': 7.0}}
+        if read_only and fake.overview is None:
+            result = {**result, 'read_only_mode': True, 'read_only_mode_hint': 'Read Only Mode is ON'}
+        return json.dumps(result)
+
+    if not read_only:  # ha-mcp hides write-capable tools in Read Only Mode
+        @server.tool(name='ha_call_service')
+        def ha_call_service(domain: str, service: str, entity_id: str | None = None) -> str:
+            """Calls any Home Assistant service. The bot must never call this."""
+            FakeHomeAssistant.active.mcp_calls.append('ha_call_service')
+            return 'ok'
+
+        @server.tool(name='ha_write_file')
+        def ha_write_file(path: str, content: str) -> str:
+            """Writes a config file. The bot must never call this."""
+            FakeHomeAssistant.active.mcp_calls.append('ha_write_file')
+            return 'ok'
+
+    mcp_app = server.streamable_http_app(streamable_http_path='/api/mcp/assist', stateless_http=True)
+
+    async def auth(scope, receive, send):
+        if scope['type'] == 'http':
+            fake = FakeHomeAssistant.active
+            header = dict(scope['headers']).get(b'authorization')
+            if fake:
+                fake.mcp_auth_headers.append(header.decode() if header else None)
+            if scope['path'] in (HA_MCP_SECRET_PATH, HA_MCP_SECRET_PATH + '/readonly'):
+                # ha-mcp: the secret path is the credential.
+                scope = {**scope, 'path': '/api/mcp/assist', 'raw_path': b'/api/mcp/assist'}
+                await mcp_app(scope, receive, send)
+                return
+            token = fake.token if fake else None
+            if header != f'Bearer {token}'.encode():
+                await send({'type': 'http.response.start', 'status': 401, 'headers': []})
+                await send({'type': 'http.response.body', 'body': b''})
+                return
+        await mcp_app(scope, receive, send)
+
+    port = free_port()
+    server_ = uvicorn.Server(uvicorn.Config(auth, host='127.0.0.1', port=port,
+                                           log_level='warning', lifespan='on'))
+    threading.Thread(target=server_.run, daemon=True).start()
+    deadline = time.time() + 15
+    while not server_.started and time.time() < deadline:
+        time.sleep(0.02)
+    if not server_.started:
+        raise RuntimeError('fake MCP server did not start')
+    return f'http://127.0.0.1:{port}'
+
+
+FAKE_CLAUDE = r'''#!{python}
+import json, os, sys, time
+spec = json.load(open({spec!r}))
+prompt = sys.stdin.read()
+with open({record!r}, 'a') as f:
+    f.write(json.dumps({{'argv': sys.argv[1:], 'env': dict(os.environ), 'prompt': prompt,
+                        'cwd': os.getcwd()}}) + '\n')
+mode = spec.get('mode', 'ok')
+if mode == 'hang':
+    time.sleep(30)
+if mode == 'auth':
+    print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': True,
+                      'api_error_status': 401,
+                      'result': 'Failed to authenticate. API Error: 401 OAuth access token is invalid.'}}))
+    sys.exit(1)
+if mode == 'limit':
+    print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': True,
+                      'api_error_status': 429, 'result': 'Claude usage limit reached.'}}))
+    sys.exit(1)
+if mode == 'garbage':
+    print('not json'); sys.exit(2)
+out = spec.get('output', {{'reply': 'ok', 'actions': []}})
+print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 2,
+                  'result': json.dumps(out), 'structured_output': out, 'api_error_status': None}}))
+'''
+
+
+class FakeClaude:
+    def __init__(self, directory: Path):
+        self.spec = directory / 'claude_spec.json'
+        self.record = directory / 'claude_calls.jsonl'
+        self.path = directory / 'claude'
+        self.path.write_text(FAKE_CLAUDE.format(python=sys.executable, spec=str(self.spec),
+                                                record=str(self.record)))
+        self.path.chmod(self.path.stat().st_mode | stat.S_IEXEC)
+        self.set()
+
+    def set(self, reply='ok', actions=(), mode='ok'):
+        self.spec.write_text(json.dumps({'mode': mode, 'output': {'reply': reply, 'actions': list(actions)}}))
+
+    @property
+    def calls(self) -> list[dict]:
+        if not self.record.exists():
+            return []
+        return [json.loads(line) for line in self.record.read_text().splitlines()]
+
+
+def scrubbed_env():
+    """Secrets that must never reach the Claude subprocess."""
+    return {'ANTHROPIC_API_KEY': 'sk-ant-api-should-not-leak', 'HA_TOKEN': 'ha-test-token',
+            'NOTIFY_TOKEN': 'n' * 40}
+
+
+os.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')

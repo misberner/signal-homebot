@@ -1,0 +1,61 @@
+name: "Signal HomeBot (Claude)"
+description: "Private Signal bot powered by Claude Code and Home Assistant MCP"
+version: "0.5.0"
+slug: "signal_claude"
+url: "https://github.com/misberner/signal-homebot"
+arch:
+  - amd64
+startup: application
+boot: manual
+init: false
+# /config = addon_configs/<slug> on the host: holds the editable policy.json.
+map:
+  - type: addon_config
+    read_only: false
+# Deliberately NO host port mappings. /notify is internal to the app network.
+options:
+  setup_mode: "inspect"
+  signal_phone: ""
+  verification_code: ""
+  signal_captcha: ""
+  signal_bot_aci: ""
+  signal_user1_aci: ""
+  signal_user2_aci: ""
+  signal_user1_safety_number: ""
+  signal_user2_safety_number: ""
+  require_verified_identity: true
+  signal_group_id: ""
+  bot_name: "HomeBot"
+  ha_base_url: "http://homeassistant:8123"
+  ha_mcp_url: "http://homeassistant:8123/api/mcp/assist"
+  ha_mcp_kind: "hass"
+  ha_mcp_domains: "light,climate,cover,weather"
+  ha_token: ""
+  claude_oauth_token: ""
+  notify_token: ""
+  allow_writes: false
+  command_max_age_seconds: 300
+  history_days: 7
+schema:
+  setup_mode: "list(inspect|listen|register|verify|trust|claude_check|run)"
+  signal_phone: "str?"
+  verification_code: "str?"
+  signal_captcha: "str?"
+  signal_bot_aci: "str?"
+  signal_user1_aci: "str?"
+  signal_user2_aci: "str?"
+  signal_user1_safety_number: "match(^[0-9 ]*$)?"
+  signal_user2_safety_number: "match(^[0-9 ]*$)?"
+  require_verified_identity: bool
+  signal_group_id: "str?"
+  bot_name: "str"
+  ha_base_url: "url"
+  ha_mcp_url: "url"
+  ha_mcp_kind: "list(hass|ha_mcp)"
+  ha_mcp_domains: "match(^[a-z_]+(,[a-z_]+)*$)"
+  ha_token: "password?"
+  claude_oauth_token: "password?"
+  notify_token: "password?"
+  allow_writes: bool
+  command_max_age_seconds: "int(30,3600)"
+  history_days: "int(1,30)"

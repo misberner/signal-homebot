@@ -1,0 +1,21 @@
+{
+  "actions": {
+    "light_on": {
+      "entities": [],
+      "senders": ["user1", "user2"],
+      "contexts": ["dm", "group"]
+    },
+    "light_off": {
+      "entities": [],
+      "senders": ["user1", "user2"],
+      "contexts": ["dm", "group"]
+    },
+    "temperature_set": {
+      "entities": [],
+      "senders": ["user1", "user2"],
+      "contexts": ["dm"],
+      "temperature_min": 18,
+      "temperature_max": 23
+    }
+  }
+}
