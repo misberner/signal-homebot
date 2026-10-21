@@ -1,329 +1,283 @@
-# Installing Signal HomeBot (Claude Code) on Home Assistant OS
+# Signal HomeBot (Claude)
 
-This is an **experimental local app**, not a published community app. It
-packages `signal-cli` 0.14.9 (Java build, on Java 25), Claude Code CLI 2.1.306, Python 3.13 and
-the bot inside one amd64 container. It is **read-only by default**. See
-[Test evidence](#test-evidence) for what has and has not been verified.
+A private Signal bot for your household. Allowlisted people DM it, or address
+it in configured groups, with questions such as "how warm is the living
+room?" or "turn the kitchen light to 40%". Claude Code (with your
+subscription) answers by **reading** Home Assistant through a restricted set
+of read tools. It can *propose* changes, but each one runs only after the
+requesting person says "yes" or reacts 👍.
+
+It packages signal-cli 0.14.9 (Java build on Java 25), Claude Code 2.1.306,
+Python 3.13 and the bot in one amd64 container. See
+[Test evidence](#test-evidence) for what has and hasn't been verified.
 
 ## Install
 
 1. **Settings → Apps → App store → ⋮ → Repositories**, add
-   `https://github.com/misberner/signal-homebot`. (While the GitHub repository
-   is private, Supervisor needs credentials in the URL; see the repository
-   README.)
+   `https://github.com/misberner/signal-homebot`.
 2. Install **Signal HomeBot (Claude)**. Supervisor builds the image on the HA
-   box (amd64), fetching signal-cli and Claude Code; the build runs the test
-   suite and fails if it fails. Updates arrive through the app store when
-   `version` in `config.yaml` changes.
-3. Leave **Start on boot** disabled until initialization is complete. Each
-   setup mode exits when done; see its output under Logs.
+   box. The build runs the test suite and loads Signal's crypto library on
+   your CPU; it fails if either fails. Updates arrive through the app store.
 
-## Signal primary-device registration (using your spare number)
+## Configuration tab (secrets and connections only)
 
-1. Set `signal_phone` to `+49...` in E.164 form. Select `setup_mode: register`.
-   Save and Start; complete the SMS challenge. If a captcha is requested, get
-   `signalcaptcha://...` via https://signalcaptchas.org/registration/generate.html
-   and set `signal_captcha` before retrying.
-2. Set `setup_mode: verify`, enter the SMS in `verification_code`, Save and
-   Start. Afterwards clear `verification_code` and `signal_captcha`.
-3. Set `setup_mode: inspect` to display the bot account ID (ACI); put it in
-   `signal_bot_aci`.
-4. Each person who should use the bot DMs it (and, for groups, posts in the
-   group with the bot), then run `setup_mode: listen`. It collects waiting
-   messages for 60 seconds and logs only sender IDs and group IDs, never text.
-   Add each person under **`users`** (`name`, `aci`; the name is a lowercase
-   label used in `policy.json` and `/notify`, and the one Claude sees), and
-   each group under **`groups`** (`name`, `id`). Groups are optional; with
-   none, the bot works by DM only. `inspect` also lists every group the bot is
-   in, with all member IDs, which is handy for adding someone who is not
-   around to message the bot.
-5. Do not use telephone numbers as ACI values. The CLI remains the primary
-   Signal device; no Android phone is required.
-6. **Verify each user's safety number** (required by default, see
-   [Trusted accounts](#trusted-accounts)): `setup_mode: trust` logs each
-   user's safety number. On that person's phone open the conversation with the
-   bot → **View safety number** and compare. Only if they match, enter it as
-   that user's `safety_number` and run `trust` again; it must print `verified`
-   and trust level `TRUSTED_VERIFIED`. signal-cli rejects a number that does
-   not match its stored key. Users can be verified one at a time; an
-   unverified user is simply ignored until then.
-7. Each user should enable **Registration Lock** (Signal → Settings → Account)
-   so their number cannot be re-registered by someone else (SIM swap).
+| Option | What |
+|---|---|
+| `claude_oauth_token` | Run `claude setup-token` on your computer (Claude Pro/Max login, not an API key), paste the result. Never post it in chats or git. |
+| `ha_mcp_kind`, `ha_mcp_url` | How the bot reads Home Assistant, see [Reading Home Assistant](#reading-home-assistant). |
+| `ha_mcp_domains` | Domains for the overview tool (default `light,climate,cover,weather`). |
+| `ha_token` | Long-lived token of a **non-admin** HA user. Needed for writes, and for the built-in MCP server. |
+| `ha_base_url` | Usually `http://homeassistant:8123`. |
+| `notify_token` | Optional, for n8n/automation notifications (≥ 32 random characters). |
+
+Start the app, then click **Open Web UI** (or "HomeBot" in the sidebar).
+Everything else happens there.
+
+## Setup page
+
+The page is behind Home Assistant's admin login and only reachable through
+it.
+
+1. **Bot's Signal number.** Enter a spare number that can receive SMS (or a
+   call). Signal usually asks for a captcha: solve it at
+   signalcaptchas.org, copy the "Open Signal" link, paste it, and click
+   **Request code** within a minute. Then enter the code. The app becomes the
+   number's main Signal device; no phone app is needed. A number registered
+   by an earlier version is picked up automatically.
+2. **People.** Each person sends the bot any message. They then appear under
+   **Recently seen** (only their Signal ID and profile name are kept, never
+   the text). Give them a short lowercase name and click **Add**. Verify
+   their safety number: on their phone, open the chat with the bot → tap its
+   name → **View safety number**, compare it with the number shown, and enter
+   it. Until a person is verified, the bot ignores them (you can switch this
+   off in Settings, but don't).
+3. **Groups (optional).** Add the bot's number to a Signal group and post
+   something there. The group appears under **Groups the bot is in**, with its
+   members. Add it with a name. The bot answers there when addressed with
+   `/ha`, `!ha` or an @-mention, and only while every member is a configured
+   person.
+4. **What the bot may change.** Off by default. See [Changes](#changes).
+5. **Settings.** Bot name, request age limit, history retention. **Test Home
+   Assistant** and **Test Claude** check the connections.
+
+Each person should also enable **Registration Lock** (Signal → Settings →
+Account), so their number can't be re-registered by someone else.
+
+## Reading Home Assistant
+
+Claude never talks to Home Assistant directly and never sees an HA
+credential. For each request, the bot opens a local read-only tool server
+(on 127.0.0.1, with a one-time token) that offers Claude only these tools. It
+forwards each call to Home Assistant with constrained arguments:
+
+| `ha_mcp_kind` | Tools Claude gets | Upstream |
+|---|---|---|
+| `ha_mcp` (recommended) | `search_entities`, `get_states` (≤ 25 entities, with attributes such as temperatures), `get_overview` (states per domain, never your coordinates), `get_history` (≤ 10 entities) | [ha-mcp](https://github.com/homeassistant-ai/ha-mcp) |
+| `hass` | `get_live_context` | HA's built-in **Model Context Protocol Server** (Assist API, read-only option, exposed entities only) |
+
+**ha-mcp must be read-only.** The bot refuses any ha-mcp connection whose
+tool list contains write tools. If ha-mcp runs inside Home Assistant (the
+"HA-MCP Server" integration, port 9584), use
+`http://homeassistant:9584/private_…/readonly` as `ha_mcp_url`. The
+`/readonly` suffix makes that connection read-only. Better still is a
+separate ha-mcp instance with Read Only Mode on, because whoever knows the
+`private_…` URL can drop the suffix. No HA token is sent to ha-mcp.
+
+For `hass`, set `ha_mcp_url` to `http://homeassistant:8123/api/mcp/assist`
+and `ha_token` to a non-admin user's token.
+
+## Changes
+
+Changes need **all** of:
+
+1. **Allow changes** switched on in the setup page, and an `ha_token`.
+2. An **action** that covers it. An action names one service (e.g.
+   `light.turn_on`), the entities it may touch (exact IDs or `light.*`), the
+   extra fields it may pass, with limits, and who may use it where (private
+   chat, groups). Field syntax:
+   - `brightness_pct: 1..100` (a number range)
+   - `color_name: red | warm white` (a list of allowed values)
+   - `oscillating: boolean`
+
+   Only these domains can ever be controlled: light, switch, fan, cover,
+   climate, humidifier, water_heater, media_player, scene, script, input_*,
+   button, vacuum, select, number. Locks, alarms, cameras, notifications,
+   automations, shell/REST commands and HA administration can't be, whatever
+   you configure. (A `script` or `scene` runs whatever it contains, so only
+   allow ones you'd run yourself. A garage door is often a `cover`: think
+   before allowing `cover.*`.)
+3. **A "yes" from the person who asked**, in their private chat with the
+   bot. The bot asks "Shall I light.turn_on on light.kitchen
+   (brightness_pct=40)?" and it can be answered by:
+   - replying "yes" (or "ja", "ok", 👍),
+   - reacting 👍 to the question,
+   - or "no" / 👎 to cancel.
+
+   With several open questions, reply directly to the one you mean (swipe
+   to reply) or react to it. Questions expire after 2 minutes and work once.
+   Nobody else can answer them, and neither can a group.
+
+Outcomes: **Done**, **did not perform** (HA rejected the call or was
+unreachable), or **UNKNOWN** (timeout, server error, restart mid-call).
+Unknown outcomes are reported and never retried.
 
 ## Trusted accounts
 
-The bot acts only for the people listed under `users`, enforced in layers:
+The bot acts only for configured people, in layers:
 
-1. **Authenticated sender.** The sender's ACI comes from the decrypted Signal
-   envelope (`sourceUuid`), which the Signal protocol authenticates; message
-   text, display names and phone numbers are never used for identity. Anything
-   not from a configured user's `aci` is dropped before storage.
-2. **Pinned identity keys.** signal-cli rejects messages whose sender identity
-   key changed since it was first seen (e.g. the number was re-registered on
-   another phone) until someone re-trusts it. On top of that the bot checks
-   each sender's key with `listIdentities` and, by default
-   (`require_verified_identity: true`), accepts only keys verified by safety
-   number (`TRUSTED_VERIFIED`). Unverified or changed keys are ignored and
-   logged. If someone legitimately gets a new phone, re-run `setup_mode: trust`
-   with their new safety number.
-3. **Configured groups with only configured members.** Messages from other
-   groups are ignored. Before answering in a group and again before every
-   group message is sent (including `/notify`), the bot checks the roster:
-   every member and pending invitee must be a configured user. Otherwise it
-   does not post (an outsider would see replies and history) and tells the
-   requester in their DM.
-4. **Fresh, explicit requests only**, and writes need the requester's private
-   confirmation (below).
+1. **Authenticated sender.** Identity comes from the decrypted Signal envelope,
+   never from message text, names or numbers. Everyone else is ignored
+   (only their ID shows up under "Recently seen").
+2. **Pinned, verified identity keys.** signal-cli rejects messages after a
+   person's key changes (e.g. their number was re-registered elsewhere). The
+   bot additionally requires a verified safety number by default. After
+   someone legitimately gets a new phone, verify them again in the setup page.
+3. **Groups with only configured members.** Before answering and before every
+   group message (including notifications), every member and pending invitee
+   must be a configured person. Otherwise the bot stays silent there and tells
+   the requester privately.
+4. **Fresh, explicit requests.** Requests older than the age limit (default 5
+   minutes), judged by the older of the sender's and the server's timestamps,
+   are never executed. This covers backlog after downtime and replays. The
+   sender is told to resend.
 
-What this cannot protect against: someone who controls a configured user's
-Signal account or devices (an unlocked phone, or a Signal Desktop
-linked to their account) *is* that person to the bot. Linked devices are
-listed in Signal → Settings → Linked devices.
-
-## Authenticate Claude Code using your subscription
-
-Use Claude Code's automation token flow on your own computer:
-
-1. Install Claude Code there and authenticate with your Claude Pro/Max
-   subscription (not an Anthropic Console API key).
-2. Run `claude setup-token` in a local terminal. Copy the returned OAuth token
-   directly into a password manager. **Never post it in chat or commit it to git.**
-3. Paste it into the app's `claude_oauth_token` password option, Save.
-4. Select `setup_mode: claude_check`, Start, and inspect the authentication
-   status in Logs. Then switch back to `inspect` or `run`.
-
-The bot passes only `CLAUDE_CODE_OAUTH_TOKEN` to Claude, never
-`ANTHROPIC_API_KEY`, so it cannot fall back to usage-billed API credentials.
-An expired/invalid token or an exhausted plan is reported in Signal as such
-("not logged in" / "usage limit reached"); the token itself is never shown.
-Subscription usage is subject to Anthropic's limits and terms. Requests from
-the second household member are served from your subscription; check the
-terms apply to your situation.
-
-## Home Assistant reads (MCP)
-
-The bot itself (not Claude) makes **one fixed read-only MCP call** per
-request and gives Claude the result as untrusted text. Claude has no MCP or
-other tools. Choose a backend with `ha_mcp_kind`:
-
-### `hass`: Home Assistant's built-in MCP Server (default)
-
-1. Add the **Model Context Protocol Server** integration. Select the Assist
-   API and enable its read-only option. Expose only safe entities to Assist.
-2. Create a non-admin HA user and a long-lived token for it; set `ha_token`.
-3. `ha_mcp_url`: `http://homeassistant:8123/api/mcp/assist`.
-
-The bot calls only `homeassistant__GetLiveContext` (or `GetLiveContext` on
-older HA) and fails closed if it isn't offered exactly once.
-
-### `ha_mcp`: the community ha-mcp server (homeassistant-ai/ha-mcp)
-
-1. **Read Only Mode is required.** The bot refuses an ha-mcp connection that
-   lists write tools (`ha_call_service`, …) or whose overview lacks
-   `read_only_mode: true`. Either append `/readonly` to the URL (a
-   per-connection read-only alias) or, better, run a separate ha-mcp instance
-   with Read Only Mode switched on. With `/readonly`, whoever obtains the URL can
-   still drop the suffix and get full access; a separate read-only instance
-   doesn't have that problem.
-2. `ha_mcp_url`: when ha-mcp runs inside Home Assistant (the
-   `ha_mcp_tools` "HA-MCP Server" integration, port 9584, bound to `0.0.0.0`),
-   use the Supervisor-internal address with your secret path, e.g.
-   `http://homeassistant:9584/private_…/readonly`. That's the same route as the
-   default `http://homeassistant:8123`; don't use a Tailscale or LAN address.
-   The `private_…` path is the credential, so the bot sends no HA token to it.
-3. `ha_mcp_domains`: comma-separated domains to include (default
-   `light,climate,cover,weather`). Each adds tokens to every Claude request.
-   The overview gives entity *states* (e.g. `heat`), not temperatures. Add
-   `sensor` if you need readings and accept the larger prompt.
-
-The bot calls only `ha_get_overview` with fixed arguments, without
-`system_info` (it contains your home's coordinates) and without
-notifications. It re-renders the result as `entity_id (name): state` lines
-and fails closed on any other result shape. `ha_token` is then needed only
-if writes are enabled.
-
-## Writes (disabled by default)
-
-Writes need **all** of:
-
-1. `allow_writes: true` in the app options.
-2. An entry in `policy.json` in the app's config folder (Samba/File editor:
-   `app_configs/<id>_signal_claude/policy.json`, `addon_configs` on older systems; created on first start
-   with no entities; **restart the app** after editing, no rebuild needed):
-
-   ```json
-   {"actions": {
-     "light_on":  {"entities": ["light.test_lamp"], "senders": ["malte"], "contexts": ["dm", "group"]},
-     "light_off": {"entities": ["light.test_lamp"], "senders": ["malte"], "contexts": ["dm", "group"]},
-     "temperature_set": {"entities": ["climate.office"], "senders": ["malte", "anna"],
-                         "contexts": ["dm"], "temperature_min": 18, "temperature_max": 23}
-   }}
-   ```
-
-   Only `light_on`, `light_off` and `temperature_set` exist, mapped in code to
-   `light.turn_on`, `light.turn_off` and `climate.set_temperature`. Locks,
-   alarms, garages, cameras, scripts and administration are not supported.
-   Unknown keys, services or roles make the bot refuse to start.
-3. A **private confirmation for every write**. Claude only proposes. The
-   requester gets a DM: `Confirm light.turn_on on light.test_lamp? Reply
-   "confirm <code>"`. The code is single-use, valid 2 minutes, bound to that
-   sender and that exact action, and accepted only in that sender's DM. The
-   other person, the group, or Claude cannot confirm it. `cancel <code>`
-   withdraws it.
-
-Writes go through HA REST with `ha_token` (use a non-admin user). Outcomes:
-`Done`, `did not perform` (HA rejected it or was unreachable) or **UNKNOWN**
-(timeout, HTTP 5xx, dropped connection, or a restart mid-call). Unknown
-outcomes are reported and **never retried**.
+This can't protect against someone who controls a configured person's Signal
+account or devices (an unlocked phone, a linked Signal Desktop).
 
 ## Message handling
 
-- **Who:** only the two configured ACIs, in a DM or the one configured group.
-  Everything else is ignored and not stored. Identity comes from Signal
-  metadata, never from message text.
-- **When Claude runs:** every DM; group messages starting with `/ha` or `!ha`,
-  containing `@HomeBot`, or with a real Signal @mention of the bot. Other
-  group messages are stored as context only.
-- **Old messages:** a request older than `command_max_age_seconds` (default
-  300 s, judged by the *older* of the sender and server timestamps) is kept as
-  context but never executed. The sender gets "reached me too late … please
-  send it again". This covers backlog after downtime, phone-queued messages and
-  replays. Messages more than 2 minutes in the future, already-expired
-  disappearing messages, and messages older than `history_days` are dropped.
-- **Duplicates:** each Signal message is processed at most once (SQLite).
-- **Restarts:** a request interrupted by a restart is reported as not
-  completed rather than re-run. Replies wait in a durable outbox and are
-  retried for up to an hour. A retried send can at worst duplicate a text,
-  never an action.
-- **History:** the last 60 messages of the *same* conversation go to Claude,
-  labelled with user names rather than ACIs. Group history never reaches a DM.
-  "Delete for everyone" removes a message from the archive.
-  Disappearing-message timers are honoured. Default retention is 7 days.
+- Claude runs for every private message, and for group messages that start
+  with `/ha` or `!ha`, mention `@HomeBot`, or @-mention the bot. Other group
+  messages are only kept as context.
+- Each Signal message is processed at most once.
+- A request interrupted by a restart is reported as not completed, not
+  re-run.
+- Replies wait in a durable outbox and are retried for up to an hour. A
+  retried send can at worst duplicate a text, never an action.
+- Claude gets the last 60 messages of the *same* conversation, labelled with
+  people's names rather than IDs. Group history never reaches a private chat.
+- "Delete for everyone" removes a message from the archive. Disappearing
+  timers are honoured. History is kept for 7 days by default.
+- Each answer starts a fresh Claude process and its tool calls. Expect
+  10–30 seconds on a small CPU.
 
 ## Process isolation
 
-Inside the container root only prepares `/data` and supervises. Each service
-runs as its own user with no capabilities (`setpriv`, `no_new_privs`, empty
-bounding set) and only its own environment:
+Inside the container, root only prepares `/data` and supervises. Each service
+runs as its own user with no capabilities (`setpriv`, `no_new_privs`) and
+only its own environment:
 
 | User | Process | Holds | Data |
 |---|---|---|---|
-| `signal` | signal-cli daemon (HTTP on 127.0.0.1) | Signal identity keys | `/data/signal` (0700) |
-| `homebot` | the bot | HA token, notify token | `/data/homebot` SQLite (0700) |
-| `node` | Claude broker + Claude Code | Claude OAuth token | `/data/claude` (0700) |
+| `signal` | signal-cli daemon (HTTP on 127.0.0.1) | Signal identity keys | `/data/signal` |
+| `homebot` | bot, setup page, read-tool proxy | HA token, notify token | `/data/homebot` (settings, SQLite) |
+| `node` | Claude broker + Claude Code | Claude OAuth token | `/data/claude` |
 
-The bot reaches Claude only through the broker's Unix socket (directory
-readable by `homebot` only, peer UID checked); the broker runs Claude with a
-fixed command line (no tools, no MCP, safe mode). The signal-cli HTTP port
-has no authentication of its own and is reachable by any process inside this
-container; nothing else listens there.
+The bot reaches Claude only through the broker's Unix socket (peer UID
+checked). The broker runs Claude with a fixed command line: no built-in tools
+(no shell, files or web), no settings, hooks or plugins, and only the bot's
+read-tool server. The signal-cli HTTP port has no authentication of its own
+and is reachable only inside this container.
 
 ## Proactive notifications (optional, n8n)
 
-Set `notify_token` (≥ 32 random characters) to enable `POST /notify` on port
-8999 of the app's internal network; leave it empty to disable the listener.
-No LAN port is published.
+With `notify_token` set, `POST /notify` on port 8999 of the app's internal
+network sends a message:
 
 ```
-POST /notify
 Authorization: Bearer <notify_token>
-{"target": "<user name or group name>", "message": "…", "id": "optional-dedupe-key"}
+{"target": "<person or group name>", "message": "…", "id": "optional-dedupe-key"}
 ```
 
 `202` means queued; `200 {"duplicate": true}` means that `id` was already
-accepted. Use a stable `id` (e.g. the HA event id) so webhook retries don't
-duplicate notifications.
+accepted. Use a stable `id` (e.g. the HA event id) so retries don't duplicate.
 
-## On-device smoke test checklist
+## On-device checklist
 
-Do this before regular use, with a harmless test light. Record the results.
+Run through this once with a harmless test light.
 
-1. [ ] App builds on the HAOS box (Logs show `Ran … tests … OK`).
-2. [ ] `inspect`: `claude --version` shows `2.1.306`; `listAccounts` lists the bot.
-2a. [ ] `trust`: each user shows `TRUSTED_VERIFIED` after entering their
-    compared safety number; a wrong number is rejected.
-3. [ ] `claude_check`: the auth status shows subscription/OAuth login.
-4. [ ] `run` with `allow_writes: false`. Logs show `Ready (writes disabled)`.
-5. [ ] User 1 DM "is the test light on?" gives a correct answer (live state).
-6. [ ] User 2 DM works; a third phone number gets no reply.
-6a. [ ] Add a third person to the group: `/ha` there gets no group reply
-    and a DM saying why. Remove them again; group replies resume.
-7. [ ] Group: a plain message gets no reply and no Claude call in the logs.
-   `/ha what did I just say?` answers using it.
-8. [ ] Group: an @mention of the bot (picked from the mention list) triggers a reply.
-9. [ ] Stop the app, send a DM, wait > 5 minutes, start. You get "too late".
-10. [ ] Restart the app and send a DM. It works without re-registration
-    (persistent `/data`).
-11. [ ] Set `allow_writes: true` and add only the test light to
-    `policy.json` in the config folder. Restart. "/ha turn on the test light" in the group gives a
-    DM confirmation prompt. User 2 sending the code is rejected. User 1
-    confirming turns it on. A second `confirm` with the same code is rejected.
-12. [ ] Let a confirmation code expire (> 2 min). It is rejected.
-13. [ ] n8n (if used): a POST to `/notify` without a token gets 401. With a
-    token it delivers. Repeating the same `id` doesn't deliver twice.
-14. [ ] Take an HA backup and confirm the app's data is in it; protect that backup.
+1. [ ] The app builds (Supervisor log ends without error). The app log shows
+   `Signal crypto library: libsignal OK` and `Ready`.
+2. [ ] Setup page: the number registers (or an earlier registration is
+   picked up), and the bot ID appears.
+3. [ ] **Test Home Assistant** and **Test Claude** both succeed.
+4. [ ] Your DM shows up under Recently seen. After adding and verifying
+   yourself, "how warm is it in <room>?" gets a correct answer.
+5. [ ] A message from a number that isn't configured gets no reply.
+6. [ ] (Groups) `/ha` in the group answers. With an outsider added, it
+   doesn't, and you get a private note.
+7. [ ] Stop the app, send a request, wait > 5 minutes, start. You get
+   "too late".
+8. [ ] Allow changes, add one action for the test light, ask to turn it on:
+   - "yes" turns it on;
+   - a 👍 on the question works too;
+   - "no" cancels;
+   - waiting more than 2 minutes expires the question.
+9. [ ] Restart the app. Everything still works without re-registering.
+10. [ ] (n8n) `/notify` without the token gets 401; with it, the message
+    arrives once.
 
 ## Backups, privacy and limitations
 
-`/data/signal`, `/data/claude` and `/data/homebot` survive restarts and
-updates (a 0.4.x `/data/bot.sqlite3` is moved into `/data/homebot` once). HA backups include secrets and conversation data; protect them. The
-subscription token, HA token and an ha-mcp URL in the options are secrets.
+`/data` (Signal keys, Claude login, settings, history) survives restarts and
+updates and is part of HA backups. Protect those backups. Messages are sent to
+Anthropic when the bot answers. Everyone in a group with the bot should know
+and agree. Signal's end-to-end encryption ends at the bot.
 
-Group messages are stored on the HA box and sent to Anthropic when a request
-includes them. **Both group members should know and agree.** Signal's
-end-to-end encryption ends at the bot.
-
-Do not run more than one daemon for the same registered Signal account (the
-bot also refuses a second instance on the same database). If you installed
-the older `signal_codex` app, this slug creates a **separate** `/data`:
-nothing is migrated, and re-registering the same number may invalidate the
-old device.
+Don't run another signal-cli for the same number. If you used the older
+`signal_codex` app, this one has a separate `/data` and migrates nothing.
 
 ## Test evidence
 
-Verified on 2026-10-21 (see CHANGELOG.md):
+Verified on 2026-10-22 (see CHANGELOG.md):
 
-- `docker build --platform linux/amd64` succeeds, with signal-cli 0.14.9
-  (SHA-256 matches GitHub's published digest), Claude Code 2.1.306 and locked
-  Python deps. 73 tests pass inside the image (including the Linux-only
-  broker peer-UID test).
-- Container smoke test of the real `run.sh` (signal-cli replaced by the test
-  fake; everything else real): the three services run as `signal`/`node`/
-  `homebot` with zero capabilities and `NoNewPrivs`; each sees only its own
-  secrets; cross-user reads of keys, database, options and `/proc/*/environ`
-  are denied; root is rejected by the broker; a DM flows through a read-only
-  MCP read, the broker and Claude Code 2.1.306 (invalid token → "not logged
-  in" reply); SIGTERM stops all services.
-- Live: the bot refuses the admin URL of a real ha-mcp 8.7.0 and accepts its
-  `/readonly` alias.
-- signal-cli 0.14.9 source: changed identity keys are rejected on receive
-  (`IdentityKeyStore.isTrustedIdentity`); `trust -v` verifies the number.
-- Inside the image, the `signal-cli` daemon answers `/api/v1/check`,
-  JSON-RPC `version` and `/api/v1/events` (`text/event-stream`).
-- Claude Code 2.1.306: the exact bot flags return `structured_output`. An
-  invalid OAuth token yields `api_error_status: 401`, classified as `auth`,
-  with Claude running as `node` via the broker.
-- A live read-only `ha_get_overview` call against a real ha-mcp 8.7.0
-  installation, using the bot's own code.
+- **Image:** the amd64 build succeeds, with signal-cli 0.14.9 (checksum
+  matches GitHub's digest), Claude Code 2.1.306, Debian's Java 25 and locked
+  Python dependencies. 85 tests pass inside the image.
+- **Real Claude Code 2.1.306 with read tools:** through the broker and the
+  bot's read-tool proxy (in front of a fake read-only ha-mcp), real Claude
+  Code called `get_states`, answered with the temperature, and proposed
+  `light.turn_on` with `brightness_pct: 40` in the new action format, in
+  13.7 s. `--safe-mode` was shown to silently drop MCP servers, hence the
+  current flag set.
+- **Container smoke test** of the real `run.sh` (signal-cli replaced by the
+  test fake):
+  - an existing registration was picked up automatically;
+  - the setup page refused a non-ingress client;
+  - all three services ran as separate users without capabilities, and each
+    saw only its own secrets;
+  - a DM went through the read-tool preflight and the real Claude CLI and
+    got a reply;
+  - SIGTERM stopped everything.
+- **On your HA box (0.5.x):** the Supervisor build, the Celeron J4025
+  (x86-64-v2) running libsignal, `setpriv` under HA's AppArmor, and Signal
+  registration and verification.
+- **Live ha-mcp 8.7.0:** the admin URL is refused, and its `/readonly` alias
+  works.
 
-**Not yet verified:** Signal registration, real message receive/send and
-mentions, `listIdentities`/`listGroups`/`trust` against a real account, the
-HA built-in MCP server live, the bot reaching ha-mcp at `homeassistant:9584`
-from inside the app (standard Supervisor routing, not yet exercised), HA REST
-writes, Supervisor install/backup and the `app_config` mapping, whether Supervisor's container security options
-permit `setpriv`, n8n, and Claude with a real subscription token inside the
-container. Do the checklist above.
+**Not yet verified:**
+- on the box: the setup page via ingress, and registration through the
+  daemon's API;
+- real Signal messages, reactions and quoted replies;
+- the read tools against live ha-mcp;
+- HA REST writes;
+- backups;
+- n8n.
+
+Use the checklist above.
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v          # core tests; integration tests skip without deps
+cd signal_claude
+python3 -m unittest discover -s tests -v          # core tests (stdlib only)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.lock
 .venv/bin/python -m unittest discover -s tests -v # all tests
 docker build --platform linux/amd64 -t signal-homebot-claude:dev .
 ```
 
-Regenerate `requirements.lock` inside the base image after changing `requirements.txt`:
+Regenerate `requirements.lock` inside the base image after changing
+`requirements.txt`:
 
 ```bash
 docker run --rm --platform linux/amd64 -v "$PWD/requirements.txt:/r.txt:ro" \

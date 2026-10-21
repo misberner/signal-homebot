@@ -1,19 +1,19 @@
 # Signal HomeBot — Home Assistant app repository
 
 A household Signal bot for Home Assistant OS. Allowlisted people DM it or
-address it in configured groups. Claude Code (subscription auth, no tools) answers from a
-read-only Home Assistant MCP snapshot, and can *propose* a small set of
-light/climate actions that each need a private, single-use confirmation.
+address it in configured groups. Claude Code (subscription auth) answers using
+read-only Home Assistant tools served by the bot, and can *propose* allowed
+device actions, each of which needs a "yes" or 👍 from the requester.
 
 ## Install
 
 Settings → Apps → App store → ⋮ → **Repositories**, add
 `https://github.com/misberner/signal-homebot`, then install
 **Signal HomeBot (Claude)**. Supervisor builds the image on the HA box (amd64
-only), and the build runs the test suite. Setup, security model and the
+only), and the build runs the test suite. Then click **Open Web UI** for setup. Setup, security model and the
 on-device checklist are in [signal_claude/DOCS.md](signal_claude/DOCS.md).
 
-**Status:** 0.5.0, hardened prototype. Not yet tested on a live HAOS
+**Status:** 0.7.0, hardened prototype. Not yet tested on a live HAOS
 Supervisor, a real Signal account or HA writes. Read-only by default.
 
 ### Private repository

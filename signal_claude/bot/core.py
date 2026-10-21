@@ -21,14 +21,16 @@ OUTBOX_MAX_AGE = 3600
 OUTBOX_MAX_ATTEMPTS = 8
 OBJECT_REPLACEMENT = '￼'  # Signal puts this where an @mention was
 
-# The only HA services the gateway can ever call. Policy files can narrow
-# this (entities, senders, contexts) but cannot add services. Locks, alarms,
-# garage doors, cameras and administration are deliberately absent.
-ACTIONS = {
-    'light_on': 'light.turn_on',
-    'light_off': 'light.turn_off',
-    'temperature_set': 'climate.set_temperature',
-}
+# Domains whose services a policy may allow. Everything else (locks, alarms,
+# cameras, notify, HA/Supervisor administration, shell/REST commands, automation
+# editing, ...) can never be called, whatever the policy says.
+WRITABLE_DOMAINS = frozenset({
+    'light', 'switch', 'fan', 'cover', 'climate', 'humidifier', 'water_heater',
+    'media_player', 'scene', 'script', 'input_boolean', 'input_number',
+    'input_select', 'input_button', 'button', 'vacuum', 'select', 'number',
+})
+ENTITY_RE = r'[a-z_]+\.[a-z0-9_]+'
+FIELD_RE = r'[a-z_][a-z0-9_]{0,40}'
 NAME_RE = r'[a-z][a-z0-9_]{0,31}'  # user and group names (options, policy, notify)
 CONTEXTS = ('dm', 'group')
 
@@ -47,6 +49,22 @@ class Incoming:
     expires_in_seconds: int = 0
     server_timestamp: int = 0  # ms, set by the Signal server
     mentions_bot: bool = False
+    quote_ts: int = 0          # timestamp of the message this one replies to
+    quote_author: str = ''     # ACI of that message's author
+
+
+@dataclass(frozen=True)
+class Reaction:
+    sender: str
+    conv: str
+    group: bool
+    timestamp: int
+    emoji: str
+    target_ts: int
+    target_author: str
+    remove: bool
+    server_timestamp: int = 0
+    expires_in_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -64,7 +82,7 @@ class Settings:
 
 
 def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_ids: set[str],
-                       bot_name: str = 'HomeBot') -> Incoming | RemoteDelete | None:
+                       bot_name: str = 'HomeBot') -> Incoming | Reaction | RemoteDelete | None:
     """Never trust the text for identity. Use Signal metadata from signal-cli.
 
     Accepts the signal-cli HTTP SSE payload ``{"account", "envelope"}`` and the
@@ -105,9 +123,6 @@ def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_ids: se
             return None
         return RemoteDelete(sender, conv, target)
 
-    text = dm.get('message')
-    if not isinstance(text, str) or not text.strip() or dm.get('viewOnce'):
-        return None
     ts = dm.get('timestamp')
     server_ts = envelope.get('serverReceivedTimestamp') or 0
     if not _valid_ts(ts) or not isinstance(server_ts, int) or server_ts < 0:
@@ -115,9 +130,24 @@ def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_ids: se
     expires = dm.get('expiresInSeconds') or 0
     if not isinstance(expires, int) or expires < 0:
         return None
+
+    reaction = dm.get('reaction')
+    if reaction is not None:  # reaction-schema: emoji, targetAuthorUuid, targetSentTimestamp, isRemove
+        if (not isinstance(reaction, dict) or not isinstance(reaction.get('emoji'), str)
+                or not _valid_ts(reaction.get('targetSentTimestamp'))):
+            return None
+        return Reaction(sender, conv, is_group, ts, reaction['emoji'], reaction['targetSentTimestamp'],
+                        str(reaction.get('targetAuthorUuid') or '').lower(),
+                        reaction.get('isRemove') is True, server_ts, expires)
+
+    text = dm.get('message')
+    if not isinstance(text, str) or not text.strip() or dm.get('viewOnce'):
+        return None
     text, mentions_bot = _resolve_mentions(text, dm.get('mentions'), bot_aci, bot_name)
+    quote = dm.get('quote') if isinstance(dm.get('quote'), dict) else {}
+    quote_ts = quote.get('id') if _valid_ts(quote.get('id')) else 0
     return Incoming(sender, conv, is_group, ts, text.strip()[:MAX_TEXT], expires,
-                    server_ts, mentions_bot)
+                    server_ts, mentions_bot, quote_ts, str(quote.get('authorUuid') or '').lower())
 
 
 def _valid_ts(ts: object) -> bool:
@@ -150,7 +180,7 @@ def addressed(text: str, group: bool, bot_name: str, mentions_bot: bool = False)
                 re.search(r'(?<!\w)@' + re.escape(bot_name) + r'\b', text, re.I))
 
 
-def freshness(msg: Incoming, now_ms: int, settings: Settings) -> str:
+def freshness(msg: Incoming | Reaction, now_ms: int, settings: Settings) -> str:
     """Classify an incoming message against the event-age policy.
 
     Returns one of:
@@ -227,103 +257,147 @@ def group_roster_problem(groups: object, group_id: str, bot_aci: str, users: set
 
 # ---------------------------------------------------------------- policy
 
-def load_policy(raw: object) -> dict:
-    """Strictly parse policy.json. Unknown keys or services fail closed."""
-    if not isinstance(raw, dict) or set(raw) - {'actions'}:
-        raise ValueError('policy.json must be {"actions": {...}}')
-    actions = raw.get('actions', {})
-    if not isinstance(actions, dict):
-        raise ValueError('policy actions must be an object')
-    policy = {}
-    for kind, rule in actions.items():
-        if kind not in ACTIONS:
-            raise ValueError(f'Unsupported action type in policy: {kind}')
-        allowed = {'entities', 'senders', 'contexts'}
-        if kind == 'temperature_set':
-            allowed |= {'temperature_min', 'temperature_max'}
-        if not isinstance(rule, dict) or set(rule) - allowed:
-            raise ValueError(f'Unexpected keys in policy for {kind}')
-        domain = ACTIONS[kind].split('.')[0]
-        entities = rule.get('entities', [])
-        senders = rule.get('senders', [])
-        contexts = rule.get('contexts', ['dm'])
-        if (not isinstance(entities, list) or
-                not all(isinstance(e, str) and re.fullmatch(re.escape(domain) + r'\.[a-z0-9_]+', e)
-                        for e in entities)):
-            raise ValueError(f'{kind}: entities must be {domain}.* entity IDs')
-        if not isinstance(senders, list) or not all(isinstance(n, str) and re.fullmatch(NAME_RE, n)
-                                                    for n in senders):
-            raise ValueError(f'{kind}: senders must be a list of user names')
-        if not isinstance(contexts, list) or set(contexts) - set(CONTEXTS):
-            raise ValueError(f'{kind}: contexts must be a subset of {CONTEXTS}')
-        entry = {'entities': list(entities), 'senders': list(senders), 'contexts': list(contexts)}
-        if kind == 'temperature_set':
-            lo, hi = rule.get('temperature_min'), rule.get('temperature_max')
-            if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (lo, hi)) \
-                    or not 5 <= lo <= hi <= 30:
-                raise ValueError('temperature_set needs 5 <= temperature_min <= temperature_max <= 30')
-            entry.update(temperature_min=lo, temperature_max=hi)
-        policy[kind] = entry
-    return policy
+def load_policy(raw: object) -> list[dict]:
+    """Strictly parse a policy ``{"actions": [rule, ...]}``. Fails closed.
 
-
-def permitted(policy: dict, writes_enabled: bool, role: str | None, context: str) -> dict:
-    """The subset of the policy usable by this sender in this context."""
-    if not writes_enabled or not role:
-        return {}
-    return {kind: rule for kind, rule in policy.items()
-            if rule['entities'] and role in rule['senders'] and context in rule['contexts']}
-
-
-def validate_action(action: object, allowed: dict) -> tuple[str, dict]:
-    """Deterministic, fail-closed mapping from a proposed action to a HA call.
-
-    ``allowed`` must come from ``permitted()`` for the authenticated sender.
+    A rule: ``{"service": "light.turn_on", "entities": ["light.kitchen" | "light.*"],
+    "fields": {"brightness_pct": {"min": 1, "max": 100} | {"values": [...]} |
+    {"type": "boolean"}}, "senders": [user names], "contexts": ["dm", "group"]}``.
     """
-    if not isinstance(action, dict) or set(action) - {'type', 'entity_id', 'temperature'}:
+    if not isinstance(raw, dict) or set(raw) - {'actions'}:
+        raise ValueError('policy must be {"actions": [...]}')
+    actions = raw.get('actions', [])
+    if not isinstance(actions, list):
+        raise ValueError('policy actions must be a list')
+    rules = []
+    for n, rule in enumerate(actions, 1):
+        where = f'action {n}'
+        if not isinstance(rule, dict) or set(rule) - {'service', 'entities', 'fields', 'senders', 'contexts'}:
+            raise ValueError(f'{where}: unexpected keys')
+        service = rule.get('service')
+        if not isinstance(service, str) or not re.fullmatch(r'[a-z_]+\.[a-z_]+', service):
+            raise ValueError(f'{where}: service must look like light.turn_on')
+        domain = service.split('.')[0]
+        if domain not in WRITABLE_DOMAINS:
+            raise ValueError(f'{where}: the {domain} domain can never be controlled by the bot')
+        entities = rule.get('entities', [])
+        if not isinstance(entities, list) or not all(
+                isinstance(e, str) and (e == f'{domain}.*' or (re.fullmatch(ENTITY_RE, e)
+                                                              and e.split('.')[0] == domain))
+                for e in entities):
+            raise ValueError(f'{where}: entities must be {domain}.<id> or {domain}.*')
+        fields = rule.get('fields', {})
+        if not isinstance(fields, dict):
+            raise ValueError(f'{where}: fields must be an object')
+        for name, spec in fields.items():
+            _check_field_spec(f'{where} field {name}', name, spec)
+        senders = rule.get('senders', [])
+        if not isinstance(senders, list) or not all(isinstance(u, str) and re.fullmatch(NAME_RE, u)
+                                                    for u in senders):
+            raise ValueError(f'{where}: senders must be a list of user names')
+        contexts = rule.get('contexts', ['dm'])
+        if not isinstance(contexts, list) or not contexts or set(contexts) - set(CONTEXTS):
+            raise ValueError(f'{where}: contexts must be a non-empty subset of {CONTEXTS}')
+        rules.append({'service': service, 'entities': list(entities), 'fields': dict(fields),
+                      'senders': list(senders), 'contexts': list(contexts)})
+    return rules
+
+
+def _check_field_spec(where: str, name: object, spec: object) -> None:
+    if not isinstance(name, str) or not re.fullmatch(FIELD_RE, name) or name == 'entity_id':
+        raise ValueError(f'{where}: invalid field name')
+    if not isinstance(spec, dict):
+        raise ValueError(f'{where}: must be an object')
+    if set(spec) == {'min', 'max'}:
+        lo, hi = spec['min'], spec['max']
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (lo, hi)) or lo > hi:
+            raise ValueError(f'{where}: min/max must be numbers with min <= max')
+    elif set(spec) == {'values'}:
+        values = spec['values']
+        if (not isinstance(values, list) or not values or len(values) > 50
+                or not all(isinstance(v, (str, int, float, bool)) for v in values)):
+            raise ValueError(f'{where}: values must be a non-empty list of strings or numbers')
+    elif spec != {'type': 'boolean'}:
+        raise ValueError(f'{where}: use {{"min","max"}}, {{"values"}} or {{"type": "boolean"}}')
+
+
+def permitted(policy: list[dict], writes_enabled: bool, user: str | None, context: str) -> list[dict]:
+    """The rules usable by this sender in this context."""
+    if not writes_enabled or not user:
+        return []
+    return [r for r in policy if r['entities'] and user in r['senders'] and context in r['contexts']]
+
+
+def _entity_allowed(rule: dict, entity_id: str) -> bool:
+    return any(e == entity_id or (e.endswith('.*') and entity_id.split('.')[0] == e[:-2])
+               for e in rule['entities'])
+
+
+def _field_ok(spec: dict, value: object) -> bool:
+    if 'min' in spec:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and spec['min'] <= value <= spec['max']
+    if 'values' in spec:
+        return any(value == v and type(value) is type(v) for v in spec['values'])
+    return isinstance(value, bool)
+
+
+def validate_action(action: object, rules: list[dict]) -> tuple[str, dict]:
+    """Deterministic, fail-closed mapping from a proposed action to one HA call.
+
+    ``rules`` must come from ``permitted()`` for the authenticated sender.
+    Returns (service, service_data) where service_data includes entity_id.
+    """
+    if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data'}:
         raise Denied('unexpected action fields')
-    kind = action.get('type')
-    if not isinstance(kind, str) or kind not in ACTIONS or kind not in allowed:
-        raise Denied('action type not permitted')
-    rule = allowed[kind]
-    entity_id = action.get('entity_id')
-    if not isinstance(entity_id, str) or entity_id not in rule['entities']:
-        raise Denied('entity not permitted')
-    data: dict = {'entity_id': entity_id}
-    temp = action.get('temperature')
-    if kind == 'temperature_set':
-        if isinstance(temp, bool) or not isinstance(temp, (int, float)):
-            raise Denied('temperature required')
-        if not rule['temperature_min'] <= temp <= rule['temperature_max']:
-            raise Denied('temperature outside configured limits')
-        data['temperature'] = temp
-    elif temp is not None:
-        raise Denied('unexpected temperature')
-    return ACTIONS[kind], data
+    service, entity_id, data = action.get('service'), action.get('entity_id'), action.get('data') or {}
+    if not isinstance(service, str) or not isinstance(entity_id, str) or not isinstance(data, dict):
+        raise Denied('malformed action')
+    if not re.fullmatch(ENTITY_RE, entity_id) or service.split('.')[0] not in WRITABLE_DOMAINS:
+        raise Denied('action not permitted')
+    candidates = [r for r in rules if r['service'] == service and _entity_allowed(r, entity_id)]
+    if not candidates:
+        raise Denied('action not permitted')
+    for rule in candidates:
+        if all(k in rule['fields'] and _field_ok(rule['fields'][k], v) for k, v in data.items()):
+            return service, {'entity_id': entity_id, **data}
+    raise Denied('a value is not permitted')
 
 
 def describe(service: str, data: dict) -> str:
-    extra = f' to {data["temperature"]}°' if 'temperature' in data else ''
-    return f'{service} on {data["entity_id"]}{extra}'
+    extra = ', '.join(f'{k}={v}' for k, v in data.items() if k != 'entity_id')
+    return f'{service} on {data["entity_id"]}' + (f' ({extra})' if extra else '')
 
 
-def build_schema(allowed: dict) -> dict:
+def describe_rule(rule: dict) -> str:
+    fields = []
+    for name, spec in rule['fields'].items():
+        if 'min' in spec:
+            fields.append(f'{name} {spec["min"]}..{spec["max"]}')
+        elif 'values' in spec:
+            fields.append(f'{name} one of {spec["values"]}')
+        else:
+            fields.append(f'{name} true/false')
+    return (f'{rule["service"]} on {", ".join(rule["entities"])}'
+            + (f'; optional data: {"; ".join(fields)}' if fields else '; no extra data'))
+
+
+def build_schema(rules: list[dict]) -> dict:
     """JSON schema for Claude's structured output.
 
     No ``$schema`` key: Claude Code 2.1.x rejects draft 2020-12 references.
-    When no writes are permitted, ``actions`` must be empty.
+    When nothing is permitted, ``actions`` must be empty.
     """
     item = {
         'type': 'object',
         'properties': {
-            'type': {'type': 'string', 'enum': sorted(allowed) or ['none']},
+            'service': {'type': 'string', 'enum': sorted({r['service'] for r in rules}) or ['none']},
             'entity_id': {'type': 'string'},
-            'temperature': {'type': ['number', 'null']},
+            'data': {'type': 'object'},
         },
-        'required': ['type', 'entity_id', 'temperature'],
+        'required': ['service', 'entity_id', 'data'],
         'additionalProperties': False,
     }
-    actions = {'type': 'array', 'items': item, 'maxItems': 3 if allowed else 0}
+    actions = {'type': 'array', 'items': item, 'maxItems': 3 if rules else 0}
     return {
         'type': 'object',
         'properties': {'reply': {'type': 'string'}, 'actions': actions},
@@ -420,7 +494,7 @@ def parse_claude_output(stdout: bytes, returncode: int = 0) -> dict:
 
 # ---------------------------------------------------------------- storage
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Store:
@@ -466,8 +540,17 @@ class Store:
             last_error TEXT
           );
           CREATE TABLE IF NOT EXISTS notify_ids(id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
-          PRAGMA user_version={SCHEMA_VERSION};
+          CREATE TABLE IF NOT EXISTS events_seen(
+            conv TEXT NOT NULL, sender TEXT NOT NULL, timestamp INTEGER NOT NULL, seen_at INTEGER NOT NULL,
+            PRIMARY KEY(conv,sender,timestamp)
+          );
         ''')
+        # v3: the confirmation prompt's Signal timestamp, to match replies/reactions.
+        for table, column in (('approvals', 'prompt_ts INTEGER'), ('outbox', 'approval_code TEXT')):
+            have = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
+            if column.split()[0] not in have:
+                self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column}')
+        self.db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
 
     def _tx(self):
         return _Tx(self.db)
@@ -543,10 +626,35 @@ class Store:
                      data: dict, now: int, prompt: str) -> None:
         """Record a pending approval and queue its private DM atomically."""
         with self._tx():
-            self.db.execute('INSERT INTO approvals VALUES(?,?,?,?,?,?,?,?)',
+            self.db.execute('INSERT INTO approvals(code,sender,request_conv,service,data_json,created_at,'
+                            'expires_at,status) VALUES(?,?,?,?,?,?,?,?)',
                             (code, sender, request_conv, service, json.dumps(data),
                              now, now + APPROVAL_TTL, 'pending'))
-            self._enqueue([(f'dm:{sender}', prompt)], now)
+            self._enqueue([(f'dm:{sender}', prompt)], now, approval_code=code)
+
+    PROMPT_AMBIGUOUS = 'ambiguous'
+
+    def find_approval(self, sender: str, now: int, prompt_ts: int | None = None) -> str | None:
+        """The pending approval a reply/reaction refers to.
+
+        With ``prompt_ts`` (a quoted reply or reaction) it must be that exact
+        prompt. Without, there must be exactly one pending approval for the
+        sender; several give PROMPT_AMBIGUOUS.
+        """
+        rows = self.db.execute("SELECT code, prompt_ts FROM approvals WHERE sender=? AND status='pending' "
+                               'AND expires_at>?', (sender, now)).fetchall()
+        if prompt_ts is not None:
+            return next((code for code, ts in rows if ts == prompt_ts), None)
+        if len(rows) > 1:
+            return self.PROMPT_AMBIGUOUS
+        return rows[0][0] if rows else None
+
+    def seen(self, conv: str, sender: str, timestamp: int, now: int) -> bool:
+        """Record a non-text event (e.g. a reaction); False if already seen."""
+        with self._tx():
+            cur = self.db.execute('INSERT OR IGNORE INTO events_seen VALUES(?,?,?,?)',
+                                  (conv, sender, timestamp, now))
+            return cur.rowcount == 1
 
     def consume_approval(self, code: str, sender: str, now: int) -> tuple[int, str, str, dict] | None:
         """Single use: atomically mark consumed and journal the action as executing.
@@ -614,11 +722,11 @@ class Store:
         with self._tx():
             self._enqueue(outgoing, now)
 
-    def _enqueue(self, outgoing: list[tuple[str, str]], now: int) -> None:
+    def _enqueue(self, outgoing: list[tuple[str, str]], now: int, approval_code: str | None = None) -> None:
         for dest, text in outgoing:
             if text.strip():
-                self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt) VALUES(?,?,?,?)',
-                                (dest, text[:MAX_TEXT], now, now))
+                self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt,approval_code) '
+                                'VALUES(?,?,?,?,?)', (dest, text[:MAX_TEXT], now, now, approval_code))
 
     def due_outbox(self, now: int, limit: int = 20) -> list[tuple[int, str, str, int, int]]:
         return self.db.execute("SELECT id,dest,text,attempts,created_at FROM outbox "
@@ -629,9 +737,12 @@ class Store:
         row = self.db.execute("SELECT MIN(next_attempt) FROM outbox WHERE status='pending'").fetchone()
         return row[0]
 
-    def outbox_sent(self, item_id: int) -> None:
+    def outbox_sent(self, item_id: int, sent_ts: int | None = None) -> None:
         with self._tx():  # drop the text: the outbox is not a second transcript
             self.db.execute("UPDATE outbox SET status='sent', text='' WHERE id=?", (item_id,))
+            if isinstance(sent_ts, int):
+                self.db.execute('UPDATE approvals SET prompt_ts=? WHERE code=(SELECT approval_code '
+                                'FROM outbox WHERE id=?)', (sent_ts, item_id))
 
     def outbox_failed(self, item_id: int, attempts: int, created_at: int, error: str, now: int) -> str:
         attempts += 1
@@ -675,6 +786,7 @@ class Store:
             self.db.execute("DELETE FROM outbox WHERE status!='pending' AND created_at <= ?", (now - 86400,))
             self.db.execute('DELETE FROM notify_ids WHERE received_at <= ?', (now - 7 * 86400,))
             self.db.execute("DELETE FROM jobs WHERE created_at <= ?", (now - 7 * 86400,))
+            self.db.execute('DELETE FROM events_seen WHERE seen_at <= ?', (now - 7 * 86400,))
             self.db.execute("DELETE FROM actions WHERE created_at <= ?", (now - 90 * 86400,))
 
 

@@ -4,22 +4,24 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from bot.core import (Store, Incoming, RemoteDelete, Settings, Denied, ClaudeError, addressed,
-                      freshness, parse_signal_event, load_policy, permitted, validate_action,
+from bot.core import (Store, Incoming, Reaction, RemoteDelete, Settings, Denied, ClaudeError, addressed,
+                      freshness, parse_signal_event, load_policy, permitted, validate_action, describe,
                       build_schema, parse_claude_output, render_overview, ha_mcp_overview_args,
                       identity_trusted, group_roster_problem, APPROVAL_TTL)
+from bot.household import Household, HouseholdError, HouseholdStore
 
 BOT = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 USER1 = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
 USER2 = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
 GROUP = 'abc=/base64'
 USERS = {USER1, USER2}
-SHIPPED_POLICY = json.loads((Path(__file__).parent.parent / 'policy.json').read_text())
-POLICY = load_policy({'actions': {
-    'light_on': {'entities': ['light.test_lamp'], 'senders': ['user1', 'user2'], 'contexts': ['dm', 'group']},
-    'temperature_set': {'entities': ['climate.test_room'], 'senders': ['user1'], 'contexts': ['dm'],
-                        'temperature_min': 18, 'temperature_max': 23},
-}})
+POLICY = load_policy({'actions': [
+    {'service': 'light.turn_on', 'entities': ['light.*'], 'senders': ['user1', 'user2'], 'contexts': ['dm', 'group'],
+     'fields': {'brightness_pct': {'min': 1, 'max': 100}, 'color_name': {'values': ['red', 'warm white']},
+                'flash': {'type': 'boolean'}}},
+    {'service': 'climate.set_temperature', 'entities': ['climate.test_room'], 'senders': ['user1'],
+     'contexts': ['dm'], 'fields': {'temperature': {'min': 18, 'max': 23}}},
+]})
 
 
 def signal_event(sender=USER1, group=None, text='test', ts=None, **dm_extra):
@@ -71,6 +73,16 @@ class ParseTests(unittest.TestCase):
                           'dataMessage': {'message': 'x', 'timestamp': 5,
                                           'groupInfo': {'groupId': GROUP, 'type': 'UPDATE'}}}}):
             self.assertIsNone(self.parse(event), event)
+
+    def test_reactions_and_quotes(self):
+        r = self.parse(signal_event(USER1, None, None, reaction={
+            'emoji': '👍', 'targetAuthorUuid': BOT.upper(), 'targetSentTimestamp': 42, 'isRemove': False}))
+        self.assertIsInstance(r, Reaction)
+        self.assertEqual((r.emoji, r.target_ts, r.target_author, r.remove), ('👍', 42, BOT, False))
+        self.assertIsNone(self.parse(signal_event(USER1, None, None, reaction={'emoji': '👍'})))
+        q = self.parse(signal_event(USER1, None, 'yes', quote={'id': 77, 'authorUuid': BOT, 'text': 'Shall I'}))
+        self.assertEqual((q.text, q.quote_ts, q.quote_author), ('yes', 77, BOT))
+        self.assertEqual(self.parse(signal_event(USER1, None, 'yes', quote={'id': 'x'})).quote_ts, 0)
 
     def test_mentions_and_remote_delete(self):
         msg = parse_signal_event(signal_event(USER1, GROUP, '￼ lamp?', mentions=[
@@ -140,57 +152,110 @@ class FreshnessTests(unittest.TestCase):
 
 
 class PolicyTests(unittest.TestCase):
-    def test_shipped_policy_grants_nothing(self):
-        policy = load_policy(SHIPPED_POLICY)
-        for role in ('user1', 'user2'):
-            for ctx in ('dm', 'group'):
-                self.assertEqual(permitted(policy, True, role, ctx), {})
-
     def test_load_policy_fails_closed(self):
+        ok = {'service': 'light.turn_on', 'entities': ['light.x']}
         bad = [
-            {'actions': {'door_unlock': {'entities': ['lock.front_door']}}},
-            {'actions': {'light_on': {'entities': ['lock.front_door']}}},
-            {'actions': {'light_on': {'entities': ['light.x'], 'service': 'lock.unlock'}}},
-            {'actions': {'light_on': {'entities': ['light.x'], 'confirmation': False}}},
-            {'actions': {'light_on': {'entities': ['light.x'], 'senders': ['Not A Name']}}},
-            {'actions': {'light_on': {'entities': ['light.x'], 'contexts': ['everywhere']}}},
-            {'actions': {'temperature_set': {'entities': ['climate.x'], 'temperature_min': 10,
-                                             'temperature_max': 40}}},
-            {'writes_enabled': True, 'actions': {}},
+            {'actions': [{**ok, 'service': 'lock.unlock', 'entities': ['lock.front_door']}]},   # blocked domain
+            {'actions': [{**ok, 'service': 'alarm_control_panel.alarm_disarm', 'entities': []}]},
+            {'actions': [{**ok, 'service': 'notify.mobile_app', 'entities': []}]},
+            {'actions': [{**ok, 'service': 'homeassistant.restart', 'entities': []}]},
+            {'actions': [{**ok, 'entities': ['lock.front_door']}]},                            # wrong domain
+            {'actions': [{**ok, 'entities': ['*']}]},
+            {'actions': [{**ok, 'confirmation': False}]},                                      # unknown key
+            {'actions': [{**ok, 'senders': ['Not A Name']}]},
+            {'actions': [{**ok, 'contexts': ['everywhere']}]},
+            {'actions': [{**ok, 'contexts': []}]},
+            {'actions': [{**ok, 'fields': {'entity_id': {'values': ['light.y']}}}]},           # can't widen
+            {'actions': [{**ok, 'fields': {'x': {'min': 5, 'max': 1}}}]},
+            {'actions': [{**ok, 'fields': {'x': {'values': []}}}]},
+            {'actions': [{**ok, 'fields': {'x': {'regex': '.*'}}}]},
+            {'actions': [{**ok, 'fields': {'x': {'min': True, 'max': 2}}}]},
+            {'actions': {'light_on': {}}},                                                      # old format
+            {'writes_enabled': True, 'actions': []},
             [],
         ]
         for raw in bad:
             with self.assertRaises(ValueError, msg=raw):
                 load_policy(raw)
+        self.assertEqual(load_policy({'actions': [ok]})[0]['contexts'], ['dm'])  # default: DM only
 
-    def test_permitted_by_switch_role_and_context(self):
-        self.assertEqual(permitted(POLICY, False, 'user1', 'dm'), {})
-        self.assertEqual(permitted(POLICY, True, None, 'dm'), {})
-        self.assertEqual(set(permitted(POLICY, True, 'user1', 'dm')), {'light_on', 'temperature_set'})
-        self.assertEqual(set(permitted(POLICY, True, 'user2', 'dm')), {'light_on'})
-        self.assertEqual(set(permitted(POLICY, True, 'user1', 'group')), {'light_on'})
+    def test_permitted_by_switch_user_and_context(self):
+        self.assertEqual(permitted(POLICY, False, 'user1', 'dm'), [])
+        self.assertEqual(permitted(POLICY, True, None, 'dm'), [])
+        self.assertEqual([r['service'] for r in permitted(POLICY, True, 'user1', 'dm')],
+                         ['light.turn_on', 'climate.set_temperature'])
+        self.assertEqual([r['service'] for r in permitted(POLICY, True, 'user2', 'dm')], ['light.turn_on'])
+        self.assertEqual([r['service'] for r in permitted(POLICY, True, 'user1', 'group')], ['light.turn_on'])
+        self.assertEqual(permitted(load_policy({'actions': [{'service': 'light.turn_on', 'entities': [],
+                                                             'senders': ['user1']}]}), True, 'user1', 'dm'), [])
 
     def test_validate_action(self):
-        allowed = permitted(POLICY, True, 'user1', 'dm')
-        good = {'type': 'temperature_set', 'entity_id': 'climate.test_room', 'temperature': 22}
-        self.assertEqual(validate_action(good, allowed),
-                         ('climate.set_temperature', {'entity_id': 'climate.test_room', 'temperature': 22}))
-        for bad in ({**good, 'temperature': 29}, {**good, 'temperature': True},
-                    {**good, 'temperature': None}, {**good, 'entity_id': 'climate.other'},
-                    {**good, 'service': 'lock.unlock'}, {**good, 'type': 'door_unlock'},
-                    {'type': 'light_on', 'entity_id': 'light.test_lamp', 'temperature': 20}, 'x', None):
+        rules = permitted(POLICY, True, 'user1', 'dm')
+        good = {'service': 'light.turn_on', 'entity_id': 'light.kitchen',
+                'data': {'brightness_pct': 40, 'color_name': 'warm white', 'flash': False}}
+        self.assertEqual(validate_action(good, rules),
+                         ('light.turn_on', {'entity_id': 'light.kitchen', 'brightness_pct': 40,
+                                            'color_name': 'warm white', 'flash': False}))
+        self.assertEqual(validate_action({**good, 'data': {}}, rules)[1], {'entity_id': 'light.kitchen'})
+        temp = {'service': 'climate.set_temperature', 'entity_id': 'climate.test_room', 'data': {'temperature': 21.5}}
+        self.assertEqual(validate_action(temp, rules)[0], 'climate.set_temperature')
+        for bad in ({**good, 'data': {'brightness_pct': 0}}, {**good, 'data': {'brightness_pct': True}},
+                    {**good, 'data': {'brightness_pct': '40'}}, {**good, 'data': {'color_name': 'blue'}},
+                    {**good, 'data': {'flash': 1}}, {**good, 'data': {'transition': 5}},
+                    {**good, 'data': {'entity_id': 'light.other'}}, {**good, 'data': 'x'},
+                    {**good, 'entity_id': 'switch.kettle'}, {**good, 'entity_id': 'light.x; drop'},
+                    {**good, 'service': 'light.toggle'}, {**good, 'service': 'lock.unlock', 'entity_id': 'lock.x'},
+                    {**temp, 'data': {'temperature': 29}}, {**temp, 'entity_id': 'climate.other'},
+                    {**good, 'extra': 1}, 'x', None):
             with self.assertRaises(Denied, msg=bad):
-                validate_action(bad, allowed)
+                validate_action(bad, rules)
         with self.assertRaises(Denied):
-            validate_action(good, permitted(POLICY, True, 'user2', 'dm'))
+            validate_action(temp, permitted(POLICY, True, 'user2', 'dm'))
+        self.assertEqual(describe('light.turn_on', {'entity_id': 'light.k', 'brightness_pct': 40}),
+                         'light.turn_on on light.k (brightness_pct=40)')
 
     def test_schema_has_no_draft_reference_and_blocks_actions_when_read_only(self):
-        read_only = build_schema({})
+        read_only = build_schema([])
         self.assertNotIn('$schema', read_only)
         self.assertEqual(read_only['properties']['actions']['maxItems'], 0)
         rw = build_schema(permitted(POLICY, True, 'user1', 'dm'))
-        self.assertEqual(rw['properties']['actions']['items']['properties']['type']['enum'],
-                         ['light_on', 'temperature_set'])
+        self.assertEqual(rw['properties']['actions']['items']['properties']['service']['enum'],
+                         ['climate.set_temperature', 'light.turn_on'])
+
+
+class HouseholdTests(unittest.TestCase):
+    def test_defaults_are_safe(self):
+        house = Household()
+        house.validate()
+        self.assertFalse(house.allow_writes)
+        self.assertTrue(house.require_verified_identity)
+        self.assertEqual(house.policy, [])
+
+    def test_validation(self):
+        base = Household(users={'malte': USER1})
+        base.validate()
+        for change in ({'users': {'Malte': USER1}}, {'users': {'a': 'not-an-aci'}}, {'users': {'a': USER1, 'b': USER1}},
+                       {'bot_aci': USER1}, {'groups': {'malte': 'Z3JvdXBpZGlk'}}, {'groups': {'a': 'x'}},
+                       {'signal_account': '015112345678'}, {'bot_name': 'Home Bot!'},
+                       {'actions': [{'service': 'light.turn_on', 'entities': ['light.x'], 'senders': ['anna']}]},
+                       {'actions': [{'service': 'lock.unlock', 'entities': ['lock.x']}]},
+                       {'command_max_age': 5}, {'history_days': 99}):
+            with self.assertRaises(HouseholdError, msg=change):
+                base.change(**change)
+
+    def test_store_roundtrip_and_types(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = HouseholdStore(str(Path(d) / 'sub' / 'settings.json'))
+            self.assertEqual(store.load(), Household())
+            house = Household(signal_account='+4915100000000', users={'malte': USER1}, allow_writes=True,
+                              actions=[{'service': 'light.turn_on', 'entities': ['light.x'], 'senders': ['malte']}])
+            store.save(house)
+            self.assertEqual(store.load(), house)
+            self.assertEqual(oct(store.path.stat().st_mode & 0o777), '0o600')
+            for bad in ({'allow_writes': 'yes'}, {'surprise': 1}, {'command_max_age': True}, []):
+                store.path.write_text(json.dumps(bad if isinstance(bad, list) else {**house.to_json(), **bad}))
+                with self.assertRaises(HouseholdError, msg=bad):
+                    store.load()
 
 
 class ClaudeOutputTests(unittest.TestCase):
@@ -266,6 +331,21 @@ class StoreTests(unittest.TestCase):
         self.db.add(short)
         self.assertIn('vanishing', self.db.context('dm:' + USER1, self.now + 59))
         self.assertNotIn('vanishing', self.db.context('dm:' + USER1, self.now + 61))
+
+    def test_find_approval_by_prompt_timestamp(self):
+        data = {'entity_id': 'light.test_lamp'}
+        self.db.add_approval('one', USER1, 'dm:' + USER1, 'light.turn_on', data, self.now, 'Shall I 1')
+        self.assertEqual(self.db.find_approval(USER1, self.now), 'one')
+        self.assertIsNone(self.db.find_approval(USER2, self.now))
+        [(item, *_)] = self.db.due_outbox(self.now)
+        self.db.outbox_sent(item, 5000)  # the Signal timestamp of the question
+        self.db.add_approval('two', USER1, 'dm:' + USER1, 'light.turn_off', data, self.now, 'Shall I 2')
+        self.assertEqual(self.db.find_approval(USER1, self.now), Store.PROMPT_AMBIGUOUS)
+        self.assertEqual(self.db.find_approval(USER1, self.now, prompt_ts=5000), 'one')
+        self.assertIsNone(self.db.find_approval(USER1, self.now, prompt_ts=4999))
+        self.assertIsNone(self.db.find_approval(USER1, self.now + APPROVAL_TTL))
+        self.assertTrue(self.db.seen('dm:x', USER1, 1, self.now))
+        self.assertFalse(self.db.seen('dm:x', USER1, 1, self.now))
 
     def test_approval_bound_single_use_and_expiring(self):
         data = {'entity_id': 'light.test_lamp'}

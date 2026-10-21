@@ -1,6 +1,6 @@
 name: "Signal HomeBot (Claude)"
 description: "Private Signal bot powered by Claude Code and Home Assistant MCP"
-version: "0.6.0"
+version: "0.7.0"
 slug: "signal_claude"
 url: "https://github.com/misberner/signal-homebot"
 arch:
@@ -8,55 +8,26 @@ arch:
 startup: application
 boot: manual
 init: false
-# /config = the app's config folder on the host: holds the editable policy.json.
-map:
-  - type: app_config
-    read_only: false
+# Setup page (number, people, groups, actions) behind HA's admin login.
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:message-lock-outline"
+panel_title: "HomeBot"
 # Deliberately NO host port mappings. /notify is internal to the app network.
+# Options hold only secrets and connections; everything else is in the setup page.
 options:
-  setup_mode: "inspect"
-  signal_phone: ""
-  verification_code: ""
-  signal_captcha: ""
-  signal_bot_aci: ""
-  users: []
-  groups: []
-  require_verified_identity: true
-  bot_name: "HomeBot"
-  ha_base_url: "http://homeassistant:8123"
-  ha_mcp_url: "http://homeassistant:8123/api/mcp/assist"
-  ha_mcp_kind: "hass"
-  ha_mcp_domains: "light,climate,cover,weather"
-  ha_token: ""
   claude_oauth_token: ""
+  ha_mcp_kind: "hass"
+  ha_mcp_url: "http://homeassistant:8123/api/mcp/assist"
+  ha_mcp_domains: "light,climate,cover,weather"
+  ha_base_url: "http://homeassistant:8123"
+  ha_token: ""
   notify_token: ""
-  allow_writes: false
-  command_max_age_seconds: 300
-  history_days: 7
 schema:
-  setup_mode: "list(inspect|listen|register|verify|trust|claude_check|run)"
-  signal_phone: "str?"
-  verification_code: "str?"
-  signal_captcha: "str?"
-  signal_bot_aci: "str?"
-  # People allowed to talk to the bot; names are used in policy.json and /notify.
-  users:
-    - name: "match(^[a-z][a-z0-9_]{0,31}$)"
-      aci: "str"
-      safety_number: "match(^[0-9 ]*$)?"
-  # Signal groups the bot participates in (optional).
-  groups:
-    - name: "match(^[a-z][a-z0-9_]{0,31}$)"
-      id: "str"
-  require_verified_identity: bool
-  bot_name: "str"
-  ha_base_url: "url"
-  ha_mcp_url: "url"
-  ha_mcp_kind: "list(hass|ha_mcp)"
-  ha_mcp_domains: "match(^[a-z_]+(,[a-z_]+)*$)"
-  ha_token: "password?"
   claude_oauth_token: "password?"
+  ha_mcp_kind: "list(hass|ha_mcp)"
+  ha_mcp_url: "url"
+  ha_mcp_domains: "match(^[a-z_]+(,[a-z_]+)*$)"
+  ha_base_url: "url"
+  ha_token: "password?"
   notify_token: "password?"
-  allow_writes: bool
-  command_max_age_seconds: "int(30,3600)"
-  history_days: "int(1,30)"

@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HomeBot setup</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1c1f24; --muted: #646b75; --line: #dde1e6;
+          --accent: #1f6feb; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111418; --card: #1a1e24; --text: #e6e8eb; --muted: #9aa3ad; --line: #2c323a;
+            --accent: #4c8dff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 4px 0 16px; }
+  h2 { font-size: 17px; margin: 0 0 10px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 16px; margin-bottom: 14px; }
+  p.hint, .muted { color: var(--muted); font-size: 13px; margin: 4px 0 10px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 3px; }
+  input[type=text], input[type=number], textarea { width: 100%; padding: 8px 10px; font: inherit;
+         color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; }
+  textarea { min-height: 64px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  button { font: inherit; padding: 7px 14px; border-radius: 7px; border: 1px solid var(--line);
+           background: var(--bg); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.small { padding: 3px 10px; font-size: 13px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+  .row > * { flex: 1 1 180px; }
+  .row > button { flex: 0 0 auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td, th { text-align: left; padding: 7px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; border-top: none; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; border: 1px solid; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .action { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 10px 0; }
+  .checks label { display: inline-flex; gap: 5px; align-items: center; margin-right: 14px; color: var(--text); }
+  #toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); max-width: 92vw;
+           background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 8px; display: none; }
+  .table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>HomeBot setup</h1>
+
+  <section id="account">
+    <h2>1. Bot's Signal number</h2>
+    <div id="account-body"></div>
+  </section>
+
+  <section>
+    <h2>2. People</h2>
+    <p class="hint">Only these people can talk to the bot. To add someone, have them send the bot a
+      message; they appear under "Recently seen". Then verify their safety number: on their phone,
+      open the chat with the bot → tap its name → View safety number, and compare with the number below.</p>
+    <div class="table-wrap"><table id="users"></table></div>
+    <h2 style="margin-top:14px">Recently seen</h2>
+    <div class="table-wrap"><table id="seen"></table></div>
+  </section>
+
+  <section>
+    <h2>3. Groups (optional)</h2>
+    <p class="hint">The bot answers in a group when addressed with /ha, !ha or @-mention, and only while
+      every member is one of the people above.</p>
+    <div class="table-wrap"><table id="groups"></table></div>
+    <h2 style="margin-top:14px">Groups the bot is in</h2>
+    <div class="table-wrap"><table id="group-candidates"></table></div>
+  </section>
+
+  <section id="settings">
+    <h2>4. What the bot may change</h2>
+    <p class="hint">The bot can always <em>read</em> your home. Changes are off unless enabled here, and
+      every change still needs a "yes" (or 👍) from the person who asked, in their private chat.
+      Locks, alarms, cameras and administration can never be controlled.</p>
+    <label class="checks"><label><input type="checkbox" id="allow_writes"> Allow changes</label></label>
+    <p class="hint" id="write-token-hint"></p>
+    <div id="actions"></div>
+    <button onclick="addAction()">Add action</button>
+    <p class="hint">Fields, one per line: <code>brightness_pct: 1..100</code>,
+      <code>color_name: red | blue | white</code>, <code>oscillating: boolean</code>.
+      Entities: exact IDs or <code>light.*</code> for all of a domain.</p>
+  </section>
+
+  <section id="settings2">
+    <h2>5. Settings</h2>
+    <div class="row">
+      <div><label for="bot_name">Bot name (for @mentions)</label><input type="text" id="bot_name"></div>
+      <div><label for="command_max_age">Ignore requests older than (seconds)</label>
+        <input type="number" id="command_max_age" min="30" max="3600"></div>
+      <div><label for="history_days">Keep chat history (days)</label>
+        <input type="number" id="history_days" min="1" max="30"></div>
+    </div>
+    <label class="checks"><label><input type="checkbox" id="require_verified_identity">
+      Only accept people with a verified safety number (recommended)</label></label>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="saveSettings()">Save actions and settings</button>
+      <button onclick="runTest('ha')">Test Home Assistant</button>
+      <button onclick="runTest('claude')">Test Claude</button>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+let state = null;
+let dirty = false;  // unsaved edits in actions/settings: don't re-render them
+document.addEventListener('input', e => { if (e.target.closest('#settings, #settings2')) dirty = true; });
+document.addEventListener('change', e => { if (e.target.closest('#settings, #settings2')) dirty = true; });
+
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else if (v !== null && v !== undefined) e.setAttribute(k, v);
+  }
+  for (const c of children.flat()) e.append(c instanceof Node ? c : document.createTextNode(c ?? ''));
+  return e;
+}
+
+function toast(msg, bad = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block'; t.style.background = bad ? 'var(--bad)' : '';
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.style.display = 'none', bad ? 7000 : 3500);
+}
+
+async function api(path, data) {
+  const opts = data === undefined ? {} : {method: 'POST', body: JSON.stringify(data),
+    headers: {'Content-Type': 'application/json', 'X-HomeBot': '1'}};
+  const r = await fetch('api/' + path, opts);
+  let out = {};
+  try { out = await r.json(); } catch (e) { out = {error: await r.text().catch(() => r.statusText)}; }
+  if (!r.ok || out.error) throw new Error(out.error || r.statusText);
+  return out;
+}
+
+async function act(path, data) {
+  try { const out = await api(path, data); if (out.message) toast(out.message); await load(); return out; }
+  catch (e) { toast(e.message, true); }
+}
+
+function trustBadge(level) {
+  if (level === 'TRUSTED_VERIFIED') return el('span', {class: 'badge ok'}, 'verified');
+  if (level === 'TRUSTED_UNVERIFIED') return el('span', {class: 'badge warn'}, 'not verified');
+  if (level === 'UNTRUSTED') return el('span', {class: 'badge bad'}, 'key changed');
+  return el('span', {class: 'badge warn'}, 'no message yet');
+}
+
+function renderAccount() {
+  const a = state.account, box = document.getElementById('account-body');
+  box.replaceChildren();
+  if (a.number) {
+    box.append(el('p', {}, 'Registered as ', el('strong', {}, a.number), ' ',
+      el('span', {class: 'badge ok'}, 'active')),
+      el('p', {class: 'muted'}, 'Bot ID: ', el('code', {}, a.bot_aci || 'loading…')));
+    box.append(el('details', {}, el('summary', {class: 'muted'}, 'Register a different number'), registerForm()));
+    return;
+  }
+  box.append(el('p', {class: 'hint'}, 'Use a spare number that can receive SMS. This app becomes its main Signal device.'));
+  box.append(registerForm());
+  if (a.pending) {
+    const code = el('input', {type: 'text', id: 'code', inputmode: 'numeric', placeholder: '123456'});
+    const pin = el('input', {type: 'text', id: 'pin', placeholder: 'only if the number had a Signal PIN'});
+    box.append(el('h2', {style: 'margin-top:14px'}, 'Enter the code sent to ' + a.pending),
+      el('div', {class: 'row'}, el('div', {}, el('label', {}, 'Code'), code),
+        el('div', {}, el('label', {}, 'Registration lock PIN'), pin),
+        el('button', {class: 'primary', onclick: () => act('verify', {code: code.value, pin: pin.value})}, 'Verify')));
+  }
+}
+
+function registerForm() {
+  const num = el('input', {type: 'text', placeholder: '+4915112345678', value: state.account.pending || ''});
+  const cap = el('input', {type: 'text', placeholder: 'signalcaptcha://… (only if asked)'});
+  const voice = el('input', {type: 'checkbox'});
+  return el('div', {},
+    el('div', {class: 'row'}, el('div', {}, el('label', {}, 'Phone number'), num),
+      el('div', {}, el('label', {}, 'Captcha'), cap)),
+    el('p', {class: 'hint'}, 'Signal usually asks for a captcha: solve it at ',
+      el('a', {href: 'https://signalcaptchas.org/registration/generate.html', target: '_blank', rel: 'noopener'},
+        'signalcaptchas.org'), ', right-click "Open Signal", copy the link, paste it above, and request the code within a minute.'),
+    el('label', {class: 'checks'}, el('label', {}, voice, 'Call me instead of SMS')),
+    el('button', {class: 'primary', onclick: () => act('register', {number: num.value, captcha: cap.value, voice: voice.checked})},
+      'Request code'));
+}
+
+function renderUsers() {
+  const t = document.getElementById('users');
+  t.replaceChildren(el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Identity'), el('th', {}, 'Safety number'), el('th')));
+  if (!state.users.length) t.append(el('tr', {}, el('td', {colspan: 4, class: 'muted'}, 'Nobody yet.')));
+  for (const u of state.users) {
+    const sn = el('input', {type: 'text', placeholder: 'enter after comparing'});
+    t.append(el('tr', {},
+      el('td', {}, el('strong', {}, u.name), el('div', {}, el('code', {}, u.aci))),
+      el('td', {}, trustBadge(u.trust)),
+      el('td', {}, u.safety_number ? el('code', {}, u.safety_number) : el('span', {class: 'muted'}, '—'),
+        u.trust && u.trust !== 'TRUSTED_VERIFIED' ? el('div', {class: 'row', style: 'margin-top:6px'}, sn,
+          el('button', {class: 'small', onclick: () => act('trust', {name: u.name, safety_number: sn.value})}, 'Verify')) : ''),
+      el('td', {}, el('button', {class: 'small', onclick: () => confirm('Remove ' + u.name + '?') && act('users/remove', {name: u.name})}, 'Remove'))));
+  }
+  const s = document.getElementById('seen');
+  s.replaceChildren(el('tr', {}, el('th', {}, 'Signal profile'), el('th', {}, 'ID'), el('th', {}, 'Add as')));
+  if (!state.seen_senders.length) s.append(el('tr', {}, el('td', {colspan: 3, class: 'muted'},
+    state.account.number ? 'Nobody new. Send the bot a message and refresh.' : 'Register the bot first.')));
+  for (const p of state.seen_senders) {
+    const name = el('input', {type: 'text', placeholder: 'name, e.g. malte',
+      value: (p.profile_name || '').toLowerCase().replace(/[^a-z0-9_]/g, '').replace(/^[^a-z]+/, '')});
+    s.append(el('tr', {}, el('td', {}, p.profile_name || el('span', {class: 'muted'}, 'unknown')),
+      el('td', {}, el('code', {}, p.aci)),
+      el('td', {}, el('div', {class: 'row'}, name,
+        el('button', {class: 'small primary', onclick: () => act('users/add', {name: name.value, aci: p.aci})}, 'Add')))));
+  }
+}
+
+function renderGroups() {
+  const t = document.getElementById('groups');
+  t.replaceChildren(el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Status'), el('th')));
+  if (!state.groups.length) t.append(el('tr', {}, el('td', {colspan: 3, class: 'muted'}, 'No groups: the bot works by private chat only.')));
+  for (const g of state.groups) {
+    t.append(el('tr', {}, el('td', {}, el('strong', {}, g.name), ' ', g.title ? el('span', {class: 'muted'}, '(' + g.title + ')') : ''),
+      el('td', {}, g.problem ? el('span', {class: 'badge bad'}, g.problem) : el('span', {class: 'badge ok'}, 'ok')),
+      el('td', {}, el('button', {class: 'small', onclick: () => act('groups/remove', {name: g.name})}, 'Remove'))));
+  }
+  const c = document.getElementById('group-candidates');
+  c.replaceChildren(el('tr', {}, el('th', {}, 'Group'), el('th', {}, 'Members'), el('th', {}, 'Add as')));
+  if (!state.group_candidates.length) c.append(el('tr', {}, el('td', {colspan: 3, class: 'muted'},
+    'None. Add the bot\'s number to a Signal group and send a message there.')));
+  const known = Object.fromEntries(state.users.map(u => [u.aci, u.name]));
+  if (state.account.bot_aci) known[state.account.bot_aci] = 'the bot';
+  for (const g of state.group_candidates) {
+    const name = el('input', {type: 'text', placeholder: 'name, e.g. home'});
+    c.append(el('tr', {}, el('td', {}, g.title || el('code', {}, g.id)),
+      el('td', {}, g.members.length ? g.members.map(m => el('div', {}, known[m] || el('code', {class: 'warn'}, m + ' (not a user)'))) : el('span', {class: 'muted'}, '—')),
+      el('td', {}, el('div', {class: 'row'}, name,
+        el('button', {class: 'small primary', onclick: () => act('groups/add', {name: name.value, id: g.id})}, 'Add')))));
+  }
+}
+
+function fieldsToText(fields) {
+  return Object.entries(fields || {}).map(([k, s]) =>
+    'min' in s ? `${k}: ${s.min}..${s.max}` : 'values' in s ? `${k}: ${s.values.join(' | ')}` : `${k}: boolean`).join('\n');
+}
+
+function textToFields(txt, where) {
+  const fields = {};
+  for (const raw of txt.split('\n')) {
+    const line = raw.trim(); if (!line) continue;
+    const m = line.match(/^([a-z_][a-z0-9_]*)\s*:\s*(.+)$/);
+    if (!m) throw new Error(`${where}: can't read "${line}"`);
+    const [, name, spec] = m, range = spec.match(/^(-?[\d.]+)\s*\.\.\s*(-?[\d.]+)$/);
+    if (range) fields[name] = {min: Number(range[1]), max: Number(range[2])};
+    else if (spec.trim() === 'boolean') fields[name] = {type: 'boolean'};
+    else fields[name] = {values: spec.split('|').map(v => v.trim()).filter(Boolean)
+      .map(v => /^-?\d+(\.\d+)?$/.test(v) ? Number(v) : v)};
+  }
+  return fields;
+}
+
+function actionCard(rule = {service: '', entities: [], fields: {}, senders: [], contexts: ['dm']}) {
+  const service = el('input', {type: 'text', placeholder: 'light.turn_on', value: rule.service, 'data-k': 'service'});
+  const entities = el('input', {type: 'text', placeholder: 'light.kitchen, light.hallway', value: rule.entities.join(', '), 'data-k': 'entities'});
+  const fields = el('textarea', {placeholder: 'brightness_pct: 1..100', 'data-k': 'fields'});
+  fields.value = fieldsToText(rule.fields);
+  const who = el('div', {class: 'checks'}, 'Who: ', state.users.map(u =>
+    el('label', {}, el('input', {type: 'checkbox', 'data-user': u.name, ...(rule.senders.includes(u.name) ? {checked: ''} : {})}), u.name)));
+  const where = el('div', {class: 'checks'}, 'Where: ', ['dm', 'group'].map(c =>
+    el('label', {}, el('input', {type: 'checkbox', 'data-context': c, ...(rule.contexts.includes(c) ? {checked: ''} : {})}),
+      c === 'dm' ? 'private chat' : 'groups')));
+  const card = el('div', {class: 'action'},
+    el('div', {class: 'row'}, el('div', {}, el('label', {}, 'Service'), service),
+      el('div', {}, el('label', {}, 'Entities'), entities)),
+    el('label', {}, 'Allowed extra fields'), fields, who, where,
+    el('button', {class: 'small', onclick: () => { dirty = true; card.remove(); }}, 'Remove action'));
+  return card;
+}
+
+function addAction() { dirty = true; document.getElementById('actions').append(actionCard()); }
+
+function collectActions() {
+  return [...document.querySelectorAll('#actions .action')].map((card, i) => ({
+    service: card.querySelector('[data-k=service]').value.trim(),
+    entities: card.querySelector('[data-k=entities]').value.split(',').map(s => s.trim()).filter(Boolean),
+    fields: textToFields(card.querySelector('[data-k=fields]').value, `Action ${i + 1}`),
+    senders: [...card.querySelectorAll('[data-user]:checked')].map(c => c.dataset.user),
+    contexts: [...card.querySelectorAll('[data-context]:checked')].map(c => c.dataset.context),
+  }));
+}
+
+function renderSettings() {
+  document.getElementById('allow_writes').checked = state.allow_writes;
+  document.getElementById('require_verified_identity').checked = state.require_verified_identity;
+  document.getElementById('bot_name').value = state.account.bot_name;
+  document.getElementById('command_max_age').value = state.command_max_age;
+  document.getElementById('history_days').value = state.history_days;
+  document.getElementById('write-token-hint').textContent = state.ha.write_token ? '' :
+    'Changes also need an ha_token in the app Configuration tab.';
+  const box = document.getElementById('actions');
+  box.replaceChildren(...state.actions.map(r => actionCard(r)));
+}
+
+async function saveSettings() {
+  try {
+    await api('settings', {
+      actions: collectActions(),
+      allow_writes: document.getElementById('allow_writes').checked,
+      require_verified_identity: document.getElementById('require_verified_identity').checked,
+      bot_name: document.getElementById('bot_name').value.trim(),
+      command_max_age: Number(document.getElementById('command_max_age').value),
+      history_days: Number(document.getElementById('history_days').value),
+    });
+    dirty = false; toast('Saved.'); await load();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function runTest(what) {
+  toast(what === 'claude' ? 'Asking Claude…' : 'Checking Home Assistant…');
+  try { const r = await api('test', {what}); toast(r.message, !r.ok); } catch (e) { toast(e.message, true); }
+}
+
+async function load() {
+  try { state = await api('state'); } catch (e) { toast(e.message, true); return; }
+  renderAccount(); renderUsers(); renderGroups();
+  if (!dirty) renderSettings();
+}
+load();
+</script>
+</body>
+</html>

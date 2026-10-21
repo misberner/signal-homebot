@@ -63,6 +63,11 @@ class FakeSignalDaemon:
         self.send_results = 'SUCCESS'  # or e.g. 'NETWORK_FAILURE'
         self.connects: list[str | None] = []
         self.identities = {USER1: 'TRUSTED_VERIFIED', USER2: 'TRUSTED_VERIFIED'}
+        self.safety_numbers = {USER1: '1' * 60, USER2: '2' * 60}
+        self.accounts: list[dict] = [{'number': ACCOUNT, 'aci': BOT}]
+        self.pending_registration: str | None = None
+        self.require_captcha = True
+        self.next_ts = int(time.time() * 1000)
         self.group_members = [BOT, USER1, USER2]
         self.pending_members: list[str] = []
         self.rpc_methods: list[str] = []
@@ -104,12 +109,39 @@ class FakeSignalDaemon:
         assert body['jsonrpc'] == '2.0' and 'id' in body
         self.rpc_methods.append(body['method'])
         params = body.get('params') or {}
-        if body['method'] == 'listIdentities':  # ListIdentitiesCommand JsonIdentity
-            aci = params.get('number')
-            result = [{'number': None, 'uuid': aci, 'fingerprint': 'ab' * 33,
-                       'safetyNumber': '12345 ' * 12, 'scannableSafetyNumber': None,
-                       'trustLevel': self.identities[aci], 'addedTimestamp': 1}] if aci in self.identities else []
+        def ok(result):
             return web.json_response({'jsonrpc': '2.0', 'id': body['id'], 'result': result})
+
+        def error(message, code=-1):
+            return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
+                                      'error': {'code': code, 'message': message}})
+        method = body['method']
+        if method == 'listIdentities':  # ListIdentitiesCommand JsonIdentity
+            aci = params.get('number')
+            sn = self.safety_numbers.get(aci, '0' * 60)
+            return ok([{'number': None, 'uuid': aci, 'fingerprint': 'ab' * 33,
+                        'safetyNumber': ' '.join(sn[i:i + 5] for i in range(0, 60, 5)),
+                        'scannableSafetyNumber': None, 'trustLevel': self.identities[aci],
+                        'addedTimestamp': 1}] if aci in self.identities else [])
+        if method == 'listAccounts':  # ListAccountsCommand JsonAccount(number, aci)
+            return ok(self.accounts)
+        if method == 'register':  # RegistrationParams(voice, captcha, ...)
+            if self.require_captcha and not params.get('captcha'):
+                return error('Captcha required for verification, use --captcha CAPTCHA')
+            self.pending_registration = params['account']
+            return ok({})
+        if method == 'verify':  # VerifyParams(verificationCode, pin)
+            if params.get('account') != self.pending_registration or params.get('verificationCode') != '123456':
+                return error('Verify error: Invalid verification code')
+            self.accounts = [{'number': params['account'], 'aci': BOT}]
+            return ok({})
+        if method == 'trust':  # TrustCommand: recipient, verifiedSafetyNumber
+            aci, sn = params.get('recipient'), params.get('verifiedSafetyNumber')
+            if sn != self.safety_numbers.get(aci):
+                return error('Failed to set the trust for this number, make sure the number and the '
+                             'fingerprint/safety number are correct.')
+            self.identities[aci] = 'TRUSTED_VERIFIED'
+            return ok({})
         if body['method'] == 'listGroups':  # ListGroupsCommand JsonGroup
             group = {'id': GROUP, 'name': 'Home', 'description': None, 'isMember': True, 'isBlocked': False,
                      'messageExpirationTime': 0,
@@ -119,8 +151,7 @@ class FakeSignalDaemon:
                      'permissionEditDetails': 'ONLY_ADMINS', 'permissionSendMessage': 'EVERY_MEMBER',
                      'groupInviteLink': None, 'isTerminated': False}
             wanted = params.get('groupId') or [GROUP]
-            return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
-                                      'result': [group] if GROUP in wanted else []})
+            return ok([group] if GROUP in wanted else [])
         if body['method'] != 'send':
             return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
                                       'error': {'code': -32601, 'message': 'Method not implemented'}})
@@ -128,11 +159,11 @@ class FakeSignalDaemon:
             self.rpc_failures -= 1
             return web.json_response({'jsonrpc': '2.0', 'id': body['id'],
                                       'error': {'code': -5, 'message': 'Failed to send message due to rate limiting'}})
-        self.sent.append(body['params'])
+        self.next_ts += 1
+        self.sent.append({**body['params'], '_ts': self.next_ts})
         recipients = body['params'].get('recipient') or [USER1, USER2]
-        return web.json_response({'jsonrpc': '2.0', 'id': body['id'], 'result': {
-            'timestamp': int(time.time() * 1000),
-            'results': [{'recipientAddress': {'uuid': r}, 'type': self.send_results} for r in recipients]}})
+        return ok({'timestamp': self.next_ts,
+                   'results': [{'recipientAddress': {'uuid': r}, 'type': self.send_results} for r in recipients]})
 
     async def events_endpoint(self, req: web.Request) -> web.StreamResponse:
         last = req.headers.get('Last-Event-ID')
@@ -158,13 +189,13 @@ class FakeSignalDaemon:
             self.clients.remove(q)
         return resp
 
+    def messages_to(self, dest: str) -> list[dict]:
+        return [p for p in self.sent
+                if (dest.startswith('group:') and p.get('groupId') == dest[6:]) or
+                   (dest.startswith('dm:') and p.get('recipient') == [dest[3:]])]
+
     def texts_to(self, dest: str) -> list[str]:
-        out = []
-        for p in self.sent:
-            if (dest.startswith('group:') and p.get('groupId') == dest[6:]) or \
-               (dest.startswith('dm:') and p.get('recipient') == [dest[3:]]):
-                out.append(p['message'])
-        return out
+        return [p['message'] for p in self.messages_to(dest)]
 
 
 class FakeHomeAssistant:
@@ -186,6 +217,7 @@ class FakeHomeAssistant:
         self.mcp_auth_headers: list[str | None] = []
         self.mcp_fail = False
         self.overview: dict | None = None  # ha-mcp ha_get_overview result override
+        self.states = {'light.test_lamp': 'off', 'sensor.living_room_temperature': '21.5'}
         self.runner = None
         self.url = ''
 
@@ -277,6 +309,34 @@ def _start_mcp(read_only: bool) -> str:
             result = {**result, 'read_only_mode': True, 'read_only_mode_hint': 'Read Only Mode is ON'}
         return json.dumps(result)
 
+    @server.tool(name='ha_get_state')
+    def ha_get_state(entity_id: str | list[str], fields: list[str] | None = None) -> str:
+        """Get current state of entities."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_get_state')
+        fake.mcp_args.append({'entity_id': entity_id, 'fields': fields})
+        ids = entity_id if isinstance(entity_id, list) else [entity_id]
+        return json.dumps({'success': True, 'states': {e: {'state': fake.states.get(e, 'unknown')} for e in ids}})
+
+    @server.tool(name='ha_search')
+    def ha_search(query: str | None = None, domain_filter: str | None = None, area_filter: str | None = None,
+                  limit: int = 10, exact_match: bool = True, result_fields: list[str] | None = None) -> str:
+        """Search entities."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_search')
+        fake.mcp_args.append({'query': query, 'domain_filter': domain_filter, 'limit': limit})
+        return json.dumps({'success': True, 'entities': [{'entity_id': e, 'state': st}
+                                                         for e, st in fake.states.items()]})
+
+    @server.tool(name='ha_get_history')
+    def ha_get_history(entity_ids: str | list[str], start_time: str | None = None, limit: int | None = None,
+                       minimal_response: bool = True) -> str:
+        """State history."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_get_history')
+        fake.mcp_args.append({'entity_ids': entity_ids, 'start_time': start_time, 'limit': limit})
+        return json.dumps({'success': True, 'entities': {}})
+
     if not read_only:  # ha-mcp hides write-capable tools in Read Only Mode
         @server.tool(name='ha_call_service')
         def ha_call_service(domain: str, service: str, entity_id: str | None = None) -> str:
@@ -323,12 +383,31 @@ def _start_mcp(read_only: bool) -> str:
 
 
 FAKE_CLAUDE = r'''#!{python}
-import json, os, sys, time
+import asyncio, json, os, sys, time
 spec = json.load(open({spec!r}))
 prompt = sys.stdin.read()
+argv = sys.argv[1:]
+mcp_config = json.load(open(argv[argv.index('--mcp-config') + 1])) if '--mcp-config' in argv else None
 with open({record!r}, 'a') as f:
-    f.write(json.dumps({{'argv': sys.argv[1:], 'env': dict(os.environ), 'prompt': prompt,
-                        'cwd': os.getcwd()}}) + '\n')
+    f.write(json.dumps({{'argv': argv, 'env': dict(os.environ), 'prompt': prompt,
+                        'cwd': os.getcwd(), 'mcp_config': mcp_config}}) + '\n')
+tool_text = None
+if spec.get('call_tool') and mcp_config:
+    async def use_tool():
+        import httpx2
+        from mcp import Client
+        from mcp.client.streamable_http import streamable_http_client
+        server = mcp_config['mcpServers']['ha']
+        async with httpx2.AsyncClient(headers=server.get('headers', {{}})) as http:
+            async with Client(streamable_http_client(server['url'], http_client=http)) as client:
+                names = [t.name for t in (await client.list_tools()).tools]
+                result = await client.call_tool(spec['call_tool']['name'], spec['call_tool']['args'])
+                text = ' '.join(getattr(c, 'text', '') for c in result.content)
+                return json.dumps({{'tools': names, 'error': result.is_error, 'text': text}})
+    try:
+        tool_text = asyncio.run(use_tool())
+    except BaseException as err:
+        tool_text = json.dumps({{'exception': type(err).__name__}})
 mode = spec.get('mode', 'ok')
 if mode == 'hang':
     time.sleep(30)
@@ -343,7 +422,9 @@ if mode == 'limit':
     sys.exit(1)
 if mode == 'garbage':
     print('not json'); sys.exit(2)
-out = spec.get('output', {{'reply': 'ok', 'actions': []}})
+out = dict(spec.get('output', {{'reply': 'ok', 'actions': []}}))
+if tool_text is not None:
+    out['reply'] = tool_text
 print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 2,
                   'result': json.dumps(out), 'structured_output': out, 'api_error_status': None}}))
 '''
@@ -359,8 +440,9 @@ class FakeClaude:
         self.path.chmod(self.path.stat().st_mode | stat.S_IEXEC)
         self.set()
 
-    def set(self, reply='ok', actions=(), mode='ok'):
-        self.spec.write_text(json.dumps({'mode': mode, 'output': {'reply': reply, 'actions': list(actions)}}))
+    def set(self, reply='ok', actions=(), mode='ok', call_tool=None):
+        self.spec.write_text(json.dumps({'mode': mode, 'call_tool': call_tool,
+                                         'output': {'reply': reply, 'actions': list(actions)}}))
 
     @property
     def calls(self) -> list[dict]:

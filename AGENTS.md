@@ -16,10 +16,14 @@ This repository is an agent connected to **physical home devices**.
 - Use `claude -p --output-format json --json-schema` with no built-in/MCP tools.
 - Don't use `--dangerously-skip-permissions`, `--bare` (which ignores subscription
   login) or `ANTHROPIC_API_KEY` (which could incur separate usage charges).
-- Every write needs a single-use DM confirmation; never add an auto-execute
-  path. Never retry an HA action whose outcome is `unknown`.
-- The bot (not Claude) makes exactly one fixed read-only MCP call per request
-  (`GetLiveContext` or ha-mcp `ha_get_overview`). Never call other MCP tools.
+- Every write needs a single-use confirmation (yes/👍) from the requester in
+  their DM; never add an auto-execute path. Never retry an `unknown` HA action.
+- Claude reads HA only through the bot's local MCP proxy (`bot/ha_tools.py`):
+  a fixed list of read tools with constrained arguments, a per-request token,
+  and an upstream read-only check. Never expose write tools or HA credentials
+  to Claude. Writes go only through the policy gateway (`validate_action`).
+- Controllable domains are a fixed allowlist in `bot/core.py`
+  (`WRITABLE_DOMAINS`); never add locks, alarms, cameras, notify or admin.
 - Never log message text, tokens, or MCP URLs (ha-mcp URLs contain a secret).
 - Process users: signal-cli = `signal`, bot = `homebot`, Claude broker +
   Claude = `node`; root only in `run.sh`. Never give the bot the Claude token
@@ -27,6 +31,8 @@ This repository is an agent connected to **physical home devices**.
 - Senders must have verified identity keys (`listIdentities`), and the group
   roster must contain only the bot and configured users before anything is
   posted there. Users and groups are lists in the app options (no fixed count).
+- Household settings (number, people, groups, actions) live in the setup page
+  (`bot/webui.py`, ingress-only); app options hold only secrets/connections.
 - Layout: HA app repository. The app lives in `signal_claude/` (keep the slug:
   changing it orphans the users' `/data`). Bump `version` in
   `signal_claude/config.yaml` for every release users should receive.

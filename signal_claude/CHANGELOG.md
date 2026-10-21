@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.7.0 — 2026-10-22
+
+**Breaking:** setup moved to the new setup page. The old `setup_mode`,
+`signal_*`, `users`, `groups`, `allow_writes` and similar options are gone.
+An already-registered number is adopted automatically; add people and groups
+again in the setup page.
+
+### Claude reads Home Assistant itself
+- The fixed state snapshot is replaced by read tools that Claude calls as
+  needed. A local MCP proxy in the bot (127.0.0.1, per-request token) offers:
+  - ha-mcp: `search_entities`, `get_states`, `get_overview`, `get_history`;
+  - HA's built-in server: `get_live_context`.
+
+  It forwards calls upstream with constrained arguments, after the read-only
+  check. Claude never holds HA credentials.
+- Claude Code flags: `--safe-mode` dropped, because it silently ignores
+  `--mcp-config` (verified). Now `--tools ''`, `--setting-sources ''`,
+  `--disable-slash-commands`, `--strict-mcp-config`, and only the proxy's
+  tools in `--allowedTools`. The MCP config is written to a private file,
+  not argv.
+- Verified with real Claude Code 2.1.306: it called `get_states` through the
+  proxy and answered from the result.
+
+### Generic actions
+- Policy entries are `{service, entities, fields, senders, contexts}`, with
+  per-field limits: number ranges, value lists, booleans. Services come from
+  a fixed list of controllable domains. Locks, alarms, cameras, notify,
+  automations, shell/REST commands and administration can never be
+  controlled.
+
+### Setup page (HA ingress)
+- Covers registration (captcha, SMS/voice code, PIN), people and groups the
+  bot has recently seen (IDs only), safety-number verification, the action
+  editor, settings, and Home Assistant/Claude tests.
+- Reachable only through Supervisor's ingress proxy; changes require a
+  custom header.
+- Household settings live in `/data/homebot/settings.json`; the
+  Configuration tab keeps only secrets and connections. The `policy.json`
+  file and the config-folder mapping are gone.
+- signal-cli runs in multi-account mode so the page can register numbers.
+
+### Confirmations
+- Confirm with "yes" or a 👍 reaction to the bot's question; "no" or 👎
+  cancels. A reaction or quoted reply targets that exact question. A bare
+  "yes" works when exactly one question is open.
+- Still private-chat only, by the requester only, fresh only, single use,
+  2-minute expiry.
+
+### Tests: 75 → 85
+Covers the read-tool proxy (real MCP on both sides; tokens; argument
+limits), generic actions, reply and reaction confirmations, the setup-page
+flow (register → verify → add → trust → actions), household settings
+validation, and account adoption.
+
+
 ## 0.6.0 — 2026-10-21
 ### Changed (options)
 - **Any number of users and groups.** The fixed `signal_user1_aci`,

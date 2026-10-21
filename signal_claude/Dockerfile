@@ -2,7 +2,7 @@
 # Base image pinned by digest (node:22-trixie-slim, multi-arch index).
 FROM node:22-trixie-slim@sha256:8eb619e402eaede1748a3c8173bffab391592812e85136452f781741c7242ddf
 
-ARG BUILD_VERSION=0.6.0
+ARG BUILD_VERSION=0.7.0
 ARG BUILD_ARCH=amd64
 LABEL io.hass.version="${BUILD_VERSION}" \
       io.hass.type="app" \
@@ -44,7 +44,6 @@ RUN python3 -m venv /opt/homebot/.venv && \
     /opt/homebot/.venv/bin/pip install --no-cache-dir --retries 5 --no-deps -r requirements.lock
 COPY bot/ /opt/homebot/bot/
 COPY scripts/ /opt/homebot/scripts/
-COPY policy.json /opt/homebot/
 COPY run.sh /run.sh
 RUN chmod 755 /run.sh
 

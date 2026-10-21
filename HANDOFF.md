@@ -1,6 +1,6 @@
 # Engineering handoff — Signal HomeBot (Claude Code + Home Assistant)
 
-**Status:** 0.5.0 hardened prototype; **NOT deployment-ready** until the on-device checklist in DOCS.md passes.  
+**Status:** 0.7.0 hardened prototype; **NOT deployment-ready** until the on-device checklist in DOCS.md passes.  
 **Prepared:** 2026-10-21 · **Updated:** 2026-10-21 (0.5.0, see section 0 and CHANGELOG.md)  
 **Intended next developer:** Codex (or a human engineer) working **on this repository**.  
 **Important distinction:** The deployed bot should **run Claude Code**, not Codex. Codex is only the development/review assistant for this hardening effort.
@@ -30,7 +30,7 @@ work:
 - Policy: 0.5.0 loads `/config/policy.json` (add-on config folder); edits
   need a restart, not a rebuild.
 
-## 0b. Next: approved redesign (not started; findings verified 2026-10-21)
+## 0b. Redesign (done in 0.7.0, 2026-10-22; notes kept for reference)
 
 The user approved fixing these, in this order:
 1. **Claude reads HA via tools, not a fixed snapshot.** The bot runs a local MCP
