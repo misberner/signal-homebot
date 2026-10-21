@@ -61,13 +61,26 @@ case "${SETUP_MODE}" in
     echo "Requesting Signal registration SMS for ${SIGNAL_ACCOUNT}..."
     args=()
     if [[ -n "${SIGNAL_CAPTCHA}" ]]; then args+=(--captcha "${SIGNAL_CAPTCHA}"); fi
-    signal_cli -a "${SIGNAL_ACCOUNT}" register "${args[@]}"
+    # signal-cli prints nothing on success, so say what happened.
+    if signal_cli -a "${SIGNAL_ACCOUNT}" register "${args[@]}"; then
+      echo "OK: Signal sent a verification code to ${SIGNAL_ACCOUNT}."
+      echo "Next: put it in verification_code, set setup_mode to verify, and start again."
+    else
+      echo "Registration request FAILED (see the message above)." >&2
+      exit 1
+    fi
     ;;
   verify)
     : "${SIGNAL_ACCOUNT:?Set signal_phone}"
     : "${VERIFY_CODE:?Set verification_code from SMS}"
     echo "Verifying Signal registration..."
-    signal_cli -a "${SIGNAL_ACCOUNT}" verify "${VERIFY_CODE}"
+    if signal_cli -a "${SIGNAL_ACCOUNT}" verify "${VERIFY_CODE}"; then
+      echo "OK: ${SIGNAL_ACCOUNT} is registered; this app is now its primary Signal device."
+      echo "Next: clear verification_code and signal_captcha, then run setup_mode inspect."
+    else
+      echo "Verification FAILED (see the message above). Codes expire; request a new one with register." >&2
+      exit 1
+    fi
     ;;
   trust)
     : "${SIGNAL_ACCOUNT:?Set signal_phone}"
@@ -111,6 +124,12 @@ case "${SETUP_MODE}" in
       /opt/homebot/scripts/LibsignalCheck.java 2>&1 | tail -1
     echo "Signal accounts (registration must be completed first):"
     signal_cli --output=json listAccounts || true
+    if [[ -n "${SIGNAL_ACCOUNT}" ]]; then
+      echo "Bot account ID (put into signal_bot_aci):"
+      signal_cli --output=json listAccounts 2>/dev/null | python3 -c 'import json,sys
+for a in json.load(sys.stdin):
+    print("  ", a.get("uuid") or a.get("aci") or a)' || true
+    fi
     if [[ -n "${SIGNAL_ACCOUNT}" ]]; then
       echo "Signal groups:"
       signal_cli -a "${SIGNAL_ACCOUNT}" --output=json listGroups || true

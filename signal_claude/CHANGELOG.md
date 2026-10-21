@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2 — 2026-10-21
+- `register` and `verify` print an explicit OK/FAILED line and the next step.
+  signal-cli prints nothing on success, which looked like a hang.
+- `inspect` prints the bot account ID to copy into `signal_bot_aci`.
+
+
 ## 0.5.1 — 2026-10-21
 
 ### Fixed
