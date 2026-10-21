@@ -1,6 +1,6 @@
 name: "Signal HomeBot (Claude)"
 description: "Private Signal bot powered by Claude Code and Home Assistant MCP"
-version: "0.5.2"
+version: "0.6.0"
 slug: "signal_claude"
 url: "https://github.com/misberner/signal-homebot"
 arch:
@@ -19,12 +19,9 @@ options:
   verification_code: ""
   signal_captcha: ""
   signal_bot_aci: ""
-  signal_user1_aci: ""
-  signal_user2_aci: ""
-  signal_user1_safety_number: ""
-  signal_user2_safety_number: ""
+  users: []
+  groups: []
   require_verified_identity: true
-  signal_group_id: ""
   bot_name: "HomeBot"
   ha_base_url: "http://homeassistant:8123"
   ha_mcp_url: "http://homeassistant:8123/api/mcp/assist"
@@ -42,12 +39,16 @@ schema:
   verification_code: "str?"
   signal_captcha: "str?"
   signal_bot_aci: "str?"
-  signal_user1_aci: "str?"
-  signal_user2_aci: "str?"
-  signal_user1_safety_number: "match(^[0-9 ]*$)?"
-  signal_user2_safety_number: "match(^[0-9 ]*$)?"
+  # People allowed to talk to the bot; names are used in policy.json and /notify.
+  users:
+    - name: "match(^[a-z][a-z0-9_]{0,31}$)"
+      aci: "str"
+      safety_number: "match(^[0-9 ]*$)?"
+  # Signal groups the bot participates in (optional).
+  groups:
+    - name: "match(^[a-z][a-z0-9_]{0,31}$)"
+      id: "str"
   require_verified_identity: bool
-  signal_group_id: "str?"
   bot_name: "str"
   ha_base_url: "url"
   ha_mcp_url: "url"

@@ -42,7 +42,7 @@ def incoming(ts_offset_s=0.0, server_offset_s=None, expires=0, now=None):
 
 class ParseTests(unittest.TestCase):
     def parse(self, event):
-        return parse_signal_event(event, BOT, USERS, GROUP)
+        return parse_signal_event(event, BOT, USERS, {GROUP})
 
     def test_one_group_and_two_dms(self):
         a = self.parse(signal_event(USER1, GROUP))
@@ -74,7 +74,8 @@ class ParseTests(unittest.TestCase):
 
     def test_mentions_and_remote_delete(self):
         msg = parse_signal_event(signal_event(USER1, GROUP, '￼ lamp?', mentions=[
-            {'uuid': BOT, 'start': 0, 'length': 1}]), BOT, USERS, GROUP, 'HomeBot')
+            {'uuid': BOT, 'start': 0, 'length': 1}]), BOT, USERS, {GROUP}, 'HomeBot')
+        self.assertIsNone(parse_signal_event(signal_event(USER1, GROUP), BOT, USERS, set()))  # no groups
         self.assertTrue(msg.mentions_bot)
         self.assertEqual(msg.text, '@HomeBot lamp?')
         deletion = self.parse(signal_event(USER2, GROUP, None, remoteDelete={'targetTimestamp': 42}))
@@ -110,9 +111,12 @@ class TrustTests(unittest.TestCase):
             return [{**g, **kw}]
         self.assertIsNone(group_roster_problem(group(), GROUP, BOT, USERS))
         self.assertIsNone(group_roster_problem(group(requestingMembers=[{'uuid': 'x'}]), GROUP, BOT, USERS))
+        # A subset of the configured users is fine, and so is inviting one of them.
+        self.assertIsNone(group_roster_problem(group(members=[{'uuid': BOT}, {'uuid': USER1}],
+                                                     pendingMembers=[{'uuid': USER2}]), GROUP, BOT, USERS))
         for bad in (group(members=[{'uuid': u} for u in (BOT, USER1, USER2, 'evil')]),
-                    group(members=[{'uuid': u} for u in (BOT, USER1)]),
-                    group(members=[{'uuid': u} for u in (BOT, USER1, USER2, USER2)]),
+                    group(members=[{'uuid': u} for u in (USER1, USER2)]),                 # bot missing
+                    group(members=[{'uuid': BOT}, {'uuid': USER1}, {'number': '+49'}]),   # unknown uuid
                     group(pendingMembers=[{'uuid': 'evil'}]), group(isMember=False),
                     group(isBlocked=True), group(isTerminated=True), group(members=None),
                     group(id='other'), None, []):
@@ -148,7 +152,7 @@ class PolicyTests(unittest.TestCase):
             {'actions': {'light_on': {'entities': ['lock.front_door']}}},
             {'actions': {'light_on': {'entities': ['light.x'], 'service': 'lock.unlock'}}},
             {'actions': {'light_on': {'entities': ['light.x'], 'confirmation': False}}},
-            {'actions': {'light_on': {'entities': ['light.x'], 'senders': ['admin']}}},
+            {'actions': {'light_on': {'entities': ['light.x'], 'senders': ['Not A Name']}}},
             {'actions': {'light_on': {'entities': ['light.x'], 'contexts': ['everywhere']}}},
             {'actions': {'temperature_set': {'entities': ['climate.x'], 'temperature_min': 10,
                                              'temperature_max': 40}}},

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0 — 2026-10-21
+### Changed (options)
+- **Any number of users and groups.** The fixed `signal_user1_aci`,
+  `signal_user2_aci`, `signal_userN_safety_number` and `signal_group_id` options
+  are replaced by two lists:
+  - `users: [{name, aci, safety_number}]` (at least one)
+  - `groups: [{name, id}]` (may be empty: DMs only)
+
+  Names are what `policy.json` `senders`, `/notify` targets and Claude's
+  transcript labels use. Startup fails on duplicate ACIs, the bot's own ACI,
+  user/group name clashes, or policy senders that aren't configured users.
+- Group roster rule: every member and pending invitee must be a configured
+  user. This replaces "exactly bot + two users", so a group may contain any
+  subset of them.
+- `trust` verifies each configured user independently; unverified users are
+  ignored until verified.
+
+
 ## 0.5.2 — 2026-10-21
 - `register` and `verify` print an explicit OK/FAILED line and the next step.
   signal-cli prints nothing on success, which looked like a hang.

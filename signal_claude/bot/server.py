@@ -24,7 +24,7 @@ from .core import (Store, Incoming, RemoteDelete, Settings, Denied, ClaudeError,
                    addressed, freshness, parse_signal_event, load_policy, permitted,
                    validate_action, describe, build_schema, parse_claude_output,
                    ha_mcp_overview_args, render_overview, identity_trusted, group_roster_problem,
-                   ACTIONS, APPROVAL_TTL)
+                   ACTIONS, APPROVAL_TTL, NAME_RE)
 
 LOG = logging.getLogger('homebot')
 ROOT = Path(__file__).resolve().parent.parent
@@ -52,8 +52,8 @@ class UnsafeDestination(RuntimeError):
 @dataclass
 class Config:
     bot_aci: str
-    users: dict[str, str]  # role ('user1'/'user2') -> ACI (lowercase)
-    group_id: str
+    users: dict[str, str]   # name -> ACI (lowercase); at least one
+    groups: dict[str, str]  # name -> Signal group id; may be empty (DMs only)
     ha_url: str
     mcp_url: str
     ha_token: str
@@ -92,8 +92,8 @@ class Config:
             raise ValueError('HA_TOKEN is required for writes and for the built-in HA MCP server')
         return cls(
             bot_aci=env['SIGNAL_BOT_ACI'].lower(),
-            users={'user1': env['SIGNAL_USER1_ACI'].lower(), 'user2': env['SIGNAL_USER2_ACI'].lower()},
-            group_id=env['SIGNAL_GROUP_ID'],
+            users={u['name']: u['aci'].lower() for u in named_list(env.get('USERS_JSON', '[]'), 'aci')},
+            groups={g['name']: g['id'] for g in named_list(env.get('GROUPS_JSON', '[]'), 'id')},
             ha_url=env['HA_BASE_URL'].rstrip('/'),
             mcp_url=env['HA_MCP_URL'],
             ha_token=env.get('HA_TOKEN', ''),
@@ -118,9 +118,18 @@ class Config:
 class HomeBot:
     def __init__(self, config: Config, clock: Callable[[], float] = time.time):
         self.cfg = config
-        if len(set(config.users.values())) != 2 or config.bot_aci in config.users.values():
-            raise ValueError('Configure two distinct user ACIs that differ from the bot ACI')
-        self.roles = {aci: role for role, aci in config.users.items()}
+        acis = list(config.users.values())
+        if not acis or len(set(acis)) != len(acis) or config.bot_aci in acis:
+            raise ValueError('Configure at least one user; user ACIs must be distinct and not the bot ACI')
+        if set(config.users) & set(config.groups):
+            raise ValueError('User and group names must not overlap')
+        if len(set(config.groups.values())) != len(config.groups):
+            raise ValueError('Group ids must be distinct')
+        unknown = {n for rule in config.policy.values() for n in rule['senders']} - set(config.users)
+        if unknown:
+            raise ValueError(f'policy.json names unknown users: {sorted(unknown)}')
+        self.roles = {aci: name for name, aci in config.users.items()}
+        self.group_ids = set(config.groups.values())
         self.clock = clock
         self.store = Store(config.db_path)
         self.lock = asyncio.Lock()  # one message at a time; state changes are serialized
@@ -148,9 +157,10 @@ class HomeBot:
     def destination_params(self, dest: str) -> dict:
         """Only the configured group and the two users are reachable."""
         if dest.startswith('group:'):
-            if dest.removeprefix('group:') != self.cfg.group_id:
+            group_id = dest.removeprefix('group:')
+            if group_id not in self.group_ids:
                 raise ValueError('Unknown group')
-            return {'groupId': self.cfg.group_id}
+            return {'groupId': group_id}
         if dest.startswith('dm:'):
             aci = dest.removeprefix('dm:').lower()
             if aci not in self.roles:
@@ -168,16 +178,16 @@ class HomeBot:
             return False
         return identity_trusted(identities, aci, self.cfg.require_verified_identity)
 
-    async def group_problem(self) -> str | None:
-        """Why replying in the group would be unsafe, or None."""
+    async def group_problem(self, group_id: str) -> str | None:
+        """Why posting in this group would be unsafe, or None."""
         try:
-            groups = await self.signal_rpc('listGroups', {'groupId': [self.cfg.group_id]})
+            groups = await self.signal_rpc('listGroups', {'groupId': [group_id]})
         except Exception as err:
             return f'group lookup failed ({type(err).__name__})'
-        return group_roster_problem(groups, self.cfg.group_id, self.cfg.bot_aci, set(self.roles))
+        return group_roster_problem(groups, group_id, self.cfg.bot_aci, set(self.roles))
 
     async def send_now(self, dest: str, text: str) -> None:
-        if dest.startswith('group:') and (problem := await self.group_problem()):
+        if dest.startswith('group:') and (problem := await self.group_problem(dest.removeprefix('group:'))):
             raise UnsafeDestination(problem)
         result = await self.signal_rpc('send', {**self.destination_params(dest), 'message': text})
         results = result.get('results') if isinstance(result, dict) else None
@@ -271,7 +281,7 @@ class HomeBot:
         try:
             event = json.loads(data)
             msg = parse_signal_event(event, self.cfg.bot_aci, set(self.roles),
-                                     self.cfg.group_id, self.cfg.bot_name)
+                                     self.group_ids, self.cfg.bot_name)
         except ValueError:
             LOG.warning('Ignoring malformed Signal event')
             return
@@ -452,11 +462,11 @@ type, entity_id and temperature (null unless temperature_set).
                     self.enqueue((msg.conv, f'Your request from {when} reached me too late and was '
                                             'not processed. Please send it again if still needed.'))
                 return
-            if msg.group and (problem := await self.group_problem()):
+            if msg.group and (problem := await self.group_problem(msg.conv.removeprefix('group:'))):
                 if self.store.add(msg, self.cfg.settings):
                     LOG.warning('Not answering in the group: %s', problem)
                     self.enqueue((f'dm:{msg.sender}', f'I did not answer in the group: {problem}. '
-                                                      'The group must contain only the two of you and me.'))
+                                                      'Everyone in it must be a configured user.'))
                 return
             if not self.store.add_with_job(msg, self.now(), self.cfg.settings):
                 return  # duplicate delivery
@@ -559,8 +569,8 @@ type, entity_id and temperature (null unless temperature_set).
             raise web.HTTPBadRequest(text='Provide a message of 1-4000 characters')
         if notify_id is not None and (not isinstance(notify_id, str) or not 0 < len(notify_id) <= 128):
             raise web.HTTPBadRequest(text='id must be a string of 1-128 characters')
-        if target == 'group':
-            dest = f'group:{self.cfg.group_id}'
+        if target in self.cfg.groups:
+            dest = f'group:{self.cfg.groups[target]}'
         elif target in self.cfg.users:
             dest = f'dm:{self.cfg.users[target]}'
         else:
@@ -601,6 +611,22 @@ type, entity_id and temperature (null unless temperature_set).
         finally:
             if runner:
                 await runner.cleanup()
+
+
+def named_list(raw: str, key: str) -> list[dict]:
+    """Parse the ``users``/``groups`` app options: [{"name": ..., key: ...}, ...]."""
+    items = json.loads(raw)
+    if not isinstance(items, list):
+        raise ValueError('expected a list')
+    names = set()
+    for item in items:
+        if (not isinstance(item, dict) or not isinstance(item.get('name'), str)
+                or not re.fullmatch(NAME_RE, item['name']) or not isinstance(item.get(key), str)
+                or not item[key].strip() or item['name'] in names):
+            raise ValueError(f'each entry needs a unique lowercase name and a non-empty {key}')
+        names.add(item['name'])
+        item[key] = item[key].strip()
+    return items
 
 
 def policy_file(path: str) -> Path:

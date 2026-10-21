@@ -29,7 +29,7 @@ ACTIONS = {
     'light_off': 'light.turn_off',
     'temperature_set': 'climate.set_temperature',
 }
-ROLES = ('user1', 'user2')
+NAME_RE = r'[a-z][a-z0-9_]{0,31}'  # user and group names (options, policy, notify)
 CONTEXTS = ('dm', 'group')
 
 
@@ -63,7 +63,7 @@ class Settings:
     history_days: int = 7
 
 
-def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_id: str,
+def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_ids: set[str],
                        bot_name: str = 'HomeBot') -> Incoming | RemoteDelete | None:
     """Never trust the text for identity. Use Signal metadata from signal-cli.
 
@@ -89,7 +89,8 @@ def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_id: str
         return None
     grp = dm.get('groupInfo')
     if grp is not None:
-        if not isinstance(grp, dict) or grp.get('groupId') != group_id:
+        group_id = grp.get('groupId') if isinstance(grp, dict) else None
+        if not isinstance(group_id, str) or group_id not in group_ids:
             return None
         if grp.get('type') not in (None, 'DELIVER'):
             return None  # group updates, not messages
@@ -195,11 +196,11 @@ def identity_trusted(identities: object, aci: str, require_verified: bool) -> bo
 
 
 def group_roster_problem(groups: object, group_id: str, bot_aci: str, users: set[str]) -> str | None:
-    """Check a signal-cli ``listGroups`` result before replying in the group.
+    """Check a signal-cli ``listGroups`` result before replying in a group.
 
-    The group must contain exactly the bot and the two users, with no pending
-    invitations: anyone else would read the bot's replies (home state and the
-    conversation history). Returns a reason, or None if the roster is safe.
+    Every member and pending invitee must be the bot or a configured user:
+    anyone else would read the bot's replies (home state and the conversation
+    history). Returns a reason, or None if the roster is safe.
     """
     if not isinstance(groups, list):
         return 'group lookup failed'
@@ -211,11 +212,16 @@ def group_roster_problem(groups: object, group_id: str, bot_aci: str, users: set
     members = group.get('members')
     if not isinstance(members, list):
         return 'member list missing'
-    uuids = {str(m.get('uuid') or '').lower() for m in members if isinstance(m, dict)}
-    if len(uuids) != len(members) or uuids != {bot_aci.lower(), *users}:
-        return 'unexpected members'
-    if group.get('pendingMembers'):
-        return 'pending invitations'
+    allowed = {bot_aci.lower(), *users}
+    uuids = [str(m.get('uuid') or '').lower() if isinstance(m, dict) else '' for m in members]
+    if bot_aci.lower() not in uuids:
+        return 'bot is not listed as a member'
+    if any(u not in allowed for u in uuids):
+        return 'someone other than the configured users is a member'
+    pending = group.get('pendingMembers') or []
+    if not isinstance(pending, list) or any(
+            not isinstance(m, dict) or str(m.get('uuid') or '').lower() not in users for m in pending):
+        return 'someone other than the configured users is invited'
     return None
 
 
@@ -245,8 +251,9 @@ def load_policy(raw: object) -> dict:
                 not all(isinstance(e, str) and re.fullmatch(re.escape(domain) + r'\.[a-z0-9_]+', e)
                         for e in entities)):
             raise ValueError(f'{kind}: entities must be {domain}.* entity IDs')
-        if not isinstance(senders, list) or set(senders) - set(ROLES):
-            raise ValueError(f'{kind}: senders must be a subset of {ROLES}')
+        if not isinstance(senders, list) or not all(isinstance(n, str) and re.fullmatch(NAME_RE, n)
+                                                    for n in senders):
+            raise ValueError(f'{kind}: senders must be a list of user names')
         if not isinstance(contexts, list) or set(contexts) - set(CONTEXTS):
             raise ValueError(f'{kind}: contexts must be a subset of {CONTEXTS}')
         entry = {'entities': list(entities), 'senders': list(senders), 'contexts': list(contexts)}
@@ -262,7 +269,7 @@ def load_policy(raw: object) -> dict:
 
 def permitted(policy: dict, writes_enabled: bool, role: str | None, context: str) -> dict:
     """The subset of the policy usable by this sender in this context."""
-    if not writes_enabled or role not in ROLES:
+    if not writes_enabled or not role:
         return {}
     return {kind: rule for kind, rule in policy.items()
             if rule['entities'] and role in rule['senders'] and context in rule['contexts']}

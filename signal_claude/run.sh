@@ -84,24 +84,24 @@ case "${SETUP_MODE}" in
     ;;
   trust)
     : "${SIGNAL_ACCOUNT:?Set signal_phone}"
-    : "${SIGNAL_USER1_ACI:?Set signal_user1_aci}"
-    : "${SIGNAL_USER2_ACI:?Set signal_user2_aci}"
     echo "Compare each safety number with the one on that person's phone (Signal: conversation"
-    echo "with the bot > View safety number). Only if they match, enter it in the options and run"
-    echo "this mode again. signal-cli refuses numbers that do not match the stored identity key."
-    for n in 1 2; do
-      aci_var="SIGNAL_USER${n}_ACI"; sn_var="SIGNAL_USER${n}_SAFETY_NUMBER"
-      aci="${!aci_var}"; sn="${!sn_var// /}"
-      echo "user${n} (${aci}):"
+    echo "with the bot > View safety number). Only if they match, enter it as that user's"
+    echo "safety_number and run this mode again. signal-cli refuses numbers that do not match."
+    while IFS=$'\t' read -r name aci sn; do
+      sn="${sn// /}"
+      echo "${name} (${aci}):"
       if [[ -n "$sn" ]]; then
-        if signal_cli -a "${SIGNAL_ACCOUNT}" trust -v "$sn" "$aci"; then
+        if signal_cli -a "${SIGNAL_ACCOUNT}" trust -v "$sn" "$aci" < /dev/null; then
           echo "  verified"
         else
           echo "  NOT verified: the entered safety number does not match" >&2
         fi
       fi
-      signal_cli -a "${SIGNAL_ACCOUNT}" --output=json listIdentities -n "$aci" | python3 scripts/show_identities.py
-    done
+      signal_cli -a "${SIGNAL_ACCOUNT}" --output=json listIdentities -n "$aci" < /dev/null \
+        | python3 scripts/show_identities.py
+    done < <(python3 -c 'import json,sys
+for u in json.loads(sys.argv[1]):
+    print(u.get("name", ""), u.get("aci", ""), u.get("safety_number") or "", sep="\t")' "${USERS_JSON}")
     ;;
   claude_check)
     echo "Checking Claude Code installation and configured subscription authentication..."
@@ -143,7 +143,8 @@ for a in json.load(sys.stdin):
     # NOTIFY_TOKEN is optional: without it the /notify webhook is disabled.
     # HA_TOKEN is needed for writes and for the built-in HA MCP server, not for
     # read-only use of ha-mcp (whose secret is part of ha_mcp_url).
-    required=(SIGNAL_ACCOUNT SIGNAL_BOT_ACI SIGNAL_USER1_ACI SIGNAL_USER2_ACI SIGNAL_GROUP_ID HA_MCP_URL CLAUDE_OAUTH_TOKEN)
+    # At least one entry in users is required (checked by the bot); groups are optional.
+    required=(SIGNAL_ACCOUNT SIGNAL_BOT_ACI HA_MCP_URL CLAUDE_OAUTH_TOKEN)
     if [[ "${ALLOW_WRITES}" == true || "${HA_MCP_KIND}" == hass ]]; then required+=(HA_TOKEN); fi
     for key in "${required[@]}"; do
       if [[ -z "${!key:-}" ]]; then echo "Missing ${key}; check app configuration" >&2; exit 2; fi
@@ -176,8 +177,8 @@ for a in json.load(sys.stdin):
     echo 'Starting HomeBot'
     run_as homebot env -i PATH="$BASE_PATH" HOME=/data/homebot LANG=C.UTF-8 PYTHONUNBUFFERED=1 \
       SIGNAL_DAEMON_URL=http://127.0.0.1:7583 SIGNAL_ACCOUNT="${SIGNAL_ACCOUNT}" \
-      SIGNAL_BOT_ACI="${SIGNAL_BOT_ACI}" SIGNAL_USER1_ACI="${SIGNAL_USER1_ACI}" \
-      SIGNAL_USER2_ACI="${SIGNAL_USER2_ACI}" SIGNAL_GROUP_ID="${SIGNAL_GROUP_ID}" BOT_NAME="${BOT_NAME}" \
+      SIGNAL_BOT_ACI="${SIGNAL_BOT_ACI}" USERS_JSON="${USERS_JSON}" GROUPS_JSON="${GROUPS_JSON}" \
+      BOT_NAME="${BOT_NAME}" \
       HA_BASE_URL="${HA_BASE_URL}" HA_MCP_URL="${HA_MCP_URL}" HA_MCP_KIND="${HA_MCP_KIND}" \
       HA_MCP_DOMAINS="${HA_MCP_DOMAINS}" HA_TOKEN="${HA_TOKEN}" NOTIFY_TOKEN="${NOTIFY_TOKEN}" \
       NOTIFY_BIND="${NOTIFY_BIND:-0.0.0.0}" NOTIFY_PORT="${NOTIFY_PORT:-8999}" BOT_DB="$BOT_DB" \

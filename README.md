@@ -1,7 +1,7 @@
 # Signal HomeBot — Home Assistant app repository
 
-A household Signal bot for Home Assistant OS. Two people DM it or address it
-in one shared group. Claude Code (subscription auth, no tools) answers from a
+A household Signal bot for Home Assistant OS. Allowlisted people DM it or
+address it in configured groups. Claude Code (subscription auth, no tools) answers from a
 read-only Home Assistant MCP snapshot, and can *propose* a small set of
 light/climate actions that each need a private, single-use confirmation.
 

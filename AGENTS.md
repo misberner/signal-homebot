@@ -25,7 +25,8 @@ This repository is an agent connected to **physical home devices**.
   Claude = `node`; root only in `run.sh`. Never give the bot the Claude token
   or let it run Claude directly; flags live in `bot/claude_broker.py`.
 - Senders must have verified identity keys (`listIdentities`), and the group
-  roster must be exactly bot + two users before anything is posted there.
+  roster must contain only the bot and configured users before anything is
+  posted there. Users and groups are lists in the app options (no fixed count).
 - Layout: HA app repository. The app lives in `signal_claude/` (keep the slug:
   changing it orphans the users' `/data`). Bump `version` in
   `signal_claude/config.yaml` for every release users should receive.

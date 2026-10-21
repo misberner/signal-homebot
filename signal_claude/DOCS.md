@@ -26,34 +26,38 @@ the bot inside one amd64 container. It is **read-only by default**. See
    and set `signal_captcha` before retrying.
 2. Set `setup_mode: verify`, enter the SMS in `verification_code`, Save and
    Start. Afterwards clear `verification_code` and `signal_captcha`.
-3. Set `setup_mode: inspect` to display the bot account UUID (ACI). Add both
-   users and the bot to one Signal group. Inspect again for the group's ID.
-4. `setup_mode: listen`: have both people DM the bot during the 60-second
-   listen period. Sender UUIDs appear in logs (not message text). Use these
-   in `signal_user1_aci` and `signal_user2_aci`, and the group ID in
-   `signal_group_id`. `user1`/`user2` are also the role names used in
-   `policy.json`.
+3. Set `setup_mode: inspect` to display the bot account ID (ACI); put it in
+   `signal_bot_aci`.
+4. Each person who should use the bot DMs it (and, for groups, posts in the
+   group with the bot), then run `setup_mode: listen`. It collects waiting
+   messages for 60 seconds and logs only sender IDs and group IDs, never text.
+   Add each person under **`users`** (`name`, `aci`; the name is a lowercase
+   label used in `policy.json` and `/notify`, and the one Claude sees), and
+   each group under **`groups`** (`name`, `id`). Groups are optional; with
+   none, the bot works by DM only. `inspect` also lists every group the bot is
+   in, with all member IDs, which is handy for adding someone who is not
+   around to message the bot.
 5. Do not use telephone numbers as ACI values. The CLI remains the primary
    Signal device; no Android phone is required.
-6. **Verify both people's safety numbers** (required by default, see
+6. **Verify each user's safety number** (required by default, see
    [Trusted accounts](#trusted-accounts)): `setup_mode: trust` logs each
-   user's safety number. On each phone open the conversation with the bot →
-   **View safety number** and compare. Only if they match, enter the number in
-   `signal_user1_safety_number` / `signal_user2_safety_number` and run `trust`
-   again; it must print `verified` and trust level `TRUSTED_VERIFIED`.
-   signal-cli rejects a number that does not match its stored key.
-7. Have both people enable **Registration Lock** (Signal → Settings → Account)
-   so their numbers cannot be re-registered by someone else (SIM swap).
+   user's safety number. On that person's phone open the conversation with the
+   bot → **View safety number** and compare. Only if they match, enter it as
+   that user's `safety_number` and run `trust` again; it must print `verified`
+   and trust level `TRUSTED_VERIFIED`. signal-cli rejects a number that does
+   not match its stored key. Users can be verified one at a time; an
+   unverified user is simply ignored until then.
+7. Each user should enable **Registration Lock** (Signal → Settings → Account)
+   so their number cannot be re-registered by someone else (SIM swap).
 
 ## Trusted accounts
 
-The bot acts only for the two configured people, enforced in layers:
+The bot acts only for the people listed under `users`, enforced in layers:
 
 1. **Authenticated sender.** The sender's ACI comes from the decrypted Signal
    envelope (`sourceUuid`), which the Signal protocol authenticates; message
    text, display names and phone numbers are never used for identity. Anything
-   not from `signal_user1_aci`/`signal_user2_aci` (or the bot itself) is
-   dropped before storage.
+   not from a configured user's `aci` is dropped before storage.
 2. **Pinned identity keys.** signal-cli rejects messages whose sender identity
    key changed since it was first seen (e.g. the number was re-registered on
    another phone) until someone re-trusts it. On top of that the bot checks
@@ -62,16 +66,17 @@ The bot acts only for the two configured people, enforced in layers:
    number (`TRUSTED_VERIFIED`). Unverified or changed keys are ignored and
    logged. If someone legitimately gets a new phone, re-run `setup_mode: trust`
    with their new safety number.
-3. **One group, exactly three members.** Only `signal_group_id` is accepted.
-   Before answering in the group and again before every group message is sent
-   (including `/notify`), the bot checks the roster: exactly the bot and the two
-   users, no pending invitations. Otherwise it does not post (a newcomer would
-   see replies and history) and tells the requester in their DM.
+3. **Configured groups with only configured members.** Messages from other
+   groups are ignored. Before answering in a group and again before every
+   group message is sent (including `/notify`), the bot checks the roster:
+   every member and pending invitee must be a configured user. Otherwise it
+   does not post (an outsider would see replies and history) and tells the
+   requester in their DM.
 4. **Fresh, explicit requests only**, and writes need the requester's private
    confirmation (below).
 
-What this cannot protect against: someone who controls one of the two
-people's Signal accounts or devices (an unlocked phone, or a Signal Desktop
+What this cannot protect against: someone who controls a configured user's
+Signal account or devices (an unlocked phone, or a Signal Desktop
 linked to their account) *is* that person to the bot. Linked devices are
 listed in Signal → Settings → Linked devices.
 
@@ -148,9 +153,9 @@ Writes need **all** of:
 
    ```json
    {"actions": {
-     "light_on":  {"entities": ["light.test_lamp"], "senders": ["user1"], "contexts": ["dm", "group"]},
-     "light_off": {"entities": ["light.test_lamp"], "senders": ["user1"], "contexts": ["dm", "group"]},
-     "temperature_set": {"entities": ["climate.office"], "senders": ["user1", "user2"],
+     "light_on":  {"entities": ["light.test_lamp"], "senders": ["malte"], "contexts": ["dm", "group"]},
+     "light_off": {"entities": ["light.test_lamp"], "senders": ["malte"], "contexts": ["dm", "group"]},
+     "temperature_set": {"entities": ["climate.office"], "senders": ["malte", "anna"],
                          "contexts": ["dm"], "temperature_min": 18, "temperature_max": 23}
    }}
    ```
@@ -191,7 +196,7 @@ outcomes are reported and **never retried**.
   retried for up to an hour. A retried send can at worst duplicate a text,
   never an action.
 - **History:** the last 60 messages of the *same* conversation go to Claude,
-  labelled `user1`/`user2` rather than ACIs. Group history never reaches a DM.
+  labelled with user names rather than ACIs. Group history never reaches a DM.
   "Delete for everyone" removes a message from the archive.
   Disappearing-message timers are honoured. Default retention is 7 days.
 
@@ -222,7 +227,7 @@ No LAN port is published.
 ```
 POST /notify
 Authorization: Bearer <notify_token>
-{"target": "group" | "user1" | "user2", "message": "…", "id": "optional-dedupe-key"}
+{"target": "<user name or group name>", "message": "…", "id": "optional-dedupe-key"}
 ```
 
 `202` means queued; `200 {"duplicate": true}` means that `id` was already
@@ -235,8 +240,8 @@ Do this before regular use, with a harmless test light. Record the results.
 
 1. [ ] App builds on the HAOS box (Logs show `Ran … tests … OK`).
 2. [ ] `inspect`: `claude --version` shows `2.1.306`; `listAccounts` lists the bot.
-2a. [ ] `trust`: both users show `TRUSTED_VERIFIED` after entering their
-    compared safety numbers; a wrong number is rejected.
+2a. [ ] `trust`: each user shows `TRUSTED_VERIFIED` after entering their
+    compared safety number; a wrong number is rejected.
 3. [ ] `claude_check`: the auth status shows subscription/OAuth login.
 4. [ ] `run` with `allow_writes: false`. Logs show `Ready (writes disabled)`.
 5. [ ] User 1 DM "is the test light on?" gives a correct answer (live state).

@@ -74,7 +74,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
 
     def config(self, **overrides):
         values = dict(
-            bot_aci=BOT, users={'user1': USER1, 'user2': USER2}, group_id=GROUP,
+            bot_aci=BOT, users={'user1': USER1, 'user2': USER2}, groups={'home': GROUP},
             ha_url=self.ha.url, mcp_url=self.ha.mcp_url, ha_token=self.ha.token,
             db_path=str(self.dir / 'bot.sqlite3'),
             signal_url=self.signal.url, signal_account=ACCOUNT, notify_token='n' * 40,
@@ -287,6 +287,40 @@ class TrustTests(Integration):
         await self.settle()
         self.assertEqual(self.group(), [])
         self.assertEqual(self.bot.store.outbox_status(), {'dead': 1})
+
+
+class SingleUserTests(Integration):
+    """Only user1 configured, no group: the minimal first setup."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await self.restart_bot(users={'user1': USER1}, groups={},
+                               policy=load_policy({'actions': {}}))
+
+    async def test_only_user1_by_dm(self):
+        await self.deliver(sender=USER1, text='is the lamp on?')
+        self.assertEqual(self.dm(USER1), ['ok'])
+        await self.deliver(sender=USER2, text='is the lamp on?')
+        await self.deliver(sender=USER1, group=GROUP, text='/ha is the lamp on?')
+        self.assertEqual(len(self.claude.calls), 1)
+        self.assertEqual(self.dm(USER2), [])
+        self.assertEqual(self.group(), [])
+        self.assertEqual(self.bot.store.db.execute('SELECT COUNT(*) FROM messages').fetchone()[0], 1)
+
+    async def test_notify_targets_limited_to_configured(self):
+        server = aiohttp.test_utils.TestServer(self.bot.webapp())
+        await server.start_server()
+        try:
+            for target, status in (('home', 400), ('user2', 400), ('user1', 202)):
+                async with self.http.post(server.make_url('/notify'),
+                                          headers={'Authorization': 'Bearer ' + 'n' * 40},
+                                          json={'target': target, 'message': 'hi'}) as r:
+                    self.assertEqual(r.status, status, target)
+        finally:
+            await server.close()
+        await self.settle()
+        self.assertEqual(self.dm(USER1), ['hi'])
+        self.assertEqual(self.group(), [])
 
 
 class FreshnessTests(Integration):
@@ -584,7 +618,7 @@ class NotifyTests(Integration):
             return r.status
 
     async def test_notify_authentication_and_validation(self):
-        good = {'target': 'group', 'message': 'Washer done', 'id': 'evt-1'}
+        good = {'target': 'home', 'message': 'Washer done', 'id': 'evt-1'}
         self.assertEqual(await self.post(good, token=None), 401)
         self.assertEqual(await self.post(good, token='wrong'), 401)
         self.assertEqual(await self.post(good, token='ünïcode'), 401)
@@ -600,7 +634,7 @@ class NotifyTests(Integration):
         await self.settle()
         self.assertEqual(self.group(), ['Washer done'])
         self.signal.group_members.append(STRANGER)
-        self.assertEqual(await self.post({'target': 'group', 'message': 'Door open'}), 202)
+        self.assertEqual(await self.post({'target': 'home', 'message': 'Door open'}), 202)
         await self.settle()
         self.assertEqual(self.group(), ['Washer done'])  # not leaked to the stranger
         self.assertEqual(self.dm(USER2), ['Hi'])
@@ -652,8 +686,10 @@ class BrokerTests(Integration):
 
 @unittest.skipUnless(aiohttp, 'needs aiohttp and mcp')
 class ConfigTests(unittest.TestCase):
-    BASE = {'SIGNAL_BOT_ACI': BOT, 'SIGNAL_USER1_ACI': USER1, 'SIGNAL_USER2_ACI': USER2,
-            'SIGNAL_GROUP_ID': GROUP, 'HA_BASE_URL': 'http://ha:8123/', 'HA_MCP_URL': 'http://ha/api/mcp',
+    BASE = {'SIGNAL_BOT_ACI': BOT, 'HA_BASE_URL': 'http://ha:8123/', 'HA_MCP_URL': 'http://ha/api/mcp',
+            'USERS_JSON': json.dumps([{'name': 'user1', 'aci': USER1.upper(), 'safety_number': '1'},
+                                      {'name': 'user2', 'aci': USER2}]),
+            'GROUPS_JSON': json.dumps([{'name': 'home', 'id': GROUP}]),
             'HA_TOKEN': 't', 'CLAUDE_OAUTH_TOKEN': 'c'}
 
     def load(self, **env):
@@ -683,15 +719,33 @@ class ConfigTests(unittest.TestCase):
                 self.load(**env)
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'policy.json'
+            path.write_text(json.dumps({'actions': {'light_on': {'entities': ['light.x'], 'senders': ['nobody']}}}))
+            with self.assertRaises(ValueError):  # policy names a user that isn't configured
+                HomeBot(self.load(POLICY_FILE=str(path), BOT_DB=':memory:'))
             path.write_text(json.dumps(TEST_POLICY))
             self.assertEqual(self.load(POLICY_FILE=str(path)).policy['light_on']['entities'], ['light.test_lamp'])
             path.write_text('{"actions": {"door_unlock": {"entities": ["lock.front"]}}}')
             with self.assertRaises(ValueError):
                 self.load(POLICY_FILE=str(path))
+        one = json.dumps([{'name': 'malte', 'aci': USER1}])
+        single = self.load(USERS_JSON=one, GROUPS_JSON='[]')
+        self.assertEqual((single.users, single.groups), ({'malte': USER1}, {}))
+        HomeBot(self.load(USERS_JSON=one, GROUPS_JSON='[]', BOT_DB=':memory:'))
+        three = json.dumps([{'name': n, 'aci': a} for n, a in (('a', USER1), ('b', USER2), ('c', STRANGER))])
+        self.assertEqual(len(self.load(USERS_JSON=three).users), 3)
+        for bad in ([], [{'name': 'Bad Name', 'aci': USER1}], [{'name': 'a', 'aci': ''}],
+                    [{'name': 'a', 'aci': USER1}, {'name': 'a', 'aci': USER2}], {'name': 'a'}):
+            with self.assertRaises(ValueError, msg=bad):
+                cfg = self.load(USERS_JSON=json.dumps(bad), BOT_DB=':memory:')
+                HomeBot(cfg)
+        for users, groups in (([{'name': 'a', 'aci': BOT}], []),                       # bot as user
+                              ([{'name': 'a', 'aci': USER1}, {'name': 'b', 'aci': USER1}], []),  # duplicate ACI
+                              ([{'name': 'home', 'aci': USER1}], [{'name': 'home', 'id': GROUP}])):  # name clash
+            with self.assertRaises(ValueError, msg=(users, groups)):
+                HomeBot(self.load(USERS_JSON=json.dumps(users), GROUPS_JSON=json.dumps(groups), BOT_DB=':memory:'))
         cfg = self.load(HA_TOKEN='', HA_MCP_KIND='ha_mcp', HA_MCP_DOMAINS='light, sensor')
         self.assertEqual(cfg.mcp_domains, ('light', 'sensor'))
-        with self.assertRaises(ValueError):
-            HomeBot(self.load(SIGNAL_USER2_ACI=USER1, BOT_DB=':memory:'))
+
 
 
 if __name__ == '__main__':
