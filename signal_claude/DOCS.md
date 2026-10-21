@@ -298,8 +298,8 @@ Verified on 2026-10-21 (see CHANGELOG.md):
 - Claude Code 2.1.306: the exact bot flags return `structured_output`. An
   invalid OAuth token yields `api_error_status: 401`, classified as `auth`,
   with Claude running as `node` via the broker.
-- A live read-only `ha_get_overview` call against a real ha-mcp 8.7.0 / HA
-  2026.10.2, using the bot's own code.
+- A live read-only `ha_get_overview` call against a real ha-mcp 8.7.0
+  installation, using the bot's own code.
 
 **Not yet verified:** Signal registration, real message receive/send and
 mentions, `listIdentities`/`listGroups`/`trust` against a real account, the
