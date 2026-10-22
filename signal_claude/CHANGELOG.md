@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.0 — 2026-10-23
+
+### Changed
+- **One ordered permission list** replaces the allowlist and denylist:
+  `allow|review|deny <pattern>` per line, matched against entity and
+  service, last match wins (like .gitignore), no match = review. `allow`
+  runs without reviewer or question, `review` goes to the reviewer, `deny`
+  is refused. `deny *` at the top gives an allowlist. Existing allow/deny
+  lists (and pre-0.10 action tables) are converted with the same effect.
+
 ## 0.11.0 — 2026-10-22
 
 ### Added

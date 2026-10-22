@@ -107,13 +107,26 @@ these checks:
    shell/REST commands and HA administration can't be. The service must
    belong to the entity's domain, the entity must exist in HA, and the data
    must be flat values (no area/device targets).
-2. **Your allowlist**, if "Only what's on the allowlist" is on: only
-   entities or services matching one of its patterns (e.g. `light.*`,
-   `water_heater.my_home_domestic_hot_water_0`, `*.turn_on`) can be changed;
-   with an empty list, nothing. A good way to start.
-3. **Your denylist** ("Never touch"): patterns like `cover.garage*`,
-   `script.*` or `*.turn_off`, matched against the entity and the service.
-4. **The reviewer**: a separate Claude call without tools and without the
+2. **Your permission list**, one rule per line, like .gitignore: the last
+   matching line wins, and with no match the call is reviewed. Patterns are
+   matched against the entity and the service, `*` is a wildcard, `#` starts
+   a comment.
+   - `deny <pattern>`: never;
+   - `review <pattern>`: the reviewer decides (below);
+   - `allow <pattern>`: done right away, without review or question.
+
+   A strict start, then exceptions:
+   ```
+   deny *
+   review light.*
+   review water_heater.my_home_domestic_hot_water_0
+   allow light.flur
+   deny *.turn_off
+   ```
+   Here the hall light switches on without asking, other lights and the hot
+   water are reviewed, nothing may be turned off, and everything else is
+   refused.
+3. **The reviewer** (for `review`): a separate Claude call without tools and without the
    chat history. It sees your **Rules** (plain text, e.g. "Hot water: only
    Manual or Off. Never open the garage door."), who asked, where and when,
    the request, the exact call and the entity's current state, and decides:
@@ -127,15 +140,15 @@ these checks:
      "Done: … (auto-approved: …)"; with Auto mode off it asks like above.
 
 Claude also sees your rules, so it proposes what fits them. The switch, the
-user, the allowlist and the denylist are checked again when a confirmed or scheduled change
-runs. A reviewer call takes about 10-20 s with Opus.
+user and the permission list are checked again when a confirmed or scheduled
+change runs. A reviewer call takes about 10-20 s with Opus.
 
 **Later and on a schedule.** Ask for a time ("turn on the hot water at
 2:45") and the question says "… at Thu 23.10. 02:45". Your yes (or an
 auto-approval) schedules it, for up to 7 days ahead. Fixed actions can repeat
 ("every day at 22:00 turn off the lights"): you confirm once, and every run
 happens without asking. When it's due, the bot checks the switch and the
-denylist again, runs it once and tells you the result. If the bot was offline and the
+permission list again, runs it once and tells you the result. If the bot was offline and the
 time passed by more than 10 minutes, it doesn't run late; it reports
 "missed". Reminders ("remind us at 8 to …") need no confirmation and arrive
 in the chat they were asked in. **Tasks** ("tell me every weekday at 7 whether
@@ -147,8 +160,8 @@ nothing if the task's condition doesn't hold. A task that may need to change
 something ("at 22:00, if a window is open, turn the heating down to 16 °C")
 asks you once when it is set up: "Shall I set up task …, may do without
 asking: climate.set_temperature on climate.wohnzimmer?". After your yes, it
-does those calls when it runs without asking you again; the allowlist,
-denylist, your rules and the reviewer (which can still deny) apply each time.
+does those calls when it runs without asking you again; the permission list,
+your rules and the reviewer (which can still deny) apply each time.
 Other changes it proposes are asked as usual. A running task can't create further tasks. Up to 20 per person;
 cancelling a repeating task stops the series. `/scheduled` lists your pending items and
 `/cancel 12` cancels one (or just ask). Scheduling is done by the bot,

@@ -75,12 +75,13 @@
     <h2>4. What the bot may change</h2>
     <p class="hint">The bot can always <em>read</em> your home. With changes allowed, Claude may propose a
       service call on one entity (lights, switches, heating, covers, media, scenes, scripts, helpers,
-      vacuums, …). Locks, alarms, cameras and administration can never be controlled. A separate reviewer
-      checks every proposal against your rules and decides: <strong>allow</strong>, <strong>ask</strong>
-      (the requester confirms with "yes" or 👍 in their private chat) or <strong>deny</strong>.</p>
+      vacuums, …). Locks, alarms, cameras and administration can never be controlled. Your permission list
+      decides what happens to each proposal: <strong>deny</strong> (never), <strong>review</strong> (a
+      separate reviewer checks it against your rules and allows it, asks the requester in their private
+      chat, or refuses) or <strong>allow</strong> (done without review or question).</p>
     <label class="checks"><label><input type="checkbox" id="allow_writes"> Allow changes</label></label>
     <label class="checks"><label><input type="checkbox" id="auto_approve"> Auto mode: do what the reviewer
-      allows without asking (otherwise every change is confirmed)</label></label>
+      allows without asking (otherwise every reviewed change is confirmed)</label></label>
     <p class="hint" id="write-token-hint"></p>
     <label for="rules">Rules</label>
     <textarea id="rules" style="min-height:110px" placeholder="e.g.
@@ -89,18 +90,17 @@ Hot water (water_heater.my_home_domestic_hot_water_0): only Manual or Off.
 Never open covers between 22:00 and 6:00.
 Anna may control lights and media only."></textarea>
     <p class="hint">Plain language. Claude and the reviewer both read them; only admins can edit them.</p>
-    <label class="checks"><label><input type="checkbox" id="allowlist_on"> Only what's on the allowlist</label></label>
-    <textarea id="allow" style="min-height:70px" placeholder="light.*
-water_heater.my_home_domestic_hot_water_0
-switch.kaffeemaschine"></textarea>
-    <p class="hint">With this on, only entities or services matching a line can be changed (empty list:
-      nothing). The rules, the denylist and the reviewer still apply.</p>
-    <label for="deny">Never touch (one pattern per line)</label>
-    <textarea id="deny" style="min-height:70px" placeholder="cover.garage*
-script.*
-*.turn_off"></textarea>
-    <p class="hint">Matched against the entity and the service; <code>*</code> is a wildcard. Checked by the
-      bot itself, before and after the reviewer.</p>
+    <label for="permissions">Permissions (the last matching line wins; no match: review)</label>
+    <textarea id="permissions" style="min-height:130px;font-family:ui-monospace,monospace" placeholder="# start strict: nothing unless listed below
+deny *
+review light.*
+review water_heater.my_home_domestic_hot_water_0
+allow light.flur
+deny *.turn_off"></textarea>
+    <p class="hint">One rule per line: <code>allow</code>, <code>review</code> or <code>deny</code>, then a
+      pattern matched against the entity and the service (<code>*</code> is a wildcard), like .gitignore:
+      later lines override earlier ones. <code># …</code> is a comment. Checked by the bot itself, also when
+      a confirmed or scheduled change runs.</p>
   </section>
 
   <section id="settings2">
@@ -275,9 +275,7 @@ function renderSettings() {
   document.getElementById('allow_writes').checked = state.allow_writes;
   document.getElementById('auto_approve').checked = state.auto_approve;
   document.getElementById('rules').value = state.rules || '';
-  document.getElementById('deny').value = (state.deny || []).join('\n');
-  document.getElementById('allowlist_on').checked = state.allowlist_on;
-  document.getElementById('allow').value = (state.allow || []).join('\n');
+  document.getElementById('permissions').value = (state.permissions || []).join('\n');
   document.getElementById('require_verified_identity').checked = state.require_verified_identity;
   document.getElementById('bot_name').value = state.account.bot_name;
   document.getElementById('command_max_age').value = state.command_max_age;
@@ -294,9 +292,7 @@ async function saveSettings() {
       allow_writes: document.getElementById('allow_writes').checked,
       auto_approve: document.getElementById('auto_approve').checked,
       rules: document.getElementById('rules').value,
-      deny: document.getElementById('deny').value.split('\n').map(s => s.trim()).filter(Boolean),
-      allowlist_on: document.getElementById('allowlist_on').checked,
-      allow: document.getElementById('allow').value.split('\n').map(s => s.trim()).filter(Boolean),
+      permissions: document.getElementById('permissions').value.split('\n').map(s => s.trim()).filter(Boolean),
       require_verified_identity: document.getElementById('require_verified_identity').checked,
       bot_name: document.getElementById('bot_name').value.trim(),
       command_max_age: Number(document.getElementById('command_max_age').value),

@@ -147,9 +147,7 @@ class SetupApi:
             'group_candidates': candidates,
             'allow_writes': house.allow_writes,
             'auto_approve': house.auto_approve,
-            'deny': house.deny,
-            'allowlist_on': house.allowlist_on,
-            'allow': house.allow,
+            'permissions': house.permissions,
             'rules': house.rules,
             'require_verified_identity': house.require_verified_identity,
             'command_max_age': house.command_max_age,
@@ -273,8 +271,7 @@ class SetupApi:
         changes = {}
         for key, typ in (('bot_name', str), ('allow_writes', bool), ('require_verified_identity', bool),
                          ('command_max_age', int), ('history_days', int), ('notes', str), ('model', str),
-                         ('auto_approve', bool), ('deny', list), ('rules', str), ('allowlist_on', bool),
-                         ('allow', list)):
+                         ('auto_approve', bool), ('permissions', list), ('rules', str)):
             if key in data:
                 value = data[key]
                 if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):

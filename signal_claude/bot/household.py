@@ -12,7 +12,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from .core import DENY_RE, NAME_RE, Settings, load_deny
+from .core import ENTITY_RE, NAME_RE, Settings, load_permissions
 
 ACI_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 PHONE_RE = r'\+[1-9][0-9]{6,14}'
@@ -33,9 +33,8 @@ class Household:
     groups: dict[str, str] = field(default_factory=dict)  # name -> Signal group id
     allow_writes: bool = False          # master switch for changes
     auto_approve: bool = False          # the reviewer's "allow" runs without asking
-    deny: list = field(default_factory=list)  # glob patterns on entity/service, see core.load_deny
-    allowlist_on: bool = False          # if on, only entities/services matching ``allow`` can be changed
-    allow: list = field(default_factory=list)
+    # Ordered "allow|review|deny <pattern>" lines, last match wins (core.load_permissions).
+    permissions: list = field(default_factory=list)
     rules: str = ''                     # admin-written rules for Claude and the reviewer (trusted)
     require_verified_identity: bool = True
     command_max_age: int = 300
@@ -44,9 +43,8 @@ class Household:
     model: str = 'opus'  # Claude Code model alias
 
     @property
-    def active_allow(self) -> list[str] | None:
-        """The allowlist if it is switched on, else None (no allowlist)."""
-        return list(self.allow) if self.allowlist_on else None
+    def permission_rules(self) -> list[tuple[str, str]]:
+        return load_permissions(self.permissions)
 
     @property
     def settings(self) -> Settings:
@@ -85,11 +83,10 @@ class Household:
             raise HouseholdError('Two groups have the same Signal ID')
         if set(self.users) & set(self.groups):
             raise HouseholdError('Users and groups need different names')
-        for label, patterns in (('Denylist', self.deny), ('Allowlist', self.allow)):
-            try:
-                load_deny(patterns)
-            except ValueError as err:
-                raise HouseholdError(f'{label}: {err}') from None
+        try:
+            load_permissions(self.permissions)
+        except ValueError as err:
+            raise HouseholdError(f'Permissions: {err}') from None
         if len(self.rules) > 4000:
             raise HouseholdError('Rules: at most 4000 characters')
         if self.model not in MODELS:
@@ -104,8 +101,8 @@ class Household:
 
     @classmethod
     def from_json(cls, data: object) -> 'Household':
-        if isinstance(data, dict) and 'actions' in data:
-            data = migrate_actions(data)
+        if isinstance(data, dict):
+            data = migrate_lists(migrate_actions(data))
         if not isinstance(data, dict) or set(data) - set(cls.__dataclass_fields__):
             raise HouseholdError('Unknown settings')
         try:
@@ -113,8 +110,8 @@ class Household:
         except TypeError as err:
             raise HouseholdError(str(err)) from None
         types = {'signal_account': str, 'pending_account': str, 'bot_aci': str, 'bot_name': str,
-                 'users': dict, 'groups': dict, 'deny': list, 'rules': str, 'allow_writes': bool,
-                 'auto_approve': bool, 'allowlist_on': bool, 'allow': list,
+                 'users': dict, 'groups': dict, 'permissions': list, 'rules': str, 'allow_writes': bool,
+                 'auto_approve': bool,
                  'require_verified_identity': bool, 'command_max_age': int, 'history_days': int,
                  'notes': str, 'model': str}
         for key, typ in types.items():
@@ -128,15 +125,33 @@ class Household:
 def migrate_actions(data: dict) -> dict:
     """Settings from before 0.10 had an action table. Keep its scope: if it
     had entries, their entities become an active allowlist."""
+    if 'actions' not in data:
+        return data
     actions = data.get('actions')
     data = {k: v for k, v in data.items() if k != 'actions'}
     entities = []
     for rule in actions if isinstance(actions, list) else []:
         for entity in (rule.get('entities') or []) if isinstance(rule, dict) else []:
-            if isinstance(entity, str) and re.fullmatch(DENY_RE, entity) and entity not in entities:
+            if isinstance(entity, str) and re.fullmatch(ENTITY_RE + '|[a-z_]+\\.\\*', entity) \
+                    and entity not in entities:
                 entities.append(entity)
     if actions and 'allowlist_on' not in data:
         data['allowlist_on'], data['allow'] = True, entities
+    return data
+
+
+def migrate_lists(data: dict) -> dict:
+    """0.10 had a separate allowlist and denylist; express them as ordered
+    permission lines with the same effect (the denylist last, so it wins)."""
+    if not {'deny', 'allow', 'allowlist_on'} & set(data):
+        return data
+    data = dict(data)
+    deny, allow, only = data.pop('deny', []), data.pop('allow', []), data.pop('allowlist_on', False)
+    lines = list(data.get('permissions') or [])
+    if only:
+        lines += ['deny *'] + [f'review {p}' for p in allow if isinstance(p, str)]
+    lines += [f'deny {p}' for p in deny if isinstance(p, str)]
+    data['permissions'] = lines
     return data
 
 

@@ -671,8 +671,8 @@ class WriteTests(Integration):
         self.assertEqual(self.ha.calls, [])
         self.assertIn('too late', self.dm(USER1)[-1])
 
-    async def test_fixed_limits_and_denylist_apply_before_review(self):
-        self.bot.update_house(self.bot.house.change(deny=['cover.garage*', '*.toggle']))
+    async def test_fixed_limits_and_deny_rules_apply_before_review(self):
+        self.bot.update_house(self.bot.house.change(permissions=['deny cover.garage*', 'deny *.toggle']))
         self.ha.states['cover.garage_door'] = 'closed'
         bad = [
             {'service': 'lock.unlock', 'entity_id': 'lock.front_door', 'data': {}},    # never writable
@@ -687,8 +687,8 @@ class WriteTests(Integration):
             self.assertEqual(await self.propose(sender=USER1, actions=bad[i:i + 3]), [])
         self.assertEqual(self.claude.reviews, [])          # nothing reached the reviewer
         self.assertIn('light.bedroom does not exist', self.dm(USER1)[-2])
-        self.assertIn('blocked by the denylist (cover.garage*)', self.dm(USER1)[-2])
-        self.assertIn('blocked by the denylist (*.toggle)', self.dm(USER1)[-2])
+        self.assertIn('not permitted (deny cover.garage*)', self.dm(USER1)[-2])
+        self.assertIn('not permitted (deny *.toggle)', self.dm(USER1)[-2])
         self.assertIn('lock devices can never be controlled', self.dm(USER1)[-3])
         self.assertEqual(self.ha.calls, [])
 
@@ -723,30 +723,33 @@ class WriteTests(Integration):
         self.assertEqual(len(self.questions(USER1)), 1)
         self.assertEqual(self.bot.store.action_status(1), 'succeeded')
 
-    async def test_allowlist_limits_proposals_and_is_rechecked(self):
+    async def test_permission_list_order_and_effects(self):
         self.ha.states['switch.kettle'] = 'off'
         kettle = {'service': 'switch.turn_on', 'entity_id': 'switch.kettle', 'data': {}}
-        self.bot.update_house(self.bot.house.change(allowlist_on=True, allow=['light.*']))
+        lamp_off = {'service': 'light.turn_off', 'entity_id': 'light.test_lamp', 'data': {}}
+        self.bot.update_house(self.bot.house.change(permissions=[
+            '# strict start', 'deny *', 'review light.*', 'allow light.test_lamp', 'deny *.turn_off']))
+        # deny * (no later line matches the kettle): refused before any review.
         self.assertEqual(await self.propose(actions=[kettle]), [])
-        self.assertIn('switch.kettle / switch.turn_on is not on the allowlist', self.dm(USER1)[-1])
-        self.assertIn('Only entities/services matching: light.*', self.claude.calls[-1]['prompt'])
+        self.assertIn('not permitted (deny *)', self.dm(USER1)[-1])
+        self.assertIn('  allow light.test_lamp', self.claude.calls[-1]['prompt'])
+        # allow: done without review or question.
+        self.assertEqual(await self.propose(), [])
+        self.assertEqual(self.ha.calls, [('light.turn_on', {'entity_id': 'light.test_lamp'})])
+        self.assertIn('(always allowed (allow light.test_lamp))', self.dm(USER1)[-1])
         self.assertEqual(self.claude.reviews, [])
-        [q] = await self.propose()                                       # the lamp is on the list
-        self.bot.update_house(self.bot.house.change(allow=['switch.*']))
+        # A later deny overrides the allow.
+        self.assertEqual(await self.propose(actions=[lamp_off]), [])
+        self.assertIn('not permitted (deny *.turn_off)', self.dm(USER1)[-1])
+        # review: the reviewer decides (here: ask).
+        self.bot.update_house(self.bot.house.change(permissions=['deny *', 'review light.*']))
+        [q] = await self.propose()
+        self.assertEqual(len(self.claude.reviews), 1)
+        # Re-checked at confirmation time.
+        self.bot.update_house(self.bot.house.change(permissions=['deny light.*']))
         await self.deliver(sender=USER1, text='yes')
-        self.assertIn('Not executed', self.dm(USER1)[-1])
-        # On but empty: nothing can be changed at all.
-        self.bot.update_house(self.bot.house.change(allow=[]))
-        await self.propose()
-        self.assertIn('Changes are switched off', self.claude.calls[-1]['prompt'])
-        self.assertEqual(self.ha.calls, [])
-
-    async def test_denylist_rechecked_at_confirmation(self):
-        await self.propose()
-        self.bot.update_house(self.bot.house.change(deny=['light.*']))
-        await self.deliver(sender=USER1, text='yes')
-        self.assertIn('Not executed: blocked by the denylist', self.dm(USER1)[-1])
-        self.assertEqual(self.ha.calls, [])
+        self.assertIn('Not executed: not permitted (deny light.*)', self.dm(USER1)[-1])
+        self.assertEqual(len(self.ha.calls), 1)
 
     async def test_injected_history_cannot_execute(self):
         await self.deliver(sender=USER2, group=GROUP,
@@ -1141,19 +1144,19 @@ class SetupPageTests(Integration):
         self.assertEqual(state['users'][0]['trust'], 'TRUSTED_VERIFIED')
         self.assertEqual(state['seen_senders'], [])
         # Change settings: invalid ones are rejected with a readable error; valid ones saved.
-        status, out = await self.call('settings', {'deny': ['lock']})
+        status, out = await self.call('settings', {'permissions': ['lock.*']})
         self.assertEqual(status, 400)
-        self.assertIn('Denylist', out['error'])
+        self.assertIn('Permissions: line 1', out['error'])
         status, _ = await self.call('settings', {'allow_writes': True, 'auto_approve': True,
-                                                 'deny': ['cover.garage*'], 'rules': 'Lights: anyone.',
-                                                 'allowlist_on': True, 'allow': ['light.*']})
+                                                 'permissions': ['deny *', 'review light.*'],
+                                                 'rules': 'Lights: anyone.'})
         self.assertEqual(status, 200)
         saved = HouseholdStore(str(self.dir / 'settings.json')).load()
-        self.assertEqual((saved.allow_writes, saved.auto_approve, saved.deny, saved.rules),
-                         (True, True, ['cover.garage*'], 'Lights: anyone.'))
+        self.assertEqual((saved.allow_writes, saved.auto_approve, saved.permissions, saved.rules),
+                         (True, True, ['deny *', 'review light.*'], 'Lights: anyone.'))
         _, state = await self.call('state')
-        self.assertEqual((state['deny'], state['rules'], state['auto_approve'], state['allowlist_on'], state['allow']),
-                         (['cover.garage*'], 'Lights: anyone.', True, True, ['light.*']))
+        self.assertEqual((state['permissions'], state['rules'], state['auto_approve']),
+                         (['deny *', 'review light.*'], 'Lights: anyone.', True))
         await self.call('users/remove', {'name': 'malte'})
         # Now the bot answers the user it knows.
         await self.call('users/add', {'name': 'malte', 'aci': USER1})

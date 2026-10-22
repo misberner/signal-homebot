@@ -26,7 +26,7 @@ import aiohttp
 from aiohttp import ClientSession, ClientTimeout, web
 from .core import (Store, Incoming, Reaction, RemoteDelete, Denied, ClaudeError, addressed, freshness,
                    parse_signal_event, validate_action, describe, build_schema, parse_verdict,
-                   CLASSIFIER_SCHEMA, WRITABLE_DOMAINS,
+                   CLASSIFIER_SCHEMA, WRITABLE_DOMAINS, permission,
                    parse_claude_output, identity_trusted, group_roster_problem, parse_when, local_time,
                    APPROVAL_TTL, REMIND, TASK, REPEATS, MAX_TASKS, MAX_GRANTS, SCHEDULE_GRACE)
 from .household import Household, HouseholdStore
@@ -532,17 +532,17 @@ and actions (list).{notes}"""
     def build_prompt(self, request: Incoming, history: str, writes: bool, task: dict | None = None) -> str:
         """Stable parts first (permissions, then history oldest-first), the new
         request last, so consecutive messages share a cached prefix."""
-        allow = self.house.active_allow
         if writes:
-            deny = ', '.join(self.house.deny) or 'nothing'
-            only = f' Only entities/services matching: {", ".join(allow)}.' if allow else ''
+            lines = '\n'.join(f'  {e} {p}' for e, p in self.house.permission_rules) or '  (none)'
             capabilities = (
                 'You may propose Home Assistant service calls, one entity each, in these domains: '
-                f'{", ".join(sorted(WRITABLE_DOMAINS))}.{only} Never: {deny}. An action is {{"service", '
-                '"entity_id", "data"}}: the service must belong to the entity\'s domain and data holds '
-                'that service\'s fields (e.g. {"brightness_pct": 40}), or {}. Look up the exact entity and '
-                'valid values (e.g. an operation_list) first. A reviewer checks each proposal against the '
-                'household rules; the bot then does it, asks the user, or refuses, and reports the result.'
+                f'{", ".join(sorted(WRITABLE_DOMAINS))}. An action is {{"service", "entity_id", "data"}}: '
+                'the service must belong to the entity\'s domain and data holds that service\'s fields '
+                '(e.g. {"brightness_pct": 40}), or {}. Look up the exact entity and valid values (e.g. an '
+                'operation_list) first.\nPERMISSIONS (patterns match the entity or the service; the last '
+                'matching line wins; no match = review): deny = never, review = a reviewer checks it '
+                'against the household rules and the bot does it, asks the user or refuses, allow = done '
+                f'without review.\n{lines}'
                 + (f'\nHOUSEHOLD RULES (written by the admin; trusted):\n{self.house.rules.strip()}'
                    if self.house.rules.strip() else ''))
         else:
@@ -792,8 +792,7 @@ Task prompt:
     async def plan(self, msg: Incoming, on_progress=None, task: dict | None = None) -> list[tuple[str, str]]:
         """Ask Claude (with read-only HA tools) and turn proposals into approvals.
         ``task`` is set when a scheduled task is running (no new tasks then)."""
-        # An allowlist that is on but empty allows nothing.
-        writes = self.house.allow_writes and msg.sender in self.roles and self.house.active_allow != []
+        writes = self.house.allow_writes and msg.sender in self.roles
         labels = {**self.roles, self.house.bot_aci: f'{self.house.bot_name} (you)'}
         history = self.store.context(msg.conv, self.now(), labels, exclude=(msg.sender, msg.timestamp))
         try:
@@ -815,7 +814,7 @@ Task prompt:
             notes.append('Not allowed: changes are switched off.')
         for proposal in result['actions'][:3] if writes else []:
             try:
-                service, data = validate_action(proposal, self.house.deny, self.house.active_allow)
+                service, data = validate_action(proposal, self.house.permission_rules)
                 run_at = parse_when(proposal.get('at'), self.clock())
                 repeat = proposal.get('repeat') or 'once'
                 if repeat not in REPEATS:
@@ -835,16 +834,21 @@ Task prompt:
             except Denied as err:
                 notes.append(f'Not allowed: {err}.')
                 continue
+            effect, line = permission(self.house.permission_rules, service, data['entity_id'])
             # A running task may do what the user approved when setting it up.
             granted = task is not None and not run_at and {'service': service, 'entity_id': data['entity_id']} \
                 in (task.get('grants') or [])
-            decision, reason = await self.classify(msg, task, service, data, run_at, state, granted)
-            LOG.info('Reviewer decision: %s%s', decision, ' (granted)' if granted else '')
+            if effect == 'allow':  # the admin allows this outright: no review, no question
+                decision, reason = 'allow', f'always allowed ({line})'
+            else:
+                decision, reason = await self.classify(msg, task, service, data, run_at, state, granted)
+            LOG.info('Decision: %s%s', decision, ' (granted)' if granted else '')
             if decision == 'deny':
                 notes.append(f'Not doing {what}: {reason}')
                 continue
-            if granted or (decision == 'allow' and self.house.auto_approve):
-                label = f'approved with task #{task["id"]}' if granted else f'auto-approved: {reason}'
+            if effect == 'allow' or granted or (decision == 'allow' and self.house.auto_approve):
+                label = (reason if effect == 'allow' else f'approved with task #{task["id"]}' if granted
+                         else f'auto-approved: {reason}')
                 if run_at:
                     job = self.store.add_scheduled(msg.sender, msg.conv, service, data, run_at, self.now(), repeat)
                     notes.append(f'Scheduled #{job}: {what} ({label}). /cancel {job} cancels.')
@@ -884,7 +888,7 @@ Task prompt:
                         raise Denied('malformed grant')
                     service, data = validate_action({'service': grant.get('service'),
                                                      'entity_id': grant.get('entity_id'), 'data': {}},
-                                                    self.house.deny, self.house.active_allow)
+                                                    self.house.permission_rules)
                     await self.ha_state(data['entity_id'])
                     if (pair := {'service': service, 'entity_id': data['entity_id']}) not in grants:
                         grants.append(pair)
@@ -963,14 +967,14 @@ Task prompt:
 
     def recheck(self, sender: str, service: str, data: dict) -> None:
         """Before running a confirmed or scheduled action: the switch, the user
-        and the denylist may have changed since it was proposed."""
+        and the permission list may have changed since it was proposed."""
         if not self.house.allow_writes:
             raise Denied('changes are switched off')
         if sender not in self.roles:
             raise Denied('the user was removed')
         validate_action({'service': service, 'entity_id': data['entity_id'],
                          'data': {k: v for k, v in data.items() if k != 'entity_id'}},
-                        self.house.deny, self.house.active_allow)
+                        self.house.permission_rules)
 
     async def perform(self, action_id: int, service: str, data: dict) -> tuple[str, str, str]:
         """Call HA once for a journaled action: (status, detail, text for the user)."""

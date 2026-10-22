@@ -8,7 +8,8 @@ This repository is an agent connected to **physical home devices**.
   or HTTP requests; it only proposes structured actions.
 - The Python service checks every write deterministically (`validate_action`):
   fixed domain allowlist, service of the entity's domain, entity exists, flat
-  data without extra targets, admin allowlist (if on) and denylist. Then the reviewer (a separate
+  data without extra targets, admin permission list (ordered allow/review/deny,
+  last match wins). Then the reviewer (a separate
   Claude call without tools or chat history) decides allow/ask/deny.
 - Keep Signal identifiers authenticated from signal-cli metadata, not text.
 - Store all authorized shared-group messages as context; invoke the model
@@ -19,8 +20,9 @@ This repository is an agent connected to **physical home devices**.
 - Don't use `--dangerously-skip-permissions`, `--bare` (which ignores subscription
   login) or `ANTHROPIC_API_KEY` (which could incur separate usage charges).
 - A write runs without a single-use confirmation (yes/👍 in the requester's DM)
-  only if the admin enabled Auto mode and the reviewer said "allow"; any
-  reviewer failure means "ask". Never retry an `unknown` HA action.
+  only if an admin `allow` rule matches, the admin enabled Auto mode and the
+  reviewer said "allow", or the user confirmed it once (repeating action, task
+  grant); any reviewer failure means "ask". Never retry an `unknown` HA action.
 - Claude reads HA only through the bot's local MCP proxy (`bot/ha_tools.py`):
   a fixed list of read tools with constrained arguments, a per-request token,
   and an upstream read-only check. Never expose write tools or HA credentials

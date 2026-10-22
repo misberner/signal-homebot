@@ -4,7 +4,7 @@ Security model (see HANDOFF.md section 4):
 - Sender/group identity comes only from signal-cli envelope metadata.
 - Old, future-dated or disappeared messages never trigger Claude or writes.
 - Claude may only *propose* actions. Every proposal is validated here against
-  fixed limits and the denylist, then reviewed (server.py); a write needs a
+  fixed limits and the permission list, then reviewed (server.py); a write needs a
   single-use confirmation from the requester's private DM unless the admin
   enabled auto mode and the reviewer allowed it.
 """
@@ -268,24 +268,43 @@ def group_roster_problem(groups: object, group_id: str, bot_aci: str, users: set
 # ---------------------------------------------------------------- policy
 
 TARGET_KEYS = frozenset({'entity_id', 'device_id', 'area_id', 'floor_id', 'label_id', 'target'})
-DENY_RE = r'[a-z_*?]+\.[a-z0-9_*?]+'
-MAX_DENY = 100
+MAX_RULES = 200
 VERDICTS = ('allow', 'ask', 'deny')
 
 
-def load_deny(patterns: object) -> list[str]:
-    """Validate an admin pattern list (denylist or allowlist): globs like
-    ``light.*``, ``cover.garage*`` or ``*.turn_off``, matched against entity and service."""
-    if (not isinstance(patterns, list) or len(patterns) > MAX_DENY
-            or not all(isinstance(p, str) and re.fullmatch(DENY_RE, p) for p in patterns)):
-        raise ValueError('entries look like light.*, cover.garage* or *.turn_off')
-    return list(patterns)
+PERMISSION_RE = r'(allow|review|deny)\s+(\*|[a-z_*?]+\.[a-z0-9_*?]+)'
+EFFECTS = ('allow', 'review', 'deny')
 
 
-def denied_by(patterns: list[str], service: str, entity_id: str) -> str | None:
-    """The first pattern matching the entity or the service, if any."""
-    return next((p for p in patterns if fnmatch.fnmatchcase(entity_id, p) or fnmatch.fnmatchcase(service, p)),
-                None)
+def load_permissions(lines: object) -> list[tuple[str, str]]:
+    """Parse the admin's ordered permission list into (effect, pattern) rules.
+
+    One rule per line: ``allow|review|deny <pattern>``, where the pattern is a
+    glob like ``light.*``, ``cover.garage*``, ``*.turn_off`` or ``*``, matched
+    against the entity and the service. Blank lines and ``#`` comments are
+    ignored. Like .gitignore, the last matching line wins.
+    """
+    if not isinstance(lines, list) or len(lines) > MAX_RULES or not all(isinstance(x, str) for x in lines):
+        raise ValueError(f'at most {MAX_RULES} lines of text')
+    rules = []
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        match = re.fullmatch(PERMISSION_RE, line)
+        if not match:
+            raise ValueError(f'line {n} ("{line[:40]}"): use allow, review or deny, then a pattern '
+                             'like light.*, cover.garage*, *.turn_off or *')
+        rules.append((match.group(1), match.group(2)))
+    return rules
+
+
+def permission(rules: list[tuple[str, str]], service: str, entity_id: str) -> tuple[str, str | None]:
+    """(effect, matching line) for a call; the last matching rule wins, default 'review'."""
+    for effect, pattern in reversed(rules):
+        if fnmatch.fnmatchcase(entity_id, pattern) or fnmatch.fnmatchcase(service, pattern):
+            return effect, f'{effect} {pattern}'
+    return 'review', None
 
 
 def _scalar(value: object, max_len: int) -> bool:
@@ -294,13 +313,13 @@ def _scalar(value: object, max_len: int) -> bool:
     return isinstance(value, (bool, int, float)) and value == value  # no NaN
 
 
-def validate_action(action: object, deny: list[str], allow: list[str] | None = None) -> tuple[str, dict]:
+def validate_action(action: object, rules: list[tuple[str, str]]) -> tuple[str, dict]:
     """Fixed, deterministic limits on a proposed action (before any review).
 
     One existing-looking entity, a service of that entity's domain, a domain
-    from WRITABLE_DOMAINS, nothing on the admin's denylist, on the allowlist
-    if one is active (``allow`` not None), and flat service data (no extra
-    targets). Returns (service, service_data incl. entity_id).
+    from WRITABLE_DOMAINS, not denied by the admin's permission rules, and
+    flat service data (no extra targets). Returns (service, service_data incl.
+    entity_id); ``permission()`` tells whether it still needs review.
     """
     if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at', 'repeat'}:
         raise Denied('unexpected action fields')
@@ -314,10 +333,9 @@ def validate_action(action: object, deny: list[str], allow: list[str] | None = N
         raise Denied(f'{service} does not belong to {entity_id}')
     if domain not in WRITABLE_DOMAINS:
         raise Denied(f'{domain} devices can never be controlled by the bot')
-    if pattern := denied_by(deny, service, entity_id):
-        raise Denied(f'blocked by the denylist ({pattern})')
-    if allow is not None and not denied_by(allow, service, entity_id):
-        raise Denied(f'{entity_id} / {service} is not on the allowlist')
+    effect, line = permission(rules, service, entity_id)
+    if effect == 'deny':
+        raise Denied(f'not permitted ({line})')
     if len(data) > 12:
         raise Denied('too many fields')
     for key, value in data.items():

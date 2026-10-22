@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from bot.core import (Store, Incoming, Reaction, RemoteDelete, Settings, Denied, ClaudeError, addressed,
-                      freshness, parse_signal_event, load_deny, validate_action, describe,
+                      freshness, parse_signal_event, load_permissions, permission, validate_action, describe,
                       build_schema, parse_claude_output, parse_verdict, render_overview, ha_mcp_overview_args,
                       identity_trusted, group_roster_problem, APPROVAL_TTL)
 from bot.household import Household, HouseholdError, HouseholdStore
@@ -143,12 +143,23 @@ class FreshnessTests(unittest.TestCase):
 
 
 class PolicyTests(unittest.TestCase):
-    def test_load_deny(self):
-        self.assertEqual(load_deny(['lock.*', 'cover.garage*', '*.turn_off', 'script.x?']),
-                         ['lock.*', 'cover.garage*', '*.turn_off', 'script.x?'])
-        for bad in (['lock'], ['light.*; rm'], ['Light.*'], [1], 'lock.*', ['x.y'] * 101):
+    def test_load_permissions(self):
+        self.assertEqual(load_permissions(['# strict', '', 'deny *', 'review light.*', '  allow light.flur ',
+                                           'deny *.turn_off', 'deny script.x?']),
+                         [('deny', '*'), ('review', 'light.*'), ('allow', 'light.flur'), ('deny', '*.turn_off'),
+                          ('deny', 'script.x?')])
+        for bad in (['lock.*'], ['allow lock'], ['permit light.*'], ['allow light.*; rm'], ['allow Light.*'],
+                    [1], 'deny *', ['deny *'] * 201):
             with self.assertRaises(ValueError, msg=bad):
-                load_deny(bad)
+                load_permissions(bad)
+
+    def test_last_matching_rule_wins(self):
+        rules = load_permissions(['deny *', 'review light.*', 'allow light.flur', 'deny *.turn_off'])
+        self.assertEqual(permission(rules, 'light.turn_on', 'light.flur'), ('allow', 'allow light.flur'))
+        self.assertEqual(permission(rules, 'light.turn_on', 'light.kitchen')[0], 'review')
+        self.assertEqual(permission(rules, 'light.turn_off', 'light.flur'), ('deny', 'deny *.turn_off'))
+        self.assertEqual(permission(rules, 'switch.turn_on', 'switch.kettle'), ('deny', 'deny *'))
+        self.assertEqual(permission([], 'switch.turn_on', 'switch.kettle'), ('review', None))  # default
 
     def test_validate_action_fixed_limits(self):
         good = {'service': 'light.turn_on', 'entity_id': 'light.kitchen',
@@ -176,25 +187,15 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(describe('light.turn_on', {'entity_id': 'light.k', 'brightness_pct': 40}),
                          'light.turn_on on light.k (brightness_pct=40)')
 
-    def test_denylist_matches_entity_or_service(self):
+    def test_denied_by_permissions(self):
         cover = {'service': 'cover.open_cover', 'entity_id': 'cover.garage_door', 'data': {}}
-        for deny in (['cover.garage*'], ['cover.open_*'], ['*.open_cover'], ['cover.*']):
-            with self.assertRaises(Denied, msg=deny):
-                validate_action(cover, deny)
-        self.assertEqual(validate_action(cover, ['cover.kitchen*', 'light.*'])[0], 'cover.open_cover')
-
-    def test_allowlist_when_active(self):
-        lamp = {'service': 'light.turn_on', 'entity_id': 'light.kitchen', 'data': {}}
-        heater = {'service': 'water_heater.set_operation_mode', 'entity_id': 'water_heater.dhw', 'data': {}}
-        self.assertEqual(validate_action(lamp, [], None)[0], 'light.turn_on')         # no allowlist
-        for allow in (['light.*'], ['light.kitchen'], ['*.turn_on']):
-            self.assertEqual(validate_action(lamp, [], allow)[0], 'light.turn_on')
-        for allow in ([], ['light.bedroom'], ['switch.*']):
-            with self.assertRaises(Denied, msg=allow):
-                validate_action(lamp, [], allow)
-        with self.assertRaises(Denied):                                                # deny still wins
-            validate_action(lamp, ['light.kitchen'], ['light.*'])
-        self.assertEqual(validate_action(heater, [], ['water_heater.dhw'])[0], 'water_heater.set_operation_mode')
+        for lines in (['deny cover.garage*'], ['deny cover.open_*'], ['deny *.open_cover'], ['deny *'],
+                      ['allow cover.*', 'deny cover.garage_door']):
+            with self.assertRaises(Denied, msg=lines):
+                validate_action(cover, load_permissions(lines))
+        for lines in ([], ['deny cover.kitchen*', 'deny light.*'], ['deny *', 'allow cover.garage_door'],
+                      ['deny *', 'review cover.*']):
+            self.assertEqual(validate_action(cover, load_permissions(lines))[0], 'cover.open_cover', lines)
 
     def test_schema_has_no_draft_reference_and_blocks_actions_when_read_only(self):
         read_only = build_schema(False)
@@ -218,7 +219,7 @@ class HouseholdTests(unittest.TestCase):
         self.assertFalse(house.allow_writes)
         self.assertTrue(house.require_verified_identity)
         self.assertFalse(house.auto_approve)
-        self.assertEqual(house.deny, [])
+        self.assertEqual(house.permissions, [])
 
     def test_validation(self):
         base = Household(users={'malte': USER1})
@@ -226,7 +227,7 @@ class HouseholdTests(unittest.TestCase):
         for change in ({'users': {'Malte': USER1}}, {'users': {'a': 'not-an-aci'}}, {'users': {'a': USER1, 'b': USER1}},
                        {'bot_aci': USER1}, {'groups': {'malte': 'Z3JvdXBpZGlk'}}, {'groups': {'a': 'x'}},
                        {'signal_account': '015112345678'}, {'bot_name': 'Home Bot!'},
-                       {'deny': ['lock']}, {'deny': 'lock.*'}, {'rules': 'x' * 4001}, {'allow': ['light']},
+                       {'permissions': ['deny lock']}, {'permissions': 'deny *'}, {'rules': 'x' * 4001},
                        {'command_max_age': 5}, {'history_days': 99}, {'notes': 'x' * 4001}, {'model': 'gpt'}):
             with self.assertRaises(HouseholdError, msg=change):
                 base.change(**change)
@@ -236,20 +237,23 @@ class HouseholdTests(unittest.TestCase):
             store = HouseholdStore(str(Path(d) / 'sub' / 'settings.json'))
             self.assertEqual(store.load(), Household())
             house = Household(signal_account='+4915100000000', users={'malte': USER1}, allow_writes=True,
-                              deny=['cover.garage*'], rules='Lights: anyone.', auto_approve=True,
-                              allowlist_on=True, allow=['light.*'])
+                              permissions=['deny *', 'review light.*', 'deny cover.garage*'],
+                              rules='Lights: anyone.', auto_approve=True)
             store.save(house)
             self.assertEqual(store.load(), house)
             # Settings from before 0.10 still load; a non-empty action table becomes an active
             # allowlist of its entities, so the scope never grows on update.
-            old = {k: v for k, v in house.to_json().items() if k not in ('allowlist_on', 'allow')}
+            old = {k: v for k, v in house.to_json().items() if k != 'permissions'}
             store.path.write_text(json.dumps({**old, 'actions': [
                 {'service': 'light.turn_on', 'entities': ['light.*'], 'senders': ['malte']},
                 {'service': 'water_heater.set_operation_mode', 'entities': ['water_heater.dhw', 'light.*']}]}))
-            migrated = store.load()
-            self.assertEqual((migrated.allowlist_on, migrated.allow), (True, ['light.*', 'water_heater.dhw']))
+            self.assertEqual(store.load().permissions, ['deny *', 'review light.*', 'review water_heater.dhw'])
             store.path.write_text(json.dumps({**old, 'actions': []}))
-            self.assertEqual((store.load().allowlist_on, store.load().allow), (False, []))
+            self.assertEqual(store.load().permissions, [])
+            # 0.10's separate lists become ordered lines with the same effect.
+            store.path.write_text(json.dumps({**old, 'allowlist_on': True, 'allow': ['light.*'],
+                                              'deny': ['light.garden']}))
+            self.assertEqual(store.load().permissions, ['deny *', 'review light.*', 'deny light.garden'])
             self.assertEqual(oct(store.path.stat().st_mode & 0o777), '0o600')
             for bad in ({'allow_writes': 'yes'}, {'surprise': 1}, {'command_max_age': True}, []):
                 store.path.write_text(json.dumps(bad if isinstance(bad, list) else {**house.to_json(), **bad}))
