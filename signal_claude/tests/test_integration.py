@@ -429,9 +429,12 @@ class ToolTests(Integration):
         out = await use('get_image', {'entity_id': 'image.vacuum_map'})
         self.assertFalse(out['error'])
         self.assertEqual([m for m, _ in out['images']], ['image/png'])
+        out = await use('get_image', {'entity_id': 'camera.front_door'})
+        self.assertEqual([m for m, _ in out['images']], ['image/png'])
+        self.assertIn('ha_get_camera_image', self.ha.mcp_calls)
         # Bad ids never reach HA; a picture link pointing elsewhere is refused.
         self.ha.mcp_calls.clear()
-        for name, args in (('get_image', {'entity_id': 'camera.front_door'}),
+        for name, args in (('get_image', {'entity_id': 'lock.front_door'}),
                            ('get_automation_config', {'automation_id': '../../secrets'}),
                            ('get_dashboard', {'url_path': 'x/../y'})):
             self.assertTrue((await use(name, args))['error'], name)

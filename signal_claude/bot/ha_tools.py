@@ -266,9 +266,15 @@ class HaTools:
 
             @server.tool(name='get_image')
             async def get_image(entity_id: str):
-                """The current picture of an image.* entity (e.g. a vacuum map), to look at."""
+                """The current picture of an image.* entity (e.g. a vacuum map) or a snapshot of a
+                camera.* entity, to look at."""
+                if re.fullmatch(r'camera\.[a-z0-9_]+', entity_id):
+                    text, images = await tools.call_content('ha_get_camera_image', {'entity_id': entity_id})
+                    if not images:
+                        raise UpstreamError(f'no snapshot (larger than 4 MB or not an image): {text[:200]}')
+                    return [result_summary(text, 500), images[0]]
                 if not re.fullmatch(r'image\.[a-z0-9_]+', entity_id):
-                    raise ValueError('entity_id must be an image.* entity')
+                    raise ValueError('entity_id must be an image.* or camera.* entity')
                 return await tools.image(entity_id)
         else:
             @server.tool(name='get_live_context')

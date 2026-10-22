@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.5 — 2026-10-22
+
+### Added
+- `get_image` also returns camera snapshots (`camera.*`, through ha-mcp's
+  read-only `ha_get_camera_image`).
+
 ## 0.8.4 — 2026-10-22
 
 ### Added

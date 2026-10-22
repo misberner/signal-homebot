@@ -358,6 +358,13 @@ def _start_mcp(read_only: bool) -> str:
             e: {'entity_id': e, 'state': fake.states.get(e, 'unknown'), 'attributes': fake.attributes.get(e, {})}
             for e in ids}}})
 
+    @server.tool(name='ha_get_camera_image')
+    def ha_get_camera_image(entity_id: str, width: int | None = None, height: int | None = None) -> list:
+        """Get a snapshot image from a camera entity."""
+        from mcp.server.mcpserver import Image
+        FakeHomeAssistant.active.mcp_calls.append('ha_get_camera_image')
+        return ['Snapshot 1x1, retrieved 10:00', Image(data=PNG, format='png')]
+
     @server.tool(name='ha_config_get_automation')
     def ha_config_get_automation(identifier: str) -> str:
         """Get automation configuration."""
