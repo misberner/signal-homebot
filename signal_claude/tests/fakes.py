@@ -52,6 +52,11 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+IMAGE_TOKEN = 'c9ba749c71c171e1c4bbe9c7751c579d'
+PNG = (b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15'
+       b'\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00'
+       b'\x00IEND\xaeB`\x82')
+
 class FakeSignalDaemon:
     def __init__(self):
         self.prefix = f'{int(time.time() * 1000)}-'
@@ -240,7 +245,10 @@ class FakeHomeAssistant:
         self.mcp_auth_headers: list[str | None] = []
         self.mcp_fail = False
         self.overview: dict | None = None  # ha-mcp ha_get_overview result override
-        self.states = {'light.test_lamp': 'off', 'sensor.living_room_temperature': '21.5'}
+        self.states = {'light.test_lamp': 'off', 'sensor.living_room_temperature': '21.5',
+                       'image.vacuum_map': '2026-10-21T10:34:14+00:00'}
+        self.attributes = {'image.vacuum_map': {
+            'entity_picture': '/api/image_proxy/image.vacuum_map?token=' + IMAGE_TOKEN}}
         self.runner = None
         self.url = ''
 
@@ -261,6 +269,7 @@ class FakeHomeAssistant:
     async def start(self):
         app = web.Application()
         app.router.add_post('/api/services/{domain}/{service}', self.service)
+        app.router.add_get('/api/image_proxy/{entity_id}', self.image_proxy)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         port = free_port()
@@ -269,6 +278,12 @@ class FakeHomeAssistant:
         FakeHomeAssistant.active = self
         if not FakeHomeAssistant._urls:
             FakeHomeAssistant._urls = {'admin': _start_mcp(False), 'readonly': _start_mcp(True)}
+
+    async def image_proxy(self, req: web.Request) -> web.Response:
+        # Like HA: the entity's access token authorizes this one image.
+        if req.match_info['entity_id'] != 'image.vacuum_map' or req.query.get('token') != IMAGE_TOKEN:
+            return web.Response(status=401)
+        return web.Response(body=PNG, content_type='image/png')
 
     async def stop(self):
         FakeHomeAssistant.active = None
@@ -339,7 +354,39 @@ def _start_mcp(read_only: bool) -> str:
         fake.mcp_calls.append('ha_get_state')
         fake.mcp_args.append({'entity_id': entity_id, 'fields': fields})
         ids = entity_id if isinstance(entity_id, list) else [entity_id]
-        return json.dumps({'success': True, 'states': {e: {'state': fake.states.get(e, 'unknown')} for e in ids}})
+        return json.dumps({'data': {'success': True, 'states': {
+            e: {'entity_id': e, 'state': fake.states.get(e, 'unknown'), 'attributes': fake.attributes.get(e, {})}
+            for e in ids}}})
+
+    @server.tool(name='ha_config_get_automation')
+    def ha_config_get_automation(identifier: str) -> str:
+        """Get automation configuration."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_config_get_automation')
+        return json.dumps({'success': True, 'automation_id': identifier,
+                           'config': {'triggers': [{'trigger': 'time', 'at': '06:00'}],
+                                      'actions': [{'action': 'light.turn_on'}]}})
+
+    @server.tool(name='ha_config_get_script')
+    def ha_config_get_script(script_id: str) -> str:
+        """Get script configuration."""
+        FakeHomeAssistant.active.mcp_calls.append('ha_config_get_script')
+        return json.dumps({'success': True, 'script_id': script_id.removeprefix('script.'),
+                           'config': {'sequence': [{'action': 'water_heater.set_operation_mode'}]}})
+
+    @server.tool(name='ha_config_get_dashboard')
+    def ha_config_get_dashboard(url_path: str | None = None, list_only: bool = False, view_path: str | None = None,
+                                entity_id: str | None = None, card_type: str | None = None,
+                                heading: str | None = None, query: str | None = None,
+                                include_config: bool = False, include_screenshot: bool = False) -> list:
+        """Get Lovelace dashboards."""
+        from mcp.server.mcpserver import Image
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_config_get_dashboard')
+        fake.mcp_args.append({'url_path': url_path, 'list_only': list_only, 'include_screenshot': include_screenshot})
+        text = json.dumps({'success': True, 'url_path': url_path,
+                           'config': {'views': [{'title': 'Heizung', 'cards': [{'type': 'tile'}]}]}})
+        return [text, Image(data=PNG, format='png')] if include_screenshot else [text]
 
     @server.tool(name='ha_search')
     def ha_search(query: str | None = None, domain_filter: str | None = None, area_filter: str | None = None,
@@ -426,7 +473,8 @@ if spec.get('call_tool') and mcp_config:
                 names = [t.name for t in (await client.list_tools()).tools]
                 result = await client.call_tool(spec['call_tool']['name'], spec['call_tool']['args'])
                 text = ' '.join(getattr(c, 'text', '') for c in result.content)
-                return json.dumps({{'tools': names, 'error': result.is_error, 'text': text}})
+                images = [[c.mime_type, len(c.data)] for c in result.content if getattr(c, 'type', '') == 'image']
+                return json.dumps({{'tools': names, 'error': result.is_error, 'text': text, 'images': images}})
     try:
         tool_text = asyncio.run(use_tool())
     except BaseException as err:

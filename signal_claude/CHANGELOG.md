@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.4 — 2026-10-22
+
+### Added
+- Read tools (ha-mcp): `get_dashboard` (list/read/search dashboards, plus
+  screenshots when ha-mcp's screenshot beta is enabled),
+  `get_automation_config` and `get_script_config` (sources), and
+  `get_image` (the picture of an `image.*` entity, fetched through HA's
+  image proxy with the entity's own short-lived token; only HA's own
+  `/api/image_proxy/` links are followed). All read-only.
+
+### Changed
+- A dropped connection to the MCP server is retried once (reads only).
+
 ## 0.8.3 — 2026-10-22
 
 ### Added

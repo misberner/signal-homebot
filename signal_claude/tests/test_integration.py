@@ -390,12 +390,15 @@ class ToolTests(Integration):
         self.claude.set(call_tool={'name': 'get_states', 'args': {'entity_ids': ['sensor.living_room_temperature']}})
         await self.deliver(sender=USER1, text='how warm is it?')
         result = json.loads(self.dm(USER1)[0])
-        self.assertEqual(sorted(result['tools']), ['get_history', 'get_overview', 'get_states', 'search_entities'])
+        self.assertEqual(sorted(result['tools']), ['get_automation_config', 'get_dashboard', 'get_history', 'get_image',
+                                                   'get_overview', 'get_script_config', 'get_states', 'search_entities'])
         self.assertIn('21.5', result['text'])
         self.assertTrue(all(h is None for h in self.ha.mcp_auth_headers))  # no HA token to ha-mcp
         argv = self.claude.calls[0]['argv']
         self.assertEqual(argv[argv.index('--allowedTools') + 1].split(','),
-                         [f'mcp__ha__{t}' for t in ('search_entities', 'get_states', 'get_overview', 'get_history')])
+                         [f'mcp__ha__{t}' for t in ('search_entities', 'get_states', 'get_overview', 'get_history',
+                                                     'get_dashboard', 'get_automation_config', 'get_script_config',
+                                                     'get_image')])
         # Invalid arguments never reach Home Assistant.
         self.ha.mcp_calls.clear()
         self.claude.set(call_tool={'name': 'get_states', 'args': {'entity_ids': ['light.x; rm -rf /']}})
@@ -407,6 +410,36 @@ class ToolTests(Integration):
         await self.deliver(sender=USER1, text='overview')
         self.assertIn('light.test_lamp (Test Lamp): off', json.loads(self.dm(USER1)[-1])['text'])
         self.assertNotIn('system_info', self.ha.mcp_args[-1]['fields'])
+
+    async def test_config_dashboard_and_image_reads(self):
+        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url, ha_token='')
+        async def use(name, args):
+            self.claude.set(call_tool={'name': name, 'args': args})
+            await self.deliver(sender=USER1, text=f'use {name}')
+            return json.loads(self.dm(USER1)[-1])
+        out = await use('get_automation_config', {'automation_id': 'automation.morning'})
+        self.assertFalse(out['error'])
+        self.assertIn('06:00', out['text'])
+        out = await use('get_script_config', {'script_id': 'script.warmwasser_an'})
+        self.assertIn('water_heater.set_operation_mode', out['text'])
+        out = await use('get_dashboard', {'url_path': 'dashboard-heating', 'include_screenshot': True})
+        self.assertIn('Heizung', out['text'])
+        self.assertEqual([m for m, _ in out['images']], ['image/png'])
+        # An image entity's picture comes through HA's image proxy, without HA credentials.
+        out = await use('get_image', {'entity_id': 'image.vacuum_map'})
+        self.assertFalse(out['error'])
+        self.assertEqual([m for m, _ in out['images']], ['image/png'])
+        # Bad ids never reach HA; a picture link pointing elsewhere is refused.
+        self.ha.mcp_calls.clear()
+        for name, args in (('get_image', {'entity_id': 'camera.front_door'}),
+                           ('get_automation_config', {'automation_id': '../../secrets'}),
+                           ('get_dashboard', {'url_path': 'x/../y'})):
+            self.assertTrue((await use(name, args))['error'], name)
+        self.assertEqual(self.ha.mcp_calls, [])
+        self.ha.attributes['image.vacuum_map'] = {'entity_picture': 'http://evil.example/x.png'}
+        out = await use('get_image', {'entity_id': 'image.vacuum_map'})
+        self.assertTrue(out['error'])
+        self.assertEqual(out['images'], [])
 
     async def test_proxy_rejects_missing_or_stale_token(self):
         from mcp import Client

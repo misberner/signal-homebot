@@ -9,6 +9,7 @@ connection is read-only.
 """
 from __future__ import annotations
 import asyncio
+import base64
 import contextlib
 import json
 import re
@@ -27,10 +28,17 @@ LIVE_CONTEXT_TOOLS = ('homeassistant__GetLiveContext', 'GetLiveContext')
 # catalog means the connection is not read-only.
 HA_MCP_WRITE_TOOLS = ('ha_call_service', 'ha_write_file', 'ha_restart', 'ha_bulk_control')
 TOOLS = {
-    'ha_mcp': ('search_entities', 'get_states', 'get_overview', 'get_history'),
+    'ha_mcp': ('search_entities', 'get_states', 'get_overview', 'get_history', 'get_dashboard',
+               'get_automation_config', 'get_script_config', 'get_image'),
     'hass': ('get_live_context',),
 }
 MAX_RESULT = 30000
+MAX_CONFIG_RESULT = 80000  # dashboards and automation sources are bigger than states
+MAX_IMAGE = 4 << 20
+IMAGE_TYPES = {'image/jpeg': 'jpeg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp'}
+# HA's image entities publish a short-lived, image-only access link.
+IMAGE_PROXY_RE = r'/api/image_proxy/(image\.[a-z0-9_]+)\?token=[A-Za-z0-9]{16,128}'
+CONFIG_ID_RE = r'[A-Za-z0-9_.-]{1,100}'
 # Module level: tool signatures are resolved from module globals.
 EntityIds = Annotated[list[str], Field(min_length=1, max_length=25)]
 HistoryIds = Annotated[list[str], Field(min_length=1, max_length=10)]
@@ -103,6 +111,20 @@ class HaTools:
         self._preflight_ok_until = time.monotonic() + PREFLIGHT_TTL
 
     async def call(self, tool: str, args: dict) -> str:
+        return (await self.call_content(tool, args))[0]
+
+    async def call_content(self, tool: str, args: dict) -> tuple[str, list]:
+        """(text, images) of an upstream tool result; images as MCP Image helpers.
+        These are reads, so a dropped connection is retried once."""
+        try:
+            return await self._call_once(tool, args)
+        except UpstreamError:
+            raise
+        except Exception:
+            return await self._call_once(tool, args)
+
+    async def _call_once(self, tool: str, args: dict) -> tuple[str, list]:
+        from mcp.server.mcpserver import Image
         async with self.upstream() as (client, names):
             if tool == 'GetLiveContext':
                 tool = next(n for n in LIVE_CONTEXT_TOOLS if n in names)
@@ -110,7 +132,40 @@ class HaTools:
             text = '\n'.join(getattr(c, 'text', '') for c in result.content)
             if result.is_error:
                 raise UpstreamError(f'{tool} failed: {text[:300]}')
-            return text
+            images = []
+            for c in result.content:
+                fmt = IMAGE_TYPES.get(getattr(c, 'mime_type', None) or '')
+                if getattr(c, 'type', '') == 'image' and fmt:
+                    data = base64.b64decode(c.data)
+                    if len(data) <= MAX_IMAGE:
+                        images.append(Image(data=data, format=fmt))
+            return text, images
+
+    async def image(self, entity_id: str):
+        """The current picture of an image entity, fetched through HA's image
+        proxy with the entity's own short-lived access token (no HA credentials)."""
+        import httpx2
+        from mcp.server.mcpserver import Image
+        state = json.loads(await self.call('ha_get_state', {'entity_id': [entity_id],
+                                                            'fields': ['entity_id', 'attributes']}))
+        states = (state.get('data') or state).get('states') or {}
+        picture = ((states.get(entity_id) or {}).get('attributes') or {}).get('entity_picture')
+        match = re.fullmatch(IMAGE_PROXY_RE, picture) if isinstance(picture, str) else None
+        if not match or match.group(1) != entity_id:
+            raise UpstreamError(f'{entity_id} has no picture')
+        async with httpx2.AsyncClient(timeout=httpx2.Timeout(15), follow_redirects=False) as http:
+            async with http.stream('GET', self.cfg.ha_url + picture) as r:
+                if r.status_code != 200:
+                    raise UpstreamError(f'Home Assistant returned HTTP {r.status_code}')
+                fmt = IMAGE_TYPES.get(r.headers.get('content-type', '').split(';')[0].strip().lower())
+                if not fmt:
+                    raise UpstreamError('not a JPEG, PNG, GIF or WebP image')
+                data = bytearray()
+                async for chunk in r.aiter_bytes():
+                    data += chunk
+                    if len(data) > MAX_IMAGE:
+                        raise UpstreamError('image larger than 4 MB')
+        return Image(data=bytes(data), format=fmt)
 
     # ---------------------------------------------------------------- MCP server
 
@@ -162,6 +217,59 @@ class HaTools:
                 return result_summary(await tools.call('ha_get_history', {
                     'entity_ids': check_entities(entity_ids), 'start_time': start_time,
                     'limit': limit, 'minimal_response': True}))
+
+            @server.tool(name='get_dashboard')
+            async def get_dashboard(url_path: str | None = None, list_only: bool = False,
+                                    view_path: str | None = None, entity_id: str | None = None,
+                                    card_type: str | None = None, heading: str | None = None,
+                                    query: str | None = None, include_config: bool = False,
+                                    include_screenshot: bool = False):
+                """Lovelace dashboards. list_only=true lists them; url_path (e.g. 'dashboard-heating',
+                'default' for the main one) reads one dashboard's config, optionally only view_path.
+                entity_id ('*' wildcard), card_type, heading or query search cards (include_config adds
+                each card's config). include_screenshot also returns rendered images if HA supports it."""
+                args = {'list_only': list_only, 'include_config': include_config,
+                        'include_screenshot': include_screenshot}
+                for key, value, pattern in (('url_path', url_path, r'[a-z0-9_-]{1,64}'),
+                                            ('view_path', view_path, r'[A-Za-z0-9_-]{1,64}'),
+                                            ('entity_id', entity_id, r'[a-z_*]+\.[a-z0-9_*]+'),
+                                            ('card_type', card_type, r'[A-Za-z0-9_:-]{1,64}')):
+                    if value is not None:
+                        if not re.fullmatch(pattern, value):
+                            raise ValueError(f'invalid {key}')
+                        args[key] = value
+                for key, value in (('heading', heading), ('query', query)):
+                    if value is not None:
+                        if not 0 < len(value) <= 100:
+                            raise ValueError(f'{key} must be 1-100 characters')
+                        args[key] = value
+                text, images = await tools.call_content('ha_config_get_dashboard', args)
+                return [result_summary(text, MAX_CONFIG_RESULT), *images[:3]] if images \
+                    else result_summary(text, MAX_CONFIG_RESULT)
+
+            @server.tool(name='get_automation_config')
+            async def get_automation_config(automation_id: str) -> str:
+                """Source of an automation (triggers, conditions, actions) by entity_id
+                (automation.xyz) or unique id."""
+                if not re.fullmatch(CONFIG_ID_RE, automation_id):
+                    raise ValueError('invalid automation id')
+                return result_summary(await tools.call('ha_config_get_automation',
+                                                       {'identifier': automation_id}), MAX_CONFIG_RESULT)
+
+            @server.tool(name='get_script_config')
+            async def get_script_config(script_id: str) -> str:
+                """Source of a script (sequence, fields, mode) by entity_id (script.xyz) or id."""
+                if not re.fullmatch(CONFIG_ID_RE, script_id):
+                    raise ValueError('invalid script id')
+                return result_summary(await tools.call('ha_config_get_script',
+                                                       {'script_id': script_id}), MAX_CONFIG_RESULT)
+
+            @server.tool(name='get_image')
+            async def get_image(entity_id: str):
+                """The current picture of an image.* entity (e.g. a vacuum map), to look at."""
+                if not re.fullmatch(r'image\.[a-z0-9_]+', entity_id):
+                    raise ValueError('entity_id must be an image.* entity')
+                return await tools.image(entity_id)
         else:
             @server.tool(name='get_live_context')
             async def get_live_context() -> str:
@@ -199,10 +307,10 @@ class HaTools:
             raise
 
 
-def result_summary(text: str) -> str:
+def result_summary(text: str, limit: int = MAX_RESULT) -> str:
     """Trim a tool result for Claude; pass through compact JSON."""
     try:
         text = json.dumps(json.loads(text), separators=(',', ':'), ensure_ascii=False)
     except ValueError:
         pass
-    return text[:MAX_RESULT]
+    return text[:limit]

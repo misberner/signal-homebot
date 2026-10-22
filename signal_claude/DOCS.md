@@ -80,7 +80,7 @@ forwards each call to Home Assistant with constrained arguments:
 
 | `ha_mcp_kind` | Tools Claude gets | Upstream |
 |---|---|---|
-| `ha_mcp` (recommended) | `search_entities`, `get_states` (≤ 25 entities, with attributes such as temperatures), `get_overview` (states per domain, never your coordinates), `get_history` (≤ 10 entities) | [ha-mcp](https://github.com/homeassistant-ai/ha-mcp) |
+| `ha_mcp` (recommended) | `search_entities`, `get_states` (≤ 25 entities, with attributes such as temperatures), `get_overview` (states per domain, never your coordinates), `get_history` (≤ 10 entities), `get_dashboard` (list, read or search dashboards; screenshots if ha-mcp's screenshot beta is on), `get_automation_config` / `get_script_config` (sources), `get_image` (pictures of `image.*` entities via HA's image proxy, ≤ 4 MB; cameras are not included) | [ha-mcp](https://github.com/homeassistant-ai/ha-mcp) |
 | `hass` | `get_live_context` | HA's built-in **Model Context Protocol Server** (Assist API, read-only option, exposed entities only) |
 
 **ha-mcp must be read-only.** The bot refuses any ha-mcp connection whose

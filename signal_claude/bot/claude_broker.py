@@ -68,7 +68,7 @@ def progress_detail(args: object) -> str:
     """A short, plain summary of a tool call's arguments for the status message."""
     if not isinstance(args, dict):
         return ''
-    for key in ('query', 'entity_ids', 'domains'):
+    for key in ('query', 'entity_ids', 'domains', 'entity_id', 'url_path', 'automation_id', 'script_id'):
         value = args.get(key)
         if isinstance(value, list) and value:
             first = str(value[0])[:40]
@@ -87,7 +87,8 @@ class Broker:
     allowed_uid: int | None = None  # required on Linux in production
     mcp_url: str = 'http://127.0.0.1:8765/mcp'
     allowed_tools: tuple[str, ...] = ('search_entities', 'get_states', 'get_overview', 'get_history',
-                                      'get_live_context')
+                                      'get_dashboard', 'get_automation_config', 'get_script_config',
+                                      'get_image', 'get_live_context')
 
     def __post_init__(self):
         self.busy = asyncio.Lock()
