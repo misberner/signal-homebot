@@ -219,7 +219,9 @@ class ConversationTests(Integration):
         self.assertTrue(any(t.count('🏠 Reading the home') == 2 for t in texts))
         self.assertFalse(any('Searching' in t or 'Bash' in t for t in texts))  # only tools Claude has
         self.assertEqual(texts[-1], 'Anna ist in der Küche.')
-        self.assertEqual(len({ts for ts, _ in self.signal.edits}), 1)
+        # Each edit targets the previous revision, as Signal-iOS requires.
+        targets = [ts for ts, _ in self.signal.edits]
+        self.assertEqual(len(set(targets)), len(targets))
         # History holds the answer once, not the placeholder.
         history = self.bot.store.context(f'dm:{USER1}', self.bot.now())
         self.assertEqual(history.count('Anna ist in der Küche.'), 1)

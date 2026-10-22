@@ -167,13 +167,17 @@ class FakeSignalDaemon:
                                       'error': {'code': -5, 'message': 'Failed to send message due to rate limiting'}})
         self.next_ts = max(self.next_ts + 1, int(time.time() * 1000))
         edit_of = body['params'].get('editTimestamp')
-        if edit_of is not None:  # like a phone: show the edited text in place of the original
+        if edit_of is not None:
+            # Like Signal-iOS: the latest revision takes the edit's timestamp, and
+            # an edit must target the latest revision (an earlier timestamp now
+            # names a past revision, which can't be edited; the edit is dropped).
             original = next((m for m in self.sent if m['_ts'] == edit_of), None)
             if original is None or self.reject_edits:
                 return error('Failed to send message: edit target not found')
             self.edits.append((edit_of, body['params']['message']))
             original['message'] = body['params']['message']
             original['_edits'] = original.get('_edits', 0) + 1
+            original['_ts'] = self.next_ts
             return ok({'timestamp': self.next_ts, 'results': [{'type': 'SUCCESS'}]})
         self.sent.append({**body['params'], '_ts': self.next_ts})
         recipients = body['params'].get('recipient') or [USER1, USER2]

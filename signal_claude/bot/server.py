@@ -268,7 +268,7 @@ class HomeBot:
                     self.store.outbox_sent(item_id, sent_ts)
                     if self.house.bot_aci:
                         self.store.add_outgoing(dest, self.house.bot_aci,
-                                                edit_ts or sent_ts or int(self.clock() * 1000),
+                                                sent_ts or edit_ts or int(self.clock() * 1000),
                                                 text, self.house.settings)
                 except asyncio.CancelledError:
                     raise
@@ -899,7 +899,7 @@ class StatusMessage:
 
     def __init__(self, bot: 'HomeBot', conv: str):
         self.bot, self.conv = bot, conv
-        self.ts: int | None = None
+        self.ts: int | None = None  # timestamp of the latest revision
         self.steps: list[str] = []
         self.edits = 0
         self.last_edit = 0.0
@@ -924,7 +924,9 @@ class StatusMessage:
         self.edits += 1
         self.last_edit = time.monotonic()
         try:
-            await self.bot.send_now(self.conv, self.text(), edit_ts=self.ts)
+            # Signal-iOS gives the edited message the edit's timestamp and only
+            # accepts further edits that target it; the original's is now stale.
+            self.ts = await self.bot.send_now(self.conv, self.text(), edit_ts=self.ts) or self.ts
         except Exception as err:
             LOG.debug('Status edit failed: %s', type(err).__name__)
 

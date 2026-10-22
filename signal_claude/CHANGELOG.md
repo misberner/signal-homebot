@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.1 — 2026-10-22
+
+### Fixed
+- **Answers never replaced the status message on iPhone.** Signal-iOS gives
+  an edited message the edit's timestamp and drops later edits that target
+  the original one, so only the first progress update appeared. Each edit
+  now targets the latest revision.
+
 ## 0.8.0 — 2026-10-22
 
 ### Fixed
