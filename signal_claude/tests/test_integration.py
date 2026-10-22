@@ -227,6 +227,11 @@ class ConversationTests(Integration):
         self.assertEqual(history.count('Anna ist in der Küche.'), 1)
         self.assertNotIn('Looking into it', history)
 
+    async def test_large_tool_results_do_not_break_the_answer(self):
+        self.claude.set(reply='Viele Sensoren.', tool_result_size=1 << 20)
+        await self.deliver(sender=USER1, text='was gibt es alles?')
+        self.assertEqual(self.dm(USER1), ['Viele Sensoren.'])
+
     async def test_answer_still_arrives_if_editing_fails(self):
         self.signal.reject_edits = True
         await self.deliver(sender=USER1, text='hi')

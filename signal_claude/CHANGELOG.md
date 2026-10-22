@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.2 — 2026-10-22
+
+### Fixed
+- **"Can't reach Claude" whenever Claude read a lot of HA data (0.8.0).**
+  The broker read Claude's stream-json output with asyncio's 64 KiB line
+  limit; a large tool result is one line, so the read failed and the
+  connection dropped. The limit is now 8 MiB, and the Claude process is
+  always killed if the broker stops reading early.
+
 ## 0.8.1 — 2026-10-22
 
 ### Fixed

@@ -455,6 +455,9 @@ if stream:
         print(json.dumps({{'type': 'assistant', 'message': {{'content': [{{
             'type': 'tool_use', 'name': name, 'input': {{'query': 'presence'}}}}]}}}}), flush=True)
         time.sleep(spec.get('progress_delay', 0))
+    if spec.get('tool_result_size'):  # like a large HA read: one long stream-json line
+        print(json.dumps({{'type': 'user', 'message': {{'content': [{{
+            'type': 'tool_result', 'content': 'x' * spec['tool_result_size']}}]}}}}))
 print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 2,
                   'result': json.dumps(out), 'structured_output': out, 'api_error_status': None,
                   'modelUsage': {{'claude-opus-5-5': {{}}}}}}))
@@ -471,9 +474,10 @@ class FakeClaude:
         self.path.chmod(self.path.stat().st_mode | stat.S_IEXEC)
         self.set()
 
-    def set(self, reply='ok', actions=(), mode='ok', call_tool=None, progress=(), progress_delay=0):
+    def set(self, reply='ok', actions=(), mode='ok', call_tool=None, progress=(), progress_delay=0,
+            tool_result_size=0):
         self.spec.write_text(json.dumps({'mode': mode, 'call_tool': call_tool, 'progress': list(progress),
-                                         'progress_delay': progress_delay,
+                                         'progress_delay': progress_delay, 'tool_result_size': tool_result_size,
                                          'output': {'reply': reply, 'actions': list(actions)}}))
 
     @property

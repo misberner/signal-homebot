@@ -31,6 +31,8 @@ LOG = logging.getLogger('claude-broker')
 MAX_REQUEST = 1 << 20   # bytes per request line
 MAX_PROMPT = 200_000    # characters
 MAX_OUTPUT = 1 << 20    # bytes of Claude stdout returned
+MAX_LINE = 8 << 20      # bytes per stream-json line (one tool result)
+MAX_STREAM = 64 << 20   # bytes of stream-json read per run
 
 
 TOOL_RE = r'[a-z_]{1,40}'
@@ -186,7 +188,10 @@ class Broker:
                 proc = await asyncio.create_subprocess_exec(
                     *claude_command(self.claude_bin, schema, mcp_config, tools, system, model), cwd=work, env=env,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL)
+                    stderr=asyncio.subprocess.DEVNULL,
+                    # stream-json puts each tool result on one line; HA reads
+                    # easily exceed asyncio's default 64 KiB line limit.
+                    limit=MAX_LINE)
             except OSError as err:
                 LOG.error('Cannot start Claude: %s', type(err).__name__)
                 return {'error': 'spawn'}
@@ -194,9 +199,14 @@ class Broker:
                 result = await asyncio.wait_for(self.collect(proc, prompt, set(tools), progress),
                                                 timeout=self.timeout)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
                 return {'error': 'timeout'}
+            except ValueError:  # a line longer than MAX_LINE
+                LOG.warning('Claude output line too long')
+                return {'error': 'output'}
+            finally:
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
             return {'returncode': proc.returncode, 'stdout': result}
 
     async def collect(self, proc, prompt: str, tools: set[str], progress) -> str:
@@ -208,7 +218,8 @@ class Broker:
         result, read = '', 0
         while line := await proc.stdout.readline():
             read += len(line)
-            if read > 4 * MAX_OUTPUT:
+            if read > MAX_STREAM:
+                proc.kill()
                 break
             try:
                 event = json.loads(line)
