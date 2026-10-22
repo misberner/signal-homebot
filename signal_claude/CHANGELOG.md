@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.3 — 2026-10-22
+
+### Added
+- Setup page: members and invitees of the bot's groups who aren't users yet
+  appear under "Recently seen" (with their Signal profile name and group),
+  so they can be added without writing to the bot first.
+- Setup page: added groups list their members again, marking anyone who
+  isn't a configured user and pending invitations.
+
 ## 0.8.2 — 2026-10-22
 
 ### Fixed

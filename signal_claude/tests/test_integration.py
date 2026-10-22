@@ -927,6 +927,7 @@ class SetupPageTests(Integration):
             return r.status, (await r.json() if r.content_type == 'application/json' else await r.text())
 
     async def test_full_setup_flow(self):
+        self.signal.group_members = [BOT, USER1]
         status, state = await self.call('state')
         self.assertEqual(state['account']['number'], '')
         async with self.http.get(self.server.make_url('/')) as r:
@@ -975,6 +976,23 @@ class SetupPageTests(Integration):
         await self.call('users/add', {'name': 'malte', 'aci': USER1})
         await self.deliver(sender=USER1, text='hello again')
         self.assertEqual(self.dm(USER1), ['ok'])
+
+    async def test_group_members_can_be_added_before_they_write(self):
+        self.bot.update_house(self.bot.house.change(signal_account=ACCOUNT, bot_aci=BOT, users={'malte': USER1}))
+        self.signal.profile_names = {USER2: 'Anna'}
+        _, state = await self.call('state')
+        self.assertEqual([(p['aci'], p['profile_name'], p['group']) for p in state['seen_senders']],
+                         [(USER2, 'Anna', 'Home')])
+        self.bot.update_house(self.bot.house.change(groups={'home': GROUP}))
+        _, state = await self.call('state')
+        self.assertEqual([(m['user'], m['profile_name']) for m in state['groups'][0]['members']],
+                         [('the bot', None), ('malte', None), (None, 'Anna')])
+        self.assertIn('someone other than', state['groups'][0]['problem'])
+        await self.call('users/add', {'name': 'anna', 'aci': USER2})
+        _, state = await self.call('state')
+        self.assertEqual(state['seen_senders'], [])
+        self.assertEqual([m['user'] for m in state['groups'][0]['members']], ['the bot', 'malte', 'anna'])
+        self.assertIsNone(state['groups'][0]['problem'])
 
     async def test_send_hello(self):
         self.bot.update_house(self.bot.house.change(signal_account=ACCOUNT, bot_aci=BOT, users={'malte': USER1}))

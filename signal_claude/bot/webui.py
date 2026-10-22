@@ -12,7 +12,7 @@ from pathlib import Path
 from aiohttp import web
 
 from .core import ClaudeError, build_schema
-from .household import HouseholdError
+from .household import ACI_RE, HouseholdError
 
 INDEX = Path(__file__).with_name('static') / 'index.html'
 
@@ -40,6 +40,17 @@ def make_app(bot) -> web.Application:
         app.router.add_post(f'/api/{name}', getattr(ui, name.replace('/', '_')))
     return app
 
+
+
+def group_members(group: dict) -> list[tuple[str, bool]]:
+    """(ACI, invited) of a signal-cli listGroups entry's members and invitees."""
+    out = []
+    for key, invited in (('members', False), ('pendingMembers', True)):
+        for m in group.get(key) or []:
+            aci = str(m.get('uuid') or '').lower() if isinstance(m, dict) else ''
+            if re.fullmatch(ACI_RE, aci):
+                out.append((aci, invited))
+    return out
 
 class SignalErrorOut(RuntimeError):
     pass
@@ -97,23 +108,42 @@ class SetupApi:
                 known_groups = [g for g in listed if isinstance(g, dict)] if isinstance(listed, list) else []
             except SignalErrorOut:
                 pass
+        # Members (and invitees) of the bot's groups who aren't users yet can be
+        # added without writing to the bot first.
+        in_groups: dict[str, str] = {}
+        for g in known_groups:
+            if not g.get('isMember'):
+                continue
+            for aci, _ in group_members(g):
+                if aci != house.bot_aci and aci not in house.roles:
+                    in_groups.setdefault(aci, g.get('name') or 'a group')
+        names = {aci: name for aci, (name, _) in bot.seen_senders.items() if name}
+        names.update(await self.profile_names([a for a in in_groups if a not in names]))
+
+        def members(g: dict) -> list[dict]:
+            return [{'aci': aci, 'invited': invited, 'profile_name': names.get(aci),
+                     'user': 'the bot' if aci == house.bot_aci else house.roles.get(aci)}
+                    for aci, invited in group_members(g)]
         by_id = {g.get('id'): g for g in known_groups}
         groups = [{'name': name, 'id': gid, 'title': (by_id.get(gid) or {}).get('name'),
+                   'members': members(by_id.get(gid) or {}),
                    'problem': await bot.group_problem(gid) if house.signal_account else 'not registered'}
                   for name, gid in house.groups.items()]
-        candidates = [{'id': g.get('id'), 'title': g.get('name'),
-                       'members': [m.get('uuid') for m in g.get('members') or [] if isinstance(m, dict)]}
+        candidates = [{'id': g.get('id'), 'title': g.get('name'), 'members': members(g)}
                       for g in known_groups if g.get('id') not in bot.group_ids and g.get('isMember')]
         for gid in bot.seen_groups:
             if gid not in bot.group_ids and gid not in {c['id'] for c in candidates}:
                 candidates.append({'id': gid, 'title': None, 'members': []})
+        seen = [{'aci': aci, 'profile_name': name, 'seen': ts, 'group': in_groups.get(aci)}
+                for aci, (name, ts) in reversed(bot.seen_senders.items()) if aci not in house.roles]
+        seen += [{'aci': aci, 'profile_name': names.get(aci), 'seen': None, 'group': title}
+                 for aci, title in in_groups.items() if aci not in bot.seen_senders]
         return web.json_response({
             'account': {'number': house.signal_account, 'pending': house.pending_account,
                         'bot_aci': house.bot_aci, 'bot_name': house.bot_name},
             'users': users,
             'groups': groups,
-            'seen_senders': [{'aci': aci, 'profile_name': name, 'seen': ts}
-                             for aci, (name, ts) in reversed(bot.seen_senders.items()) if aci not in house.roles],
+            'seen_senders': seen,
             'group_candidates': candidates,
             'actions': house.actions,
             'allow_writes': house.allow_writes,
@@ -125,6 +155,25 @@ class SetupApi:
             'ha': {'kind': bot.cfg.mcp_kind, 'write_token': bool(bot.cfg.ha_token)},
             'claude_configured': bot.cfg.claude_configured,
         })
+
+    async def profile_names(self, acis: list[str]) -> dict[str, str]:
+        """Signal profile names (best effort) of people the bot hasn't heard from."""
+        if not acis:
+            return {}
+        try:
+            contacts = await self.rpc('listContacts', {'recipient': acis, 'allRecipients': True})
+        except SignalErrorOut:
+            return {}
+        names = {}
+        for c in contacts if isinstance(contacts, list) else []:
+            if not isinstance(c, dict):
+                continue
+            profile = c.get('profile') if isinstance(c.get('profile'), dict) else {}
+            name = ' '.join(str(p) for p in (profile.get('givenName'), profile.get('familyName')) if p) \
+                or c.get('name')
+            if name and isinstance(c.get('uuid'), str):
+                names[c['uuid'].lower()] = str(name)[:64]
+        return names
 
     # ---------------------------------------------------------------- Signal account
 

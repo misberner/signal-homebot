@@ -214,15 +214,21 @@ function renderUsers() {
   const s = document.getElementById('seen');
   s.replaceChildren(el('tr', {}, el('th', {}, 'Signal profile'), el('th', {}, 'ID'), el('th', {}, 'Add as')));
   if (!state.seen_senders.length) s.append(el('tr', {}, el('td', {colspan: 3, class: 'muted'},
-    state.account.number ? 'Nobody new. Send the bot a message and refresh.' : 'Register the bot first.')));
+    state.account.number ? 'Nobody new. Send the bot a message, or add the bot to a group with them, and refresh.' : 'Register the bot first.')));
   for (const p of state.seen_senders) {
     const name = el('input', {type: 'text', placeholder: 'name, e.g. malte',
       value: (p.profile_name || '').toLowerCase().replace(/[^a-z0-9_]/g, '').replace(/^[^a-z]+/, '')});
-    s.append(el('tr', {}, el('td', {}, p.profile_name || el('span', {class: 'muted'}, 'unknown')),
+    s.append(el('tr', {}, el('td', {}, p.profile_name || el('span', {class: 'muted'}, 'unknown'),
+        p.group ? el('div', {class: 'muted'}, 'in group "' + p.group + '"') : ''),
       el('td', {}, el('code', {}, p.aci)),
       el('td', {}, el('div', {class: 'row'}, name,
         el('button', {class: 'small primary', onclick: () => act('users/add', {name: name.value, aci: p.aci})}, 'Add')))));
   }
+}
+
+function memberLine(m) {
+  const who = m.user || el('span', {class: 'warn'}, (m.profile_name || m.aci) + ' (not a user)');
+  return el('div', {}, who, m.invited ? el('span', {class: 'muted'}, ' (invited)') : '');
 }
 
 function renderGroups() {
@@ -230,7 +236,8 @@ function renderGroups() {
   t.replaceChildren(el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Status'), el('th')));
   if (!state.groups.length) t.append(el('tr', {}, el('td', {colspan: 3, class: 'muted'}, 'No groups: the bot works by private chat only.')));
   for (const g of state.groups) {
-    t.append(el('tr', {}, el('td', {}, el('strong', {}, g.name), ' ', g.title ? el('span', {class: 'muted'}, '(' + g.title + ')') : ''),
+    t.append(el('tr', {}, el('td', {}, el('strong', {}, g.name), ' ', g.title ? el('span', {class: 'muted'}, '(' + g.title + ')') : '',
+        g.members.map(memberLine)),
       el('td', {}, g.problem ? el('span', {class: 'badge bad'}, g.problem) : el('span', {class: 'badge ok'}, 'ok')),
       el('td', {}, el('button', {class: 'small', onclick: () => act('groups/remove', {name: g.name})}, 'Remove'))));
   }
@@ -238,12 +245,10 @@ function renderGroups() {
   c.replaceChildren(el('tr', {}, el('th', {}, 'Group'), el('th', {}, 'Members'), el('th', {}, 'Add as')));
   if (!state.group_candidates.length) c.append(el('tr', {}, el('td', {colspan: 3, class: 'muted'},
     'None. Add the bot\'s number to a Signal group and send a message there.')));
-  const known = Object.fromEntries(state.users.map(u => [u.aci, u.name]));
-  if (state.account.bot_aci) known[state.account.bot_aci] = 'the bot';
   for (const g of state.group_candidates) {
     const name = el('input', {type: 'text', placeholder: 'name, e.g. home'});
     c.append(el('tr', {}, el('td', {}, g.title || el('code', {}, g.id)),
-      el('td', {}, g.members.length ? g.members.map(m => el('div', {}, known[m] || el('code', {class: 'warn'}, m + ' (not a user)'))) : el('span', {class: 'muted'}, '—')),
+      el('td', {}, g.members.length ? g.members.map(memberLine) : el('span', {class: 'muted'}, '—')),
       el('td', {}, el('div', {class: 'row'}, name,
         el('button', {class: 'small primary', onclick: () => act('groups/add', {name: name.value, id: g.id})}, 'Add')))));
   }

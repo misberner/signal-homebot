@@ -73,6 +73,7 @@ class FakeSignalDaemon:
         self.rpc_methods: list[str] = []
         self.indicators: list[tuple[str, dict]] = []
         self.reject_edits = False
+        self.profile_names: dict[str, str] = {}
         self.edits: list[tuple[int, str]] = []
         self.runner: web.AppRunner | None = None
         self.url = ''
@@ -129,6 +130,9 @@ class FakeSignalDaemon:
         if method in ('sendTyping', 'sendReceipt'):
             self.indicators.append((method, params))
             return ok({})
+        if method == 'listContacts':  # ListContactsCommand JsonContact(number, uuid, name, profile, ...)
+            return ok([{'number': None, 'uuid': u, 'name': '', 'profile': {'givenName': n, 'familyName': None}}
+                       for u, n in self.profile_names.items() if u in (params.get('recipient') or [])])
         if method == 'listAccounts':  # ListAccountsCommand JsonAccount(number, aci)
             return ok(self.accounts)
         if method == 'register':  # RegistrationParams(voice, captcha, ...)
