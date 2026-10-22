@@ -21,6 +21,9 @@ APPROVAL_TTL = 120
 SCHEDULE_MAX_AHEAD = 7 * 86400   # actions/reminders may be scheduled up to a week ahead
 SCHEDULE_GRACE = 600             # a job more than 10 min overdue (bot was down) is skipped, not run late
 REMIND = 'homebot.remind'        # internal "service" for reminders: a message, never an HA call
+TASK = 'homebot.task'            # internal "service": run Claude with a stored instruction, then post its answer
+REPEATS = ('once', 'daily', 'weekdays', 'weekly')
+MAX_TASKS = 20                   # pending tasks per user
 OUTBOX_MAX_AGE = 3600
 OUTBOX_MAX_ATTEMPTS = 8
 OBJECT_REPLACEMENT = '￼'  # Signal puts this where an @mention was
@@ -370,6 +373,9 @@ def validate_action(action: object, rules: list[dict]) -> tuple[str, dict]:
 def describe(service: str, data: dict) -> str:
     if service == REMIND:
         return f'reminder "{data.get("text", "")}"'
+    if service == TASK:
+        repeat = data.get('repeat', 'once')
+        return f'task "{data.get("prompt", "")}"' + (f' ({repeat})' if repeat != 'once' else '')
     extra = ', '.join(f'{k}={v}' for k, v in data.items() if k != 'entity_id')
     return f'{service} on {data["entity_id"]}' + (f' ({extra})' if extra else '')
 
@@ -393,6 +399,21 @@ def parse_when(value: object, now: float) -> int | None:
     if when > now + SCHEDULE_MAX_AHEAD:
         raise Denied('can schedule at most 7 days ahead')
     return when
+
+
+def next_run(run_at: int, repeat: str, now: float) -> int | None:
+    """The next occurrence of a repeating task after ``now``, at the same local
+    wall-clock time (so it follows DST changes), or None for 'once'."""
+    if repeat not in REPEATS[1:]:
+        return None
+    t = time.localtime(run_at)
+    for day in range(1, 400):
+        when = int(time.mktime((t.tm_year, t.tm_mon, t.tm_mday + day, t.tm_hour, t.tm_min, t.tm_sec, 0, 0, -1)))
+        weekday = time.localtime(when).tm_wday
+        if when > now and (repeat == 'daily' or (repeat == 'weekdays' and weekday < 5)
+                           or (repeat == 'weekly' and day % 7 == 0)):
+            return when
+    return None
 
 
 def local_time(epoch: float) -> str:
@@ -432,10 +453,14 @@ def build_schema(rules: list[dict]) -> dict:
     actions = {'type': 'array', 'items': item, 'maxItems': 3 if rules else 0}
     reminder = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'text': {'type': 'string'}},
                 'required': ['at', 'text'], 'additionalProperties': False}
+    task = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'prompt': {'type': 'string'},
+                                             'repeat': {'type': 'string', 'enum': list(REPEATS)}},
+            'required': ['at', 'prompt', 'repeat'], 'additionalProperties': False}
     return {
         'type': 'object',
         'properties': {'reply': {'type': 'string'}, 'actions': actions,
                        'reminders': {'type': 'array', 'items': reminder, 'maxItems': 3},
+                       'tasks': {'type': 'array', 'items': task, 'maxItems': 3},
                        'cancel': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 5}},
         'required': ['reply', 'actions'],
         'additionalProperties': False,
@@ -519,14 +544,14 @@ def parse_claude_output(stdout: bytes, returncode: int = 0) -> dict:
         raise ClaudeError('invalid', f'subtype {envelope.get("subtype")}')
     obj = envelope.get('structured_output')
     if (not isinstance(obj, dict) or not {'reply', 'actions'} <= set(obj)
-            or set(obj) - {'reply', 'actions', 'reminders', 'cancel'}):
+            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel'}):
         raise ClaudeError('invalid', 'missing structured output')
-    obj = {'reminders': [], 'cancel': [], **obj}
+    obj = {'reminders': [], 'tasks': [], 'cancel': [], **obj}
     if (not isinstance(obj['reply'], str) or not isinstance(obj['actions'], list)
-            or not isinstance(obj['reminders'], list) or not isinstance(obj['cancel'], list)):
+            or not all(isinstance(obj[k], list) for k in ('reminders', 'tasks', 'cancel'))):
         raise ClaudeError('invalid', 'output does not match the schema')
-    if not all(isinstance(a, dict) for a in obj['actions'] + obj['reminders']):
-        raise ClaudeError('invalid', 'actions and reminders must be JSON objects')
+    if not all(isinstance(a, dict) for a in obj['actions'] + obj['reminders'] + obj['tasks']):
+        raise ClaudeError('invalid', 'actions, reminders and tasks must be JSON objects')
     if not all(isinstance(n, int) and not isinstance(n, bool) for n in obj['cancel']):
         raise ClaudeError('invalid', 'cancel must list numbers')
     return obj
@@ -776,6 +801,25 @@ class Store:
                 self._enqueue(outgoing, now)
             return ok
 
+    def repeat_task(self, action_id: int, now: int) -> int | None:
+        """Schedule the next occurrence of a repeating task; returns its id."""
+        with self._tx():
+            return self._repeat_task(action_id, now)
+
+    def _repeat_task(self, action_id: int, now: int) -> int | None:
+        row = self.db.execute('SELECT sender,request_conv,service,data_json,run_at FROM actions WHERE id=?',
+                              (action_id,)).fetchone()
+        if not row or row[2] != TASK:
+            return None
+        sender, conv, service, data_json, run_at = row
+        when = next_run(run_at, json.loads(data_json).get('repeat', 'once'), now)
+        if when is None:
+            return None
+        cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
+                              "status,created_at,run_at) VALUES(?,?,?,?,?,'scheduled',?,?)",
+                              (f'job-{now}-{os.urandom(6).hex()}', sender, conv, service, data_json, now, when))
+        return cur.lastrowid
+
     def cancel_scheduled(self, action_id: int, sender: str, now: int) -> bool:
         with self._tx():
             return self.db.execute("UPDATE actions SET status='cancelled', detail='cancelled by user', "
@@ -810,6 +854,13 @@ class Store:
             actions = self.db.execute("SELECT id,sender,service,data_json FROM actions "
                                       "WHERE status='executing'").fetchall()
             for action_id, sender, service, data_json in actions:
+                if service in (TASK, REMIND):  # no device involved: report, and keep a series going
+                    self.db.execute("UPDATE actions SET status='failed', detail='interrupted by restart', "
+                                    'finished_at=? WHERE id=?', (now, action_id))
+                    self._enqueue([(f'dm:{sender}', f'#{action_id} ({describe(service, json.loads(data_json))}) '
+                                                    'was interrupted by a restart.')], now)
+                    self._repeat_task(action_id, now)
+                    continue
                 self.db.execute("UPDATE actions SET status='unknown', detail='interrupted by restart', "
                                 'finished_at=? WHERE id=?', (now, action_id))
                 self._enqueue([(f'dm:{sender}',

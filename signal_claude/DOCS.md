@@ -131,7 +131,14 @@ for up to 7 days ahead. When it's due, the bot checks the action rules
 again, runs it once and tells you the result. If the bot was offline and the
 time passed by more than 10 minutes, it doesn't run late; it reports
 "missed". Reminders ("remind us at 8 to …") need no confirmation and arrive
-in the chat they were asked in. `/scheduled` lists your pending items and
+in the chat they were asked in. **Tasks** ("tell me every weekday at 7 whether
+it will rain", "at 22:00 check which windows are open") run Claude when
+they are due: once, daily, on weekdays or weekly. Claude is told that a
+scheduled task is firing (not a new message), with who set it up, when, and
+the original request. Its answer is posted as "⏰ #12: …" in the chat, or
+nothing if the task's condition doesn't hold. Actions it proposes still need
+your yes; a running task can't create further tasks. Up to 20 per person;
+cancelling a repeating task stops the series. `/scheduled` lists your pending items and
 `/cancel 12` cancels one (or just ask). Scheduling is done by the bot,
 durably, not by Claude: Claude Code's own scheduling only lives as long as
 one Claude process, and the bot starts a fresh one per message.

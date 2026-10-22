@@ -811,6 +811,49 @@ class ScheduleTests(Integration):
         self.assertEqual(self.group()[-1], '⏰ Reminder: Wäsche aufhängen')
         self.assertEqual(self.ha.calls, [])
 
+    def answer(self, **output):
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {'reply': '', 'actions': [], **output}}))
+
+    async def test_task_runs_claude_when_due_and_repeats(self):
+        self.answer(reply='Mache ich.', tasks=[{'at': self.at(900), 'prompt': 'Check whether it will rain today; '
+                                                'report only if it will.', 'repeat': 'daily'}])
+        await self.deliver(sender=USER1, text='sag mir jeden morgen ob es regnet')
+        self.assertRegex(self.dm(USER1)[-1], r'Task #\d+ set for .*, then daily')
+        job = int(self.dm(USER1)[-1].split('#')[1].split(' ')[0])
+        due = self.at(900)[-5:]
+        self.answer(reply='Heute regnet es ab 14 Uhr.')
+        await self.advance(960)
+        prompt = self.claude.calls[-1]['prompt']
+        self.assertIn(f'SCHEDULED TASK #{job} IS DUE NOW. This is not a new message', prompt)
+        self.assertIn('sag mir jeden morgen ob es regnet', prompt)   # the original request
+        self.assertIn('report only if it will', prompt)
+        self.assertNotIn('CURRENT REQUEST', prompt)
+        self.assertEqual(self.dm(USER1)[-1], f'⏰ #{job}: Heute regnet es ab 14 Uhr.')
+        # The series continues; the next run is a new job at the same time tomorrow.
+        [(nxt, _, _, service, data, run_at)] = self.bot.store.scheduled(USER1)
+        self.assertEqual((service, data['repeat']), ('homebot.task', 'daily'))
+        self.assertEqual(time.strftime('%H:%M', time.localtime(run_at)), due)
+        # Nothing to report: nothing is posted. Cancelling stops the series.
+        self.answer(reply='')
+        count = len(self.dm(USER1))
+        self.now = run_at - 30
+        await self.advance(60)
+        self.assertEqual(len(self.claude.calls), 3)
+        self.assertEqual(len(self.dm(USER1)), count)
+        [(third, *_)] = self.bot.store.scheduled(USER1)
+        self.assertTrue(self.bot.store.cancel_scheduled(third, USER1, self.bot.now()))
+        await self.advance(86400)
+        self.assertEqual(len(self.claude.calls), 3)
+
+    async def test_task_cannot_create_tasks(self):
+        self.answer(reply='ok', tasks=[{'at': self.at(900), 'prompt': 'say hi', 'repeat': 'once'}])
+        await self.deliver(sender=USER1, group=GROUP, text='/ha say hi in 15 minutes')
+        self.answer(reply='hi', tasks=[{'at': self.at(1900), 'prompt': 'again', 'repeat': 'once'}])
+        await self.advance(960)
+        self.assertIn('hi', self.group()[-1])
+        self.assertIn('cannot set up further tasks', self.group()[-1])
+        self.assertEqual(self.bot.store.scheduled(USER1), [])
+
     async def test_invalid_times_rejected(self):
         for when in (self.at(-600), self.at(8 * 86400), 'tomorrow', '2026-13-40T99:99'):
             self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {

@@ -443,3 +443,19 @@ class StoreTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NextRunTests(unittest.TestCase):
+    def test_repeats_keep_local_time(self):
+        import time
+        from bot.core import next_run
+        friday_7 = time.mktime((2026, 10, 23, 7, 0, 0, 0, 0, -1))
+        fmt = lambda t: time.strftime('%a %H:%M', time.localtime(t))
+        self.assertEqual(fmt(next_run(friday_7, 'daily', friday_7)), 'Sat 07:00')
+        self.assertEqual(fmt(next_run(friday_7, 'weekdays', friday_7)), 'Mon 07:00')
+        self.assertEqual(next_run(friday_7, 'weekly', friday_7) - friday_7 in (7 * 86400, 7 * 86400 + 3600), True)
+        self.assertIsNone(next_run(friday_7, 'once', friday_7))
+        # Missed runs are skipped, not caught up (Monday 08:00, after the DST change on Sunday).
+        monday_8 = time.mktime((2026, 10, 26, 8, 0, 0, 0, 0, -1))
+        self.assertEqual(fmt(next_run(friday_7, 'daily', monday_8)), 'Tue 07:00')
+

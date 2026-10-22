@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.0 — 2026-10-22
+
+### Added
+- **Scheduled tasks that run Claude.** Claude can schedule `tasks`
+  (`at`, `prompt`, `repeat`: once/daily/weekdays/weekly). When one is due,
+  Claude runs with a prompt that says a scheduled task is firing (not a new
+  message), who set it up and when, the original request and the task's
+  instruction; its answer is posted in the chat ("⏰ #12: …"), or nothing if
+  it replies empty. Proposed actions still need confirmation; a running task
+  can't create tasks or reminders. Repeats keep the local time across DST;
+  missed or interrupted runs are reported and the series continues.
+
 ## 0.8.5 — 2026-10-22
 
 ### Added

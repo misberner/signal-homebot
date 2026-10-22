@@ -27,7 +27,7 @@ from aiohttp import ClientSession, ClientTimeout, web
 from .core import (Store, Incoming, Reaction, RemoteDelete, Denied, ClaudeError, addressed, freshness,
                    parse_signal_event, permitted, validate_action, describe, describe_rule, build_schema,
                    parse_claude_output, identity_trusted, group_roster_problem, parse_when, local_time,
-                   APPROVAL_TTL, REMIND, SCHEDULE_GRACE)
+                   APPROVAL_TTL, REMIND, TASK, REPEATS, MAX_TASKS, SCHEDULE_GRACE)
 from .household import Household, HouseholdStore
 from .ha_tools import HaTools
 
@@ -443,7 +443,7 @@ and reports the result itself. If the request is informational, return actions=[
 question. Reply in the user's language, briefly, in plain text. Return the JSON result: reply (string)
 and actions (list).{notes}"""
 
-    def build_prompt(self, request: Incoming, history: str, rules: list[dict]) -> str:
+    def build_prompt(self, request: Incoming, history: str, rules: list[dict], task: dict | None = None) -> str:
         """Stable parts first (permissions, then history oldest-first), the new
         request last, so consecutive messages share a cached prefix."""
         if rules:
@@ -457,8 +457,15 @@ and actions (list).{notes}"""
                             'it up), say so concretely, and that an admin can allow it in the HomeBot setup page.')
         capabilities += ('\nTo do something later, give the action "at": "YYYY-MM-DDTHH:MM" (local time, '
                          'within 7 days); the user confirms now and it runs then. For reminders use '
-                         '"reminders": [{"at": "...", "text": "..."}] (no confirmation needed). To cancel '
-                         'one of the user\'s scheduled items, list its number in "cancel".')
+                         '"reminders": [{"at": "...", "text": "..."}]: a fixed text posted then, no '
+                         'confirmation needed. When something must be looked up or decided at that time '
+                         '(e.g. "tell me at 7 whether it will rain", "every weekday at 22:00 tell me which '
+                         'windows are open"), use "tasks": [{"at": "...", "prompt": "...", "repeat": '
+                         '"once|daily|weekdays|weekly"}]: at that time you are run again with the prompt and '
+                         'your answer is posted in this chat. Write the prompt as a self-contained instruction '
+                         'to your future self (what to check, what to report, and when to stay silent). To '
+                         'cancel one of the user\'s scheduled items (a repeating task: its next run), list '
+                         'its number in "cancel".')
         jobs = self.store.scheduled(request.sender)
         capabilities += '\nScheduled for this user: ' + (
             '; '.join(f'#{i} {describe(svc, data)} at {local_time(run_at)}' for i, _, _, svc, data, run_at in jobs)
@@ -475,9 +482,29 @@ EARLIER CONVERSATION ({where}):
 {defuse(history) or '(none)'}
 <<END-UNTRUSTED>>
 
-CURRENT REQUEST from {user}:
+{self.request_section(request, user, task)}"""
+
+    def request_section(self, request: Incoming, user: str, task: dict | None) -> str:
+        if task is None:
+            return f"""CURRENT REQUEST from {user}:
 <<UNTRUSTED>>
 {defuse(request.text)}
+<<END-UNTRUSTED>>
+"""
+        repeat = {'once': 'once', 'daily': 'every day', 'weekdays': 'every weekday',
+                  'weekly': 'every week'}.get(task.get('repeat', 'once'), 'once')
+        return f"""SCHEDULED TASK #{task['id']} IS DUE NOW. This is not a new message: {user} set up this task
+on {task.get('set_on', 'an earlier day')} (runs {repeat}); the bot is running it now. Do what the task's
+prompt says and write the message to post in this chat, addressed to {user}. If the prompt says to report
+only under a condition that does not hold now, reply with an empty string and nothing is posted.
+Do not create new tasks or reminders here.
+{user}'s original request that created the task:
+<<UNTRUSTED>>
+{defuse(task.get('request', ''))}
+<<END-UNTRUSTED>>
+Task prompt:
+<<UNTRUSTED>>
+{defuse(task.get('prompt', ''))}
 <<END-UNTRUSTED>>
 """
 
@@ -659,8 +686,9 @@ CURRENT REQUEST from {user}:
             await self.decide(msg.conv, msg.sender, code, meaning)
         return True
 
-    async def plan(self, msg: Incoming, on_progress=None) -> list[tuple[str, str]]:
-        """Ask Claude (with read-only HA tools) and turn proposals into approvals."""
+    async def plan(self, msg: Incoming, on_progress=None, task: dict | None = None) -> list[tuple[str, str]]:
+        """Ask Claude (with read-only HA tools) and turn proposals into approvals.
+        ``task`` is set when a scheduled task is running (no new tasks then)."""
         context = 'group' if msg.group else 'dm'
         rules = permitted(self.house.policy, self.house.allow_writes, self.roles.get(msg.sender), context)
         labels = {**self.roles, self.house.bot_aci: f'{self.house.bot_name} (you)'}
@@ -672,7 +700,7 @@ CURRENT REQUEST from {user}:
             return [(msg.conv, 'I could not read Home Assistant right now.')]
         token = self.tools.issue_token(self.cfg.claude_timeout + 30)
         try:
-            result = await self.ask_broker(self.build_prompt(msg, history, rules), build_schema(rules),
+            result = await self.ask_broker(self.build_prompt(msg, history, rules, task), build_schema(rules),
                                            token, self.tools.tool_names, self.system_prompt(), on_progress)
         except ClaudeError as err:
             LOG.warning('Claude failed: %s', err)
@@ -699,6 +727,28 @@ CURRENT REQUEST from {user}:
                 f'Reply "yes" or react 👍 within {APPROVAL_TTL // 60} minutes; "no" or 👎 cancels.', run_at)
             notes.append(f'Proposed: {what}. Confirm it in your private chat with me.'
                          if msg.group else f'Proposed: {what}. Waiting for your yes.')
+        if task is not None and (result['tasks'] or result['reminders']):
+            result = {**result, 'tasks': [], 'reminders': []}
+            notes.append('(A scheduled task cannot set up further tasks or reminders.)')
+        for item in result['tasks'][:3]:
+            prompt, repeat = item.get('prompt'), item.get('repeat', 'once')
+            try:
+                run_at = parse_when(item.get('at'), self.clock())
+                if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1000 or run_at is None:
+                    raise Denied('a task needs a time and a prompt of at most 1000 characters')
+                if repeat not in REPEATS:
+                    raise Denied('repeat must be once, daily, weekdays or weekly')
+                if sum(1 for j in self.store.scheduled(msg.sender) if j[3] == TASK) >= MAX_TASKS:
+                    raise Denied(f'you already have {MAX_TASKS} scheduled tasks')
+            except Denied as err:
+                notes.append(f'No task: {err}.')
+                continue
+            data = {'prompt': prompt.strip(), 'repeat': repeat, 'request': msg.text[:500],
+                    'set_on': local_time(self.clock())}
+            job = self.store.add_scheduled(msg.sender, msg.conv, TASK, data, run_at, self.now())
+            every = {'once': '', 'daily': ', then daily', 'weekdays': ', then on weekdays',
+                     'weekly': ', then weekly'}[repeat]
+            notes.append(f'Task #{job} set for {local_time(run_at)}{every}. /cancel {job} stops it.')
         for reminder in result['reminders'][:3]:
             text = reminder.get('text')
             try:
@@ -716,6 +766,8 @@ CURRENT REQUEST from {user}:
         answer = result['reply'].strip()
         if notes:
             answer = (answer + '\n\n' if answer else '') + '\n'.join(notes)
+        if task is not None:  # an empty answer means: nothing to report this time
+            return [(msg.conv, f'⏰ #{task["id"]}: {answer}')] if answer else []
         return [(msg.conv, answer or 'OK.')]
 
     async def decide(self, conv: str, sender: str, code: str, approve: bool) -> None:
@@ -833,16 +885,20 @@ CURRENT REQUEST from {user}:
                     self.store.end_scheduled(action_id, 'cancelled', 'user removed', [], self.now())
                     continue
                 if self.now() - run_at > SCHEDULE_GRACE:
-                    self.store.end_scheduled(action_id, 'missed', 'bot was offline', [(dm, (
-                        f'Missed #{action_id}: {describe(service, data)} was due at {local_time(run_at)} '
-                        'while I was offline. It was not done.'))], self.now())
+                    if self.store.end_scheduled(action_id, 'missed', 'bot was offline', [(dm, (
+                            f'Missed #{action_id}: {describe(service, data)} was due at {local_time(run_at)} '
+                            'while I was offline. It was not done.'))], self.now()):
+                        self.store.repeat_task(action_id, self.now())
                     self.outbox_wake.set()
                     continue
                 if not self.store.start_scheduled(action_id):
                     continue
+                dest = request_conv if request_conv.startswith('dm:') or \
+                    request_conv.removeprefix('group:') in self.group_ids else dm
+                if service == TASK:
+                    await self.run_task(action_id, sender, dest, data)
+                    continue
                 if service == REMIND:
-                    dest = request_conv if request_conv.startswith('dm:') or \
-                        request_conv.removeprefix('group:') in self.group_ids else dm
                     self.store.finish_action(action_id, 'succeeded', 'sent',
                                              [(dest, f'⏰ Reminder: {data["text"]}')], self.now())
                     self.outbox_wake.set()
@@ -859,6 +915,22 @@ CURRENT REQUEST from {user}:
                     continue
                 await self.execute(action_id, sender, dm, request_conv, service, data, f'Scheduled #{action_id}: ')
             await asyncio.sleep(interval)
+
+    async def run_task(self, action_id: int, sender: str, dest: str, data: dict) -> None:
+        """Run a due scheduled task: Claude gets the task's prompt, clearly marked as
+        a schedule firing (not a new message), and its answer is posted in the chat.
+        Proposed actions still need the user's confirmation."""
+        msg = Incoming(sender=sender, conv=dest, group=dest.startswith('group:'),
+                       timestamp=int(self.clock() * 1000), text=f'(scheduled task #{action_id})')
+        async with self.lock:
+            try:
+                outgoing = await self.plan(msg, task={**data, 'id': action_id})
+            except Exception as err:  # never lose the series over one failed run
+                LOG.warning('Task %s failed: %s', action_id, type(err).__name__)
+                outgoing = [(dest, f'⏰ #{action_id} failed this time.')]
+            self.store.finish_action(action_id, 'succeeded', 'ran', outgoing, self.now())
+            self.store.repeat_task(action_id, self.now())
+        self.outbox_wake.set()
 
     async def maintenance_loop(self) -> None:
         while True:
