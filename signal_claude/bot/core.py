@@ -273,16 +273,18 @@ VERDICTS = ('allow', 'ask', 'deny')
 
 
 def load_deny(patterns: object) -> list[str]:
-    """Validate the admin's denylist: glob patterns like ``lock.*``,
-    ``cover.garage*`` or ``*.turn_off``, matched against entity and service."""
+    """Validate an admin pattern list (denylist or allowlist): globs like
+    ``light.*``, ``cover.garage*`` or ``*.turn_off``, matched against entity and service."""
     if (not isinstance(patterns, list) or len(patterns) > MAX_DENY
             or not all(isinstance(p, str) and re.fullmatch(DENY_RE, p) for p in patterns)):
-        raise ValueError('denylist entries look like lock.*, cover.garage* or *.turn_off')
+        raise ValueError('entries look like light.*, cover.garage* or *.turn_off')
     return list(patterns)
 
 
-def denied_by(deny: list[str], service: str, entity_id: str) -> str | None:
-    return next((p for p in deny if fnmatch.fnmatchcase(entity_id, p) or fnmatch.fnmatchcase(service, p)), None)
+def denied_by(patterns: list[str], service: str, entity_id: str) -> str | None:
+    """The first pattern matching the entity or the service, if any."""
+    return next((p for p in patterns if fnmatch.fnmatchcase(entity_id, p) or fnmatch.fnmatchcase(service, p)),
+                None)
 
 
 def _scalar(value: object, max_len: int) -> bool:
@@ -291,12 +293,13 @@ def _scalar(value: object, max_len: int) -> bool:
     return isinstance(value, (bool, int, float)) and value == value  # no NaN
 
 
-def validate_action(action: object, deny: list[str]) -> tuple[str, dict]:
+def validate_action(action: object, deny: list[str], allow: list[str] | None = None) -> tuple[str, dict]:
     """Fixed, deterministic limits on a proposed action (before any review).
 
     One existing-looking entity, a service of that entity's domain, a domain
-    from WRITABLE_DOMAINS, nothing on the admin's denylist, and flat service
-    data (no extra targets). Returns (service, service_data incl. entity_id).
+    from WRITABLE_DOMAINS, nothing on the admin's denylist, on the allowlist
+    if one is active (``allow`` not None), and flat service data (no extra
+    targets). Returns (service, service_data incl. entity_id).
     """
     if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at'}:
         raise Denied('unexpected action fields')
@@ -312,6 +315,8 @@ def validate_action(action: object, deny: list[str]) -> tuple[str, dict]:
         raise Denied(f'{domain} devices can never be controlled by the bot')
     if pattern := denied_by(deny, service, entity_id):
         raise Denied(f'blocked by the denylist ({pattern})')
+    if allow is not None and not denied_by(allow, service, entity_id):
+        raise Denied(f'{entity_id} / {service} is not on the allowlist')
     if len(data) > 12:
         raise Denied('too many fields')
     for key, value in data.items():

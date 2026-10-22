@@ -34,12 +34,19 @@ class Household:
     allow_writes: bool = False          # master switch for changes
     auto_approve: bool = False          # the reviewer's "allow" runs without asking
     deny: list = field(default_factory=list)  # glob patterns on entity/service, see core.load_deny
+    allowlist_on: bool = False          # if on, only entities/services matching ``allow`` can be changed
+    allow: list = field(default_factory=list)
     rules: str = ''                     # admin-written rules for Claude and the reviewer (trusted)
     require_verified_identity: bool = True
     command_max_age: int = 300
     history_days: int = 7
     notes: str = ''  # admin-written hints for Claude (trusted), e.g. where presence data lives
     model: str = 'opus'  # Claude Code model alias
+
+    @property
+    def active_allow(self) -> list[str] | None:
+        """The allowlist if it is switched on, else None (no allowlist)."""
+        return list(self.allow) if self.allowlist_on else None
 
     @property
     def settings(self) -> Settings:
@@ -78,10 +85,11 @@ class Household:
             raise HouseholdError('Two groups have the same Signal ID')
         if set(self.users) & set(self.groups):
             raise HouseholdError('Users and groups need different names')
-        try:
-            load_deny(self.deny)
-        except ValueError as err:
-            raise HouseholdError(f'Denylist: {err}') from None
+        for label, patterns in (('Denylist', self.deny), ('Allowlist', self.allow)):
+            try:
+                load_deny(patterns)
+            except ValueError as err:
+                raise HouseholdError(f'{label}: {err}') from None
         if len(self.rules) > 4000:
             raise HouseholdError('Rules: at most 4000 characters')
         if self.model not in MODELS:
@@ -106,7 +114,7 @@ class Household:
             raise HouseholdError(str(err)) from None
         types = {'signal_account': str, 'pending_account': str, 'bot_aci': str, 'bot_name': str,
                  'users': dict, 'groups': dict, 'deny': list, 'rules': str, 'allow_writes': bool,
-                 'auto_approve': bool,
+                 'auto_approve': bool, 'allowlist_on': bool, 'allow': list,
                  'require_verified_identity': bool, 'command_max_age': int, 'history_days': int,
                  'notes': str, 'model': str}
         for key, typ in types.items():

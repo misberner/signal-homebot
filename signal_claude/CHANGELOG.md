@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.1 — 2026-10-22
+
+### Added
+- **Allowlist** (setup page, "Only what's on the allowlist"): when on, only
+  entities or services matching one of its patterns can be changed (empty:
+  nothing); everything else is refused before the reviewer. Rules, denylist
+  and reviewer still apply. Re-checked when a confirmed or scheduled change
+  runs.
+
 ## 0.10.0 — 2026-10-22
 
 ### Changed

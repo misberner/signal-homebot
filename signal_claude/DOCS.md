@@ -98,7 +98,7 @@ and `ha_token` to a non-admin user's token.
 
 With **Allow changes** on (setup page) and an `ha_token` set, Claude may
 propose a Home Assistant service call on one entity. Each proposal passes
-three checks:
+these checks:
 
 1. **Fixed limits (in code, not configurable).** Only these domains can ever
    be controlled: light, switch, fan, cover, climate, humidifier,
@@ -107,9 +107,13 @@ three checks:
    shell/REST commands and HA administration can't be. The service must
    belong to the entity's domain, the entity must exist in HA, and the data
    must be flat values (no area/device targets).
-2. **Your denylist** ("Never touch"): patterns like `cover.garage*`,
+2. **Your allowlist**, if "Only what's on the allowlist" is on: only
+   entities or services matching one of its patterns (e.g. `light.*`,
+   `water_heater.my_home_domestic_hot_water_0`, `*.turn_on`) can be changed;
+   with an empty list, nothing. A good way to start.
+3. **Your denylist** ("Never touch"): patterns like `cover.garage*`,
    `script.*` or `*.turn_off`, matched against the entity and the service.
-3. **The reviewer**: a separate Claude call without tools and without the
+4. **The reviewer**: a separate Claude call without tools and without the
    chat history. It sees your **Rules** (plain text, e.g. "Hot water: only
    Manual or Off. Never open the garage door."), who asked, where and when,
    the request, the exact call and the entity's current state, and decides:
@@ -123,7 +127,7 @@ three checks:
      "Done: … (auto-approved: …)"; with Auto mode off it asks like above.
 
 Claude also sees your rules, so it proposes what fits them. The switch, the
-user and the denylist are checked again when a confirmed or scheduled change
+user, the allowlist and the denylist are checked again when a confirmed or scheduled change
 runs. A reviewer call takes about 10-20 s with Opus.
 
 **Later and on a schedule.** Ask for a time ("turn on the hot water at

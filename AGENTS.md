@@ -8,7 +8,7 @@ This repository is an agent connected to **physical home devices**.
   or HTTP requests; it only proposes structured actions.
 - The Python service checks every write deterministically (`validate_action`):
   fixed domain allowlist, service of the entity's domain, entity exists, flat
-  data without extra targets, admin denylist. Then the reviewer (a separate
+  data without extra targets, admin allowlist (if on) and denylist. Then the reviewer (a separate
   Claude call without tools or chat history) decides allow/ask/deny.
 - Keep Signal identifiers authenticated from signal-cli metadata, not text.
 - Store all authorized shared-group messages as context; invoke the model

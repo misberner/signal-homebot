@@ -89,6 +89,12 @@ Hot water (water_heater.my_home_domestic_hot_water_0): only Manual or Off.
 Never open covers between 22:00 and 6:00.
 Anna may control lights and media only."></textarea>
     <p class="hint">Plain language. Claude and the reviewer both read them; only admins can edit them.</p>
+    <label class="checks"><label><input type="checkbox" id="allowlist_on"> Only what's on the allowlist</label></label>
+    <textarea id="allow" style="min-height:70px" placeholder="light.*
+water_heater.my_home_domestic_hot_water_0
+switch.kaffeemaschine"></textarea>
+    <p class="hint">With this on, only entities or services matching a line can be changed (empty list:
+      nothing). The rules, the denylist and the reviewer still apply.</p>
     <label for="deny">Never touch (one pattern per line)</label>
     <textarea id="deny" style="min-height:70px" placeholder="cover.garage*
 script.*
@@ -270,6 +276,8 @@ function renderSettings() {
   document.getElementById('auto_approve').checked = state.auto_approve;
   document.getElementById('rules').value = state.rules || '';
   document.getElementById('deny').value = (state.deny || []).join('\n');
+  document.getElementById('allowlist_on').checked = state.allowlist_on;
+  document.getElementById('allow').value = (state.allow || []).join('\n');
   document.getElementById('require_verified_identity').checked = state.require_verified_identity;
   document.getElementById('bot_name').value = state.account.bot_name;
   document.getElementById('command_max_age').value = state.command_max_age;
@@ -287,6 +295,8 @@ async function saveSettings() {
       auto_approve: document.getElementById('auto_approve').checked,
       rules: document.getElementById('rules').value,
       deny: document.getElementById('deny').value.split('\n').map(s => s.trim()).filter(Boolean),
+      allowlist_on: document.getElementById('allowlist_on').checked,
+      allow: document.getElementById('allow').value.split('\n').map(s => s.trim()).filter(Boolean),
       require_verified_identity: document.getElementById('require_verified_identity').checked,
       bot_name: document.getElementById('bot_name').value.trim(),
       command_max_age: Number(document.getElementById('command_max_age').value),

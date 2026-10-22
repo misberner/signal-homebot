@@ -528,11 +528,13 @@ and actions (list).{notes}"""
     def build_prompt(self, request: Incoming, history: str, writes: bool, task: dict | None = None) -> str:
         """Stable parts first (permissions, then history oldest-first), the new
         request last, so consecutive messages share a cached prefix."""
+        allow = self.house.active_allow
         if writes:
             deny = ', '.join(self.house.deny) or 'nothing'
+            only = f' Only entities/services matching: {", ".join(allow)}.' if allow else ''
             capabilities = (
                 'You may propose Home Assistant service calls, one entity each, in these domains: '
-                f'{", ".join(sorted(WRITABLE_DOMAINS))}. Never: {deny}. An action is {{"service", '
+                f'{", ".join(sorted(WRITABLE_DOMAINS))}.{only} Never: {deny}. An action is {{"service", '
                 '"entity_id", "data"}}: the service must belong to the entity\'s domain and data holds '
                 'that service\'s fields (e.g. {"brightness_pct": 40}), or {}. Look up the exact entity and '
                 'valid values (e.g. an operation_list) first. A reviewer checks each proposal against the '
@@ -780,7 +782,8 @@ Task prompt:
     async def plan(self, msg: Incoming, on_progress=None, task: dict | None = None) -> list[tuple[str, str]]:
         """Ask Claude (with read-only HA tools) and turn proposals into approvals.
         ``task`` is set when a scheduled task is running (no new tasks then)."""
-        writes = self.house.allow_writes and msg.sender in self.roles
+        # An allowlist that is on but empty allows nothing.
+        writes = self.house.allow_writes and msg.sender in self.roles and self.house.active_allow != []
         labels = {**self.roles, self.house.bot_aci: f'{self.house.bot_name} (you)'}
         history = self.store.context(msg.conv, self.now(), labels, exclude=(msg.sender, msg.timestamp))
         try:
@@ -802,7 +805,7 @@ Task prompt:
             notes.append('Not allowed: changes are switched off.')
         for proposal in result['actions'][:3] if writes else []:
             try:
-                service, data = validate_action(proposal, self.house.deny)
+                service, data = validate_action(proposal, self.house.deny, self.house.active_allow)
                 run_at = parse_when(proposal.get('at'), self.clock())
             except Denied as err:
                 notes.append(f'Not allowed: {err}.')
@@ -916,7 +919,8 @@ Task prompt:
         if sender not in self.roles:
             raise Denied('the user was removed')
         validate_action({'service': service, 'entity_id': data['entity_id'],
-                         'data': {k: v for k, v in data.items() if k != 'entity_id'}}, self.house.deny)
+                         'data': {k: v for k, v in data.items() if k != 'entity_id'}},
+                        self.house.deny, self.house.active_allow)
 
     async def perform(self, action_id: int, service: str, data: dict) -> tuple[str, str, str]:
         """Call HA once for a journaled action: (status, detail, text for the user)."""

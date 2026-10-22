@@ -183,6 +183,19 @@ class PolicyTests(unittest.TestCase):
                 validate_action(cover, deny)
         self.assertEqual(validate_action(cover, ['cover.kitchen*', 'light.*'])[0], 'cover.open_cover')
 
+    def test_allowlist_when_active(self):
+        lamp = {'service': 'light.turn_on', 'entity_id': 'light.kitchen', 'data': {}}
+        heater = {'service': 'water_heater.set_operation_mode', 'entity_id': 'water_heater.dhw', 'data': {}}
+        self.assertEqual(validate_action(lamp, [], None)[0], 'light.turn_on')         # no allowlist
+        for allow in (['light.*'], ['light.kitchen'], ['*.turn_on']):
+            self.assertEqual(validate_action(lamp, [], allow)[0], 'light.turn_on')
+        for allow in ([], ['light.bedroom'], ['switch.*']):
+            with self.assertRaises(Denied, msg=allow):
+                validate_action(lamp, [], allow)
+        with self.assertRaises(Denied):                                                # deny still wins
+            validate_action(lamp, ['light.kitchen'], ['light.*'])
+        self.assertEqual(validate_action(heater, [], ['water_heater.dhw'])[0], 'water_heater.set_operation_mode')
+
     def test_schema_has_no_draft_reference_and_blocks_actions_when_read_only(self):
         read_only = build_schema(False)
         self.assertNotIn('$schema', read_only)
@@ -213,7 +226,7 @@ class HouseholdTests(unittest.TestCase):
         for change in ({'users': {'Malte': USER1}}, {'users': {'a': 'not-an-aci'}}, {'users': {'a': USER1, 'b': USER1}},
                        {'bot_aci': USER1}, {'groups': {'malte': 'Z3JvdXBpZGlk'}}, {'groups': {'a': 'x'}},
                        {'signal_account': '015112345678'}, {'bot_name': 'Home Bot!'},
-                       {'deny': ['lock']}, {'deny': 'lock.*'}, {'rules': 'x' * 4001},
+                       {'deny': ['lock']}, {'deny': 'lock.*'}, {'rules': 'x' * 4001}, {'allow': ['light']},
                        {'command_max_age': 5}, {'history_days': 99}, {'notes': 'x' * 4001}, {'model': 'gpt'}):
             with self.assertRaises(HouseholdError, msg=change):
                 base.change(**change)
@@ -223,7 +236,8 @@ class HouseholdTests(unittest.TestCase):
             store = HouseholdStore(str(Path(d) / 'sub' / 'settings.json'))
             self.assertEqual(store.load(), Household())
             house = Household(signal_account='+4915100000000', users={'malte': USER1}, allow_writes=True,
-                              deny=['cover.garage*'], rules='Lights: anyone.', auto_approve=True)
+                              deny=['cover.garage*'], rules='Lights: anyone.', auto_approve=True,
+                              allowlist_on=True, allow=['light.*'])
             store.save(house)
             self.assertEqual(store.load(), house)
             # Settings from before 0.10 (with an action table) still load; the table is dropped.
