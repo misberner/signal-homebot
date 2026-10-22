@@ -270,6 +270,7 @@ class FakeHomeAssistant:
         app = web.Application()
         app.router.add_post('/api/services/{domain}/{service}', self.service)
         app.router.add_get('/api/image_proxy/{entity_id}', self.image_proxy)
+        app.router.add_get('/api/states/{entity_id}', self.state)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         port = free_port()
@@ -278,6 +279,16 @@ class FakeHomeAssistant:
         FakeHomeAssistant.active = self
         if not FakeHomeAssistant._urls:
             FakeHomeAssistant._urls = {'admin': _start_mcp(False), 'readonly': _start_mcp(True)}
+
+    async def state(self, req: web.Request) -> web.Response:
+        if req.headers.get('Authorization') != f'Bearer {self.token}':
+            return web.Response(status=401)
+        entity_id = req.match_info['entity_id']
+        if entity_id not in self.states:
+            return web.json_response({'message': 'Entity not found.'}, status=404)
+        return web.json_response({'entity_id': entity_id, 'state': self.states[entity_id],
+                                  'attributes': {'friendly_name': entity_id.split('.')[1].replace('_', ' ').title(),
+                                                 **self.attributes.get(entity_id, {})}})
 
     async def image_proxy(self, req: web.Request) -> web.Response:
         # Like HA: the entity's access token authorizes this one image.
@@ -465,8 +476,10 @@ spec = json.load(open({spec!r}))
 prompt = sys.stdin.read()
 argv = sys.argv[1:]
 mcp_config = json.load(open(argv[argv.index('--mcp-config') + 1])) if '--mcp-config' in argv else None
+# The action reviewer is a separate call whose schema asks for a decision.
+reviewer = '--json-schema' in argv and '"decision"' in argv[argv.index('--json-schema') + 1]
 with open({record!r}, 'a') as f:
-    f.write(json.dumps({{'argv': argv, 'env': dict(os.environ), 'prompt': prompt,
+    f.write(json.dumps({{'argv': argv, 'env': dict(os.environ), 'prompt': prompt, 'reviewer': reviewer,
                         'cwd': os.getcwd(), 'mcp_config': mcp_config}}) + '\n')
 tool_text = None
 if spec.get('call_tool') and mcp_config:
@@ -500,7 +513,8 @@ if mode == 'limit':
     sys.exit(1)
 if mode == 'garbage':
     print('not json'); sys.exit(2)
-out = dict(spec.get('output', {{'reply': 'ok', 'actions': []}}))
+out = dict(spec.get('verdict') or {{'decision': 'ask', 'reason': 'Bitte bestätigen.'}}) if reviewer \
+    else dict(spec.get('output', {{'reply': 'ok', 'actions': []}}))
 if tool_text is not None:
     out['reply'] = tool_text
 stream = '--output-format' in argv and argv[argv.index('--output-format') + 1] == 'stream-json'
@@ -534,13 +548,23 @@ class FakeClaude:
         self.set()
 
     def set(self, reply='ok', actions=(), mode='ok', call_tool=None, progress=(), progress_delay=0,
-            tool_result_size=0):
+            tool_result_size=0, verdict=None):
         self.spec.write_text(json.dumps({'mode': mode, 'call_tool': call_tool, 'progress': list(progress),
+                                         'verdict': verdict,
                                          'progress_delay': progress_delay, 'tool_result_size': tool_result_size,
                                          'output': {'reply': reply, 'actions': list(actions)}}))
 
     @property
     def calls(self) -> list[dict]:
+        """The assistant's runs (without the action reviewer's)."""
+        return [c for c in self.all_calls if not c['reviewer']]
+
+    @property
+    def reviews(self) -> list[dict]:
+        return [c for c in self.all_calls if c['reviewer']]
+
+    @property
+    def all_calls(self) -> list[dict]:
         if not self.record.exists():
             return []
         return [json.loads(line) for line in self.record.read_text().splitlines()]

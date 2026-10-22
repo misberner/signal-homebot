@@ -20,7 +20,7 @@ Supervisor, a real Signal account or HA writes. Read-only by default.
 
 Supervisor clones app repositories anonymously over HTTPS, so it can't read a
 private GitHub repo as-is. Either make the repository public (it contains no
-secrets: tokens, accounts and the policy live in the app's options and config
+secrets: tokens, accounts, rules and the denylist live in the app's options and config
 folder), or add it with a read-only fine-grained token in the URL,
 `https://<user>:<token>@github.com/misberner/signal-homebot`. Check on your
 Supervisor that the token URL is accepted, and treat the token as a secret.

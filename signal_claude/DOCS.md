@@ -96,39 +96,40 @@ and `ha_token` to a non-admin user's token.
 
 ## Changes
 
-Changes need **all** of:
+With **Allow changes** on (setup page) and an `ha_token` set, Claude may
+propose a Home Assistant service call on one entity. Each proposal passes
+three checks:
 
-1. **Allow changes** switched on in the setup page, and an `ha_token`.
-2. An **action** that covers it. An action names one service (e.g.
-   `light.turn_on`), the entities it may touch (exact IDs or `light.*`), the
-   extra fields it may pass, with limits, and who may use it where (private
-   chat, groups). Field syntax:
-   - `brightness_pct: 1..100` (a number range)
-   - `color_name: red | warm white` (a list of allowed values)
-   - `oscillating: boolean`
+1. **Fixed limits (in code, not configurable).** Only these domains can ever
+   be controlled: light, switch, fan, cover, climate, humidifier,
+   water_heater, media_player, scene, script, input_*, button, vacuum,
+   select, number. Locks, alarms, cameras, notifications, automations,
+   shell/REST commands and HA administration can't be. The service must
+   belong to the entity's domain, the entity must exist in HA, and the data
+   must be flat values (no area/device targets).
+2. **Your denylist** ("Never touch"): patterns like `cover.garage*`,
+   `script.*` or `*.turn_off`, matched against the entity and the service.
+3. **The reviewer**: a separate Claude call without tools and without the
+   chat history. It sees your **Rules** (plain text, e.g. "Hot water: only
+   Manual or Off. Never open the garage door."), who asked, where and when,
+   the request, the exact call and the entity's current state, and decides:
+   - **deny**: the bot says why and does nothing;
+   - **ask**: the bot asks the person who asked, in their private chat:
+     "Shall I light.turn_on on light.kitchen (brightness_pct=40)?" plus the
+     reviewer's note. Answer "yes" (or "ja", "ok", 👍), react 👍, or "no" /
+     👎. With several open questions, reply to the one you mean. Questions
+     expire after 2 minutes and work once; nobody else can answer them;
+   - **allow**: with **Auto mode** on, the bot does it right away and says
+     "Done: … (auto-approved: …)"; with Auto mode off it asks like above.
 
-   Only these domains can ever be controlled: light, switch, fan, cover,
-   climate, humidifier, water_heater, media_player, scene, script, input_*,
-   button, vacuum, select, number. Locks, alarms, cameras, notifications,
-   automations, shell/REST commands and HA administration can't be, whatever
-   you configure. (A `script` or `scene` runs whatever it contains, so only
-   allow ones you'd run yourself. A garage door is often a `cover`: think
-   before allowing `cover.*`.)
-3. **A "yes" from the person who asked**, in their private chat with the
-   bot. The bot asks "Shall I light.turn_on on light.kitchen
-   (brightness_pct=40)?" and it can be answered by:
-   - replying "yes" (or "ja", "ok", 👍),
-   - reacting 👍 to the question,
-   - or "no" / 👎 to cancel.
-
-   With several open questions, reply directly to the one you mean (swipe
-   to reply) or react to it. Questions expire after 2 minutes and work once.
-   Nobody else can answer them, and neither can a group.
+Claude also sees your rules, so it proposes what fits them. The switch, the
+user and the denylist are checked again when a confirmed or scheduled change
+runs. A reviewer call takes about 10-20 s with Opus.
 
 **Later and on a schedule.** Ask for a time ("turn on the hot water at
-2:45") and the question says "… at Thu 23.10. 02:45". Your yes schedules it,
-for up to 7 days ahead. When it's due, the bot checks the action rules
-again, runs it once and tells you the result. If the bot was offline and the
+2:45") and the question says "… at Thu 23.10. 02:45". Your yes (or an
+auto-approval) schedules it, for up to 7 days ahead. When it's due, the bot checks the switch and the
+denylist again, runs it once and tells you the result. If the bot was offline and the
 time passed by more than 10 minutes, it doesn't run late; it reports
 "missed". Reminders ("remind us at 8 to …") need no confirmation and arrive
 in the chat they were asked in. **Tasks** ("tell me every weekday at 7 whether
@@ -136,8 +137,8 @@ it will rain", "at 22:00 check which windows are open") run Claude when
 they are due: once, daily, on weekdays or weekly. Claude is told that a
 scheduled task is firing (not a new message), with who set it up, when, and
 the original request. Its answer is posted as "⏰ #12: …" in the chat, or
-nothing if the task's condition doesn't hold. Actions it proposes still need
-your yes; a running task can't create further tasks. Up to 20 per person;
+nothing if the task's condition doesn't hold. Actions it proposes go through
+the same checks (the reviewer knows it's a scheduled run); a running task can't create further tasks. Up to 20 per person;
 cancelling a repeating task stops the series. `/scheduled` lists your pending items and
 `/cancel 12` cancels one (or just ask). Scheduling is done by the bot,
 durably, not by Claude: Claude Code's own scheduling only lives as long as
@@ -247,7 +248,7 @@ Run through this once with a harmless test light.
    doesn't, and you get a private note.
 7. [ ] Stop the app, send a request, wait > 5 minutes, start. You get
    "too late".
-8. [ ] Allow changes, add one action for the test light, ask to turn it on:
+8. [ ] Allow changes (Auto mode off), ask to turn on a test light:
    - "yes" turns it on;
    - a 👍 on the question works too;
    - "no" cancels;

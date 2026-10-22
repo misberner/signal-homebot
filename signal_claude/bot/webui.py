@@ -145,8 +145,10 @@ class SetupApi:
             'groups': groups,
             'seen_senders': seen,
             'group_candidates': candidates,
-            'actions': house.actions,
             'allow_writes': house.allow_writes,
+            'auto_approve': house.auto_approve,
+            'deny': house.deny,
+            'rules': house.rules,
             'require_verified_identity': house.require_verified_identity,
             'command_max_age': house.command_max_age,
             'history_days': house.history_days,
@@ -218,9 +220,7 @@ class SetupApi:
     async def users_remove(self, request: web.Request) -> web.Response:
         name = text(await body(request), 'name')
         house = self.bot.house
-        actions = [{**rule, 'senders': [u for u in rule.get('senders', []) if u != name]} for rule in house.actions]
-        self.bot.update_house(house.change(users={n: a for n, a in house.users.items() if n != name},
-                                           actions=actions))
+        self.bot.update_house(house.change(users={n: a for n, a in house.users.items() if n != name}))
         return web.json_response({'ok': True})
 
     async def groups_add(self, request: web.Request) -> web.Response:
@@ -270,8 +270,8 @@ class SetupApi:
         house = self.bot.house
         changes = {}
         for key, typ in (('bot_name', str), ('allow_writes', bool), ('require_verified_identity', bool),
-                         ('command_max_age', int), ('history_days', int), ('actions', list), ('notes', str),
-                         ('model', str)):
+                         ('command_max_age', int), ('history_days', int), ('notes', str), ('model', str),
+                         ('auto_approve', bool), ('deny', list), ('rules', str)):
             if key in data:
                 value = data[key]
                 if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):
@@ -291,7 +291,7 @@ class SetupApi:
             return web.json_response({'ok': True, 'message': 'Home Assistant is reachable and read-only.'})
         if what == 'claude':
             try:
-                await self.bot.ask_broker('Reply with the single word OK and no actions.', build_schema([]))
+                await self.bot.ask_broker('Reply with the single word OK and no actions.', build_schema(False))
             except ClaudeError as err:
                 return web.json_response({'ok': False, 'message': f'Claude: {err.kind}'})
             return web.json_response({'ok': True, 'message': 'Claude answered.'})

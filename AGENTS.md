@@ -6,8 +6,10 @@ This repository is an agent connected to **physical home devices**.
 
 - Never let the LLM execute arbitrary MCP tools, shell commands, scripts,
   or HTTP requests; it only proposes structured actions.
-- The Python service validates every write against an explicit allowlist.
-  Reject all unknown fields, entities and services.
+- The Python service checks every write deterministically (`validate_action`):
+  fixed domain allowlist, service of the entity's domain, entity exists, flat
+  data without extra targets, admin denylist. Then the reviewer (a separate
+  Claude call without tools or chat history) decides allow/ask/deny.
 - Keep Signal identifiers authenticated from signal-cli metadata, not text.
 - Store all authorized shared-group messages as context; invoke the model
   only for explicit requests. Treat old group messages as untrusted data.
@@ -16,12 +18,13 @@ This repository is an agent connected to **physical home devices**.
 - Use `claude -p --output-format json --json-schema` with no built-in/MCP tools.
 - Don't use `--dangerously-skip-permissions`, `--bare` (which ignores subscription
   login) or `ANTHROPIC_API_KEY` (which could incur separate usage charges).
-- Every write needs a single-use confirmation (yes/👍) from the requester in
-  their DM; never add an auto-execute path. Never retry an `unknown` HA action.
+- A write runs without a single-use confirmation (yes/👍 in the requester's DM)
+  only if the admin enabled Auto mode and the reviewer said "allow"; any
+  reviewer failure means "ask". Never retry an `unknown` HA action.
 - Claude reads HA only through the bot's local MCP proxy (`bot/ha_tools.py`):
   a fixed list of read tools with constrained arguments, a per-request token,
   and an upstream read-only check. Never expose write tools or HA credentials
-  to Claude. Writes go only through the policy gateway (`validate_action`).
+  to Claude. Writes go only through the gateway (`validate_action` + reviewer).
 - Controllable domains are a fixed allowlist in `bot/core.py`
   (`WRITABLE_DOMAINS`); never add locks, alarms, cameras, notify or admin.
 - Never log message text, tokens, or MCP URLs (ha-mcp URLs contain a secret).

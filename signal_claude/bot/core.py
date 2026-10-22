@@ -3,11 +3,13 @@
 Security model (see HANDOFF.md section 4):
 - Sender/group identity comes only from signal-cli envelope metadata.
 - Old, future-dated or disappeared messages never trigger Claude or writes.
-- Claude may only *propose* actions. Every proposal is re-validated here
-  against a fixed action table and the policy, and every write requires a
-  single-use confirmation from the requesting user's private DM.
+- Claude may only *propose* actions. Every proposal is validated here against
+  fixed limits and the denylist, then reviewed (server.py); a write needs a
+  single-use confirmation from the requester's private DM unless the admin
+  enabled auto mode and the reviewer allowed it.
 """
 from __future__ import annotations
+import fnmatch
 import json
 import os
 import re
@@ -264,110 +266,61 @@ def group_roster_problem(groups: object, group_id: str, bot_aci: str, users: set
 
 # ---------------------------------------------------------------- policy
 
-def load_policy(raw: object) -> list[dict]:
-    """Strictly parse a policy ``{"actions": [rule, ...]}``. Fails closed.
-
-    A rule: ``{"service": "light.turn_on", "entities": ["light.kitchen" | "light.*"],
-    "fields": {"brightness_pct": {"min": 1, "max": 100} | {"values": [...]} |
-    {"type": "boolean"}}, "senders": [user names], "contexts": ["dm", "group"]}``.
-    """
-    if not isinstance(raw, dict) or set(raw) - {'actions'}:
-        raise ValueError('policy must be {"actions": [...]}')
-    actions = raw.get('actions', [])
-    if not isinstance(actions, list):
-        raise ValueError('policy actions must be a list')
-    rules = []
-    for n, rule in enumerate(actions, 1):
-        where = f'action {n}'
-        if not isinstance(rule, dict) or set(rule) - {'service', 'entities', 'fields', 'senders', 'contexts'}:
-            raise ValueError(f'{where}: unexpected keys')
-        service = rule.get('service')
-        if not isinstance(service, str) or not re.fullmatch(r'[a-z_]+\.[a-z_]+', service):
-            raise ValueError(f'{where}: service must look like light.turn_on')
-        domain = service.split('.')[0]
-        if domain not in WRITABLE_DOMAINS:
-            raise ValueError(f'{where}: the {domain} domain can never be controlled by the bot')
-        entities = rule.get('entities', [])
-        if not isinstance(entities, list) or not all(
-                isinstance(e, str) and (e == f'{domain}.*' or (re.fullmatch(ENTITY_RE, e)
-                                                              and e.split('.')[0] == domain))
-                for e in entities):
-            raise ValueError(f'{where}: entities must be {domain}.<id> or {domain}.*')
-        fields = rule.get('fields', {})
-        if not isinstance(fields, dict):
-            raise ValueError(f'{where}: fields must be an object')
-        for name, spec in fields.items():
-            _check_field_spec(f'{where} field {name}', name, spec)
-        senders = rule.get('senders', [])
-        if not isinstance(senders, list) or not all(isinstance(u, str) and re.fullmatch(NAME_RE, u)
-                                                    for u in senders):
-            raise ValueError(f'{where}: senders must be a list of user names')
-        contexts = rule.get('contexts', ['dm'])
-        if not isinstance(contexts, list) or not contexts or set(contexts) - set(CONTEXTS):
-            raise ValueError(f'{where}: contexts must be a non-empty subset of {CONTEXTS}')
-        rules.append({'service': service, 'entities': list(entities), 'fields': dict(fields),
-                      'senders': list(senders), 'contexts': list(contexts)})
-    return rules
+TARGET_KEYS = frozenset({'entity_id', 'device_id', 'area_id', 'floor_id', 'label_id', 'target'})
+DENY_RE = r'[a-z_*?]+\.[a-z0-9_*?]+'
+MAX_DENY = 100
+VERDICTS = ('allow', 'ask', 'deny')
 
 
-def _check_field_spec(where: str, name: object, spec: object) -> None:
-    if not isinstance(name, str) or not re.fullmatch(FIELD_RE, name) or name == 'entity_id':
-        raise ValueError(f'{where}: invalid field name')
-    if not isinstance(spec, dict):
-        raise ValueError(f'{where}: must be an object')
-    if set(spec) == {'min', 'max'}:
-        lo, hi = spec['min'], spec['max']
-        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (lo, hi)) or lo > hi:
-            raise ValueError(f'{where}: min/max must be numbers with min <= max')
-    elif set(spec) == {'values'}:
-        values = spec['values']
-        if (not isinstance(values, list) or not values or len(values) > 50
-                or not all(isinstance(v, (str, int, float, bool)) for v in values)):
-            raise ValueError(f'{where}: values must be a non-empty list of strings or numbers')
-    elif spec != {'type': 'boolean'}:
-        raise ValueError(f'{where}: use {{"min","max"}}, {{"values"}} or {{"type": "boolean"}}')
+def load_deny(patterns: object) -> list[str]:
+    """Validate the admin's denylist: glob patterns like ``lock.*``,
+    ``cover.garage*`` or ``*.turn_off``, matched against entity and service."""
+    if (not isinstance(patterns, list) or len(patterns) > MAX_DENY
+            or not all(isinstance(p, str) and re.fullmatch(DENY_RE, p) for p in patterns)):
+        raise ValueError('denylist entries look like lock.*, cover.garage* or *.turn_off')
+    return list(patterns)
 
 
-def permitted(policy: list[dict], writes_enabled: bool, user: str | None, context: str) -> list[dict]:
-    """The rules usable by this sender in this context."""
-    if not writes_enabled or not user:
-        return []
-    return [r for r in policy if r['entities'] and user in r['senders'] and context in r['contexts']]
+def denied_by(deny: list[str], service: str, entity_id: str) -> str | None:
+    return next((p for p in deny if fnmatch.fnmatchcase(entity_id, p) or fnmatch.fnmatchcase(service, p)), None)
 
 
-def _entity_allowed(rule: dict, entity_id: str) -> bool:
-    return any(e == entity_id or (e.endswith('.*') and entity_id.split('.')[0] == e[:-2])
-               for e in rule['entities'])
+def _scalar(value: object, max_len: int) -> bool:
+    if isinstance(value, str):
+        return len(value) <= max_len
+    return isinstance(value, (bool, int, float)) and value == value  # no NaN
 
 
-def _field_ok(spec: dict, value: object) -> bool:
-    if 'min' in spec:
-        return isinstance(value, (int, float)) and not isinstance(value, bool) and spec['min'] <= value <= spec['max']
-    if 'values' in spec:
-        return any(value == v and type(value) is type(v) for v in spec['values'])
-    return isinstance(value, bool)
+def validate_action(action: object, deny: list[str]) -> tuple[str, dict]:
+    """Fixed, deterministic limits on a proposed action (before any review).
 
-
-def validate_action(action: object, rules: list[dict]) -> tuple[str, dict]:
-    """Deterministic, fail-closed mapping from a proposed action to one HA call.
-
-    ``rules`` must come from ``permitted()`` for the authenticated sender.
-    Returns (service, service_data) where service_data includes entity_id.
+    One existing-looking entity, a service of that entity's domain, a domain
+    from WRITABLE_DOMAINS, nothing on the admin's denylist, and flat service
+    data (no extra targets). Returns (service, service_data incl. entity_id).
     """
     if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at'}:
         raise Denied('unexpected action fields')
     service, entity_id, data = action.get('service'), action.get('entity_id'), action.get('data') or {}
     if not isinstance(service, str) or not isinstance(entity_id, str) or not isinstance(data, dict):
         raise Denied('malformed action')
-    if not re.fullmatch(ENTITY_RE, entity_id) or service.split('.')[0] not in WRITABLE_DOMAINS:
-        raise Denied('action not permitted')
-    candidates = [r for r in rules if r['service'] == service and _entity_allowed(r, entity_id)]
-    if not candidates:
-        raise Denied('action not permitted')
-    for rule in candidates:
-        if all(k in rule['fields'] and _field_ok(rule['fields'][k], v) for k, v in data.items()):
-            return service, {'entity_id': entity_id, **data}
-    raise Denied('a value is not permitted')
+    if not re.fullmatch(r'[a-z_]+\.[a-z_]+', service) or not re.fullmatch(ENTITY_RE, entity_id):
+        raise Denied('malformed action')
+    domain = entity_id.split('.')[0]
+    if service.split('.')[0] != domain:
+        raise Denied(f'{service} does not belong to {entity_id}')
+    if domain not in WRITABLE_DOMAINS:
+        raise Denied(f'{domain} devices can never be controlled by the bot')
+    if pattern := denied_by(deny, service, entity_id):
+        raise Denied(f'blocked by the denylist ({pattern})')
+    if len(data) > 12:
+        raise Denied('too many fields')
+    for key, value in data.items():
+        if not re.fullmatch(FIELD_RE, key) or key in TARGET_KEYS:
+            raise Denied(f'field "{key}" is not allowed')
+        if not (_scalar(value, 200) or (isinstance(value, list) and len(value) <= 10
+                                         and all(_scalar(v, 100) for v in value))):
+            raise Denied(f'field "{key}" must be a simple value')
+    return service, {'entity_id': entity_id, **data}
 
 
 def describe(service: str, data: dict) -> str:
@@ -420,29 +373,16 @@ def local_time(epoch: float) -> str:
     return time.strftime('%a %d.%m. %H:%M', time.localtime(epoch))
 
 
-def describe_rule(rule: dict) -> str:
-    fields = []
-    for name, spec in rule['fields'].items():
-        if 'min' in spec:
-            fields.append(f'{name} {spec["min"]}..{spec["max"]}')
-        elif 'values' in spec:
-            fields.append(f'{name} one of {spec["values"]}')
-        else:
-            fields.append(f'{name} true/false')
-    return (f'{rule["service"]} on {", ".join(rule["entities"])}'
-            + (f'; optional data: {"; ".join(fields)}' if fields else '; no extra data'))
-
-
-def build_schema(rules: list[dict]) -> dict:
+def build_schema(writes: bool) -> dict:
     """JSON schema for Claude's structured output.
 
     No ``$schema`` key: Claude Code 2.1.x rejects draft 2020-12 references.
-    When nothing is permitted, ``actions`` must be empty.
+    When changes are off, ``actions`` must be empty.
     """
     item = {
         'type': 'object',
         'properties': {
-            'service': {'type': 'string', 'enum': sorted({r['service'] for r in rules}) or ['none']},
+            'service': {'type': 'string'},
             'entity_id': {'type': 'string'},
             'data': {'type': 'object'},
             'at': {'type': ['string', 'null']},
@@ -450,7 +390,7 @@ def build_schema(rules: list[dict]) -> dict:
         'required': ['service', 'entity_id', 'data'],
         'additionalProperties': False,
     }
-    actions = {'type': 'array', 'items': item, 'maxItems': 3 if rules else 0}
+    actions = {'type': 'array', 'items': item, 'maxItems': 3 if writes else 0}
     reminder = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'text': {'type': 'string'}},
                 'required': ['at', 'text'], 'additionalProperties': False}
     task = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'prompt': {'type': 'string'},
@@ -519,8 +459,30 @@ class ClaudeError(RuntimeError):
         self.kind = kind
 
 
+CLASSIFIER_SCHEMA = {
+    'type': 'object',
+    'properties': {'decision': {'type': 'string', 'enum': list(VERDICTS)}, 'reason': {'type': 'string'}},
+    'required': ['decision', 'reason'],
+    'additionalProperties': False,
+}
+
+
+def parse_verdict(stdout: bytes, returncode: int = 0) -> tuple[str, str]:
+    """(decision, reason) from the reviewer's envelope; anything odd means 'ask'."""
+    obj = _structured_output(stdout, returncode)
+    decision, reason = obj.get('decision'), obj.get('reason')
+    if decision not in VERDICTS or not isinstance(reason, str):
+        return 'ask', 'the reviewer gave no clear answer'
+    return decision, ' '.join(reason.split())[:300]
+
+
 def parse_claude_output(stdout: bytes, returncode: int = 0) -> dict:
-    """Validate the Claude CLI JSON envelope before anything reaches the gateway.
+    """Validate Claude's answer (reply, actions, ...) before anything reaches the gateway."""
+    return _check_output(_structured_output(stdout, returncode))
+
+
+def _structured_output(stdout: bytes, returncode: int = 0) -> dict:
+    """Validate the Claude CLI JSON envelope and return its structured output.
 
     Claude Code writes a JSON envelope even when it exits non-zero (for example
     ``api_error_status: 401`` for an invalid/expired OAuth token), so classify
@@ -543,6 +505,12 @@ def parse_claude_output(stdout: bytes, returncode: int = 0) -> dict:
             raise ClaudeError('unavailable', f'status {status}')
         raise ClaudeError('invalid', f'subtype {envelope.get("subtype")}')
     obj = envelope.get('structured_output')
+    if not isinstance(obj, dict):
+        raise ClaudeError('invalid', 'missing structured output')
+    return obj
+
+
+def _check_output(obj: dict) -> dict:
     if (not isinstance(obj, dict) or not {'reply', 'actions'} <= set(obj)
             or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel'}):
         raise ClaudeError('invalid', 'missing structured output')
@@ -764,9 +732,17 @@ class Store:
                                    'scheduled' if row[3] else 'executing', now, row[3]))
             return cur.lastrowid, row[0], row[1], json.loads(row[2]), row[3]
 
+    def add_action(self, sender: str, request_conv: str, service: str, data: dict, now: int) -> int:
+        """Journal an auto-approved action as executing (no confirmation step)."""
+        with self._tx():
+            return self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
+                                   "status,created_at) VALUES(?,?,?,?,?,'executing',?)",
+                                   (f'auto-{now}-{os.urandom(6).hex()}', sender, request_conv, service,
+                                    json.dumps(data), now)).lastrowid
+
     def add_scheduled(self, sender: str, request_conv: str, service: str, data: dict,
                       run_at: int, now: int) -> int:
-        """A job that needs no confirmation (reminders)."""
+        """A job that needs no (further) confirmation: reminders, tasks, auto-approved actions."""
         with self._tx():
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
                                   "status,created_at,run_at) VALUES(?,?,?,?,?,'scheduled',?,?)",

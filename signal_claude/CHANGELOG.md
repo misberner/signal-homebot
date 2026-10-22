@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.10.0 — 2026-10-22
+
+### Changed
+- **New change model: no action table.** Claude may propose any service call
+  on one entity in the fixed writable domains (locks, alarms, cameras,
+  notify, automations and admin stay impossible). Each proposal passes:
+  fixed checks in code (service of the entity's domain, entity exists in HA,
+  flat data without extra targets), the admin's **denylist** (glob patterns
+  on entity or service), and a **reviewer**: a separate Claude call without
+  tools or chat history that sees the admin's **Rules**, the requester, the
+  request, the exact call and the entity's state, and answers allow / ask /
+  deny. "ask" (and any reviewer failure) asks the requester to confirm as
+  before; "allow" runs without asking only when **Auto mode** is on (off by
+  default). Settings from earlier versions load; their action table is
+  dropped, so changes are asked or denied by the reviewer until you write
+  rules.
+
+### Fixed
+- **Replies sorted above the request** (seen on Signal Desktop): Signal
+  orders by sender timestamps, so if the phone's clock was ahead, the bot's
+  immediate reply got an earlier timestamp. The bot now waits (≤ 3 s) until
+  its clock has passed the newest incoming message before sending.
+
 ## 0.9.0 — 2026-10-22
 
 ### Added

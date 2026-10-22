@@ -12,7 +12,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from .core import NAME_RE, Settings, load_policy
+from .core import NAME_RE, Settings, load_deny
 
 ACI_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 PHONE_RE = r'\+[1-9][0-9]{6,14}'
@@ -31,17 +31,15 @@ class Household:
     bot_name: str = 'HomeBot'
     users: dict[str, str] = field(default_factory=dict)   # name -> ACI
     groups: dict[str, str] = field(default_factory=dict)  # name -> Signal group id
-    actions: list = field(default_factory=list)           # raw policy rules, see core.load_policy
-    allow_writes: bool = False
+    allow_writes: bool = False          # master switch for changes
+    auto_approve: bool = False          # the reviewer's "allow" runs without asking
+    deny: list = field(default_factory=list)  # glob patterns on entity/service, see core.load_deny
+    rules: str = ''                     # admin-written rules for Claude and the reviewer (trusted)
     require_verified_identity: bool = True
     command_max_age: int = 300
     history_days: int = 7
     notes: str = ''  # admin-written hints for Claude (trusted), e.g. where presence data lives
     model: str = 'opus'  # Claude Code model alias
-
-    @property
-    def policy(self) -> list[dict]:
-        return load_policy({'actions': self.actions})
 
     @property
     def settings(self) -> Settings:
@@ -81,12 +79,11 @@ class Household:
         if set(self.users) & set(self.groups):
             raise HouseholdError('Users and groups need different names')
         try:
-            policy = self.policy
+            load_deny(self.deny)
         except ValueError as err:
-            raise HouseholdError(f'Actions: {err}') from None
-        unknown = sorted({u for rule in policy for u in rule['senders']} - set(self.users))
-        if unknown:
-            raise HouseholdError(f'Actions name unknown users: {", ".join(unknown)}')
+            raise HouseholdError(f'Denylist: {err}') from None
+        if len(self.rules) > 4000:
+            raise HouseholdError('Rules: at most 4000 characters')
         if self.model not in MODELS:
             raise HouseholdError(f'Model must be one of {", ".join(MODELS)}')
         if len(self.notes) > 4000:
@@ -99,6 +96,8 @@ class Household:
 
     @classmethod
     def from_json(cls, data: object) -> 'Household':
+        if isinstance(data, dict):
+            data = {k: v for k, v in data.items() if k != 'actions'}  # the pre-0.10 action table
         if not isinstance(data, dict) or set(data) - set(cls.__dataclass_fields__):
             raise HouseholdError('Unknown settings')
         try:
@@ -106,7 +105,8 @@ class Household:
         except TypeError as err:
             raise HouseholdError(str(err)) from None
         types = {'signal_account': str, 'pending_account': str, 'bot_aci': str, 'bot_name': str,
-                 'users': dict, 'groups': dict, 'actions': list, 'allow_writes': bool,
+                 'users': dict, 'groups': dict, 'deny': list, 'rules': str, 'allow_writes': bool,
+                 'auto_approve': bool,
                  'require_verified_identity': bool, 'command_max_age': int, 'history_days': int,
                  'notes': str, 'model': str}
         for key, typ in types.items():

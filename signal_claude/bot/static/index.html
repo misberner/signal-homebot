@@ -37,7 +37,6 @@
   code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; border: 1px solid; }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-  .action { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 10px 0; }
   .checks label { display: inline-flex; gap: 5px; align-items: center; margin-right: 14px; color: var(--text); }
   #toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); max-width: 92vw;
            background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 8px; display: none; }
@@ -74,16 +73,28 @@
 
   <section id="settings">
     <h2>4. What the bot may change</h2>
-    <p class="hint">The bot can always <em>read</em> your home. Changes are off unless enabled here, and
-      every change still needs a "yes" (or 👍) from the person who asked, in their private chat.
-      Locks, alarms, cameras and administration can never be controlled.</p>
+    <p class="hint">The bot can always <em>read</em> your home. With changes allowed, Claude may propose a
+      service call on one entity (lights, switches, heating, covers, media, scenes, scripts, helpers,
+      vacuums, …). Locks, alarms, cameras and administration can never be controlled. A separate reviewer
+      checks every proposal against your rules and decides: <strong>allow</strong>, <strong>ask</strong>
+      (the requester confirms with "yes" or 👍 in their private chat) or <strong>deny</strong>.</p>
     <label class="checks"><label><input type="checkbox" id="allow_writes"> Allow changes</label></label>
+    <label class="checks"><label><input type="checkbox" id="auto_approve"> Auto mode: do what the reviewer
+      allows without asking (otherwise every change is confirmed)</label></label>
     <p class="hint" id="write-token-hint"></p>
-    <div id="actions"></div>
-    <button onclick="addAction()">Add action</button>
-    <p class="hint">Fields, one per line: <code>brightness_pct: 1..100</code>,
-      <code>color_name: red | blue | white</code>, <code>oscillating: boolean</code>.
-      Entities: exact IDs or <code>light.*</code> for all of a domain.</p>
+    <label for="rules">Rules</label>
+    <textarea id="rules" style="min-height:110px" placeholder="e.g.
+Lights: anyone may switch them, any time.
+Hot water (water_heater.my_home_domestic_hot_water_0): only Manual or Off.
+Never open covers between 22:00 and 6:00.
+Anna may control lights and media only."></textarea>
+    <p class="hint">Plain language. Claude and the reviewer both read them; only admins can edit them.</p>
+    <label for="deny">Never touch (one pattern per line)</label>
+    <textarea id="deny" style="min-height:70px" placeholder="cover.garage*
+script.*
+*.turn_off"></textarea>
+    <p class="hint">Matched against the entity and the service; <code>*</code> is a wildcard. Checked by the
+      bot itself, before and after the reviewer.</p>
   </section>
 
   <section id="settings2">
@@ -106,7 +117,7 @@
     <label class="checks"><label><input type="checkbox" id="require_verified_identity">
       Only accept people with a verified safety number (recommended)</label></label>
     <div class="row" style="margin-top:12px">
-      <button class="primary" onclick="saveSettings()">Save actions and settings</button>
+      <button class="primary" onclick="saveSettings()">Save settings</button>
       <button onclick="runTest('ha')">Test Home Assistant</button>
       <button onclick="runTest('claude')">Test Claude</button>
     </div>
@@ -116,7 +127,7 @@
 
 <script>
 let state = null;
-let dirty = false;  // unsaved edits in actions/settings: don't re-render them
+let dirty = false;  // unsaved edits in the settings: don't re-render them
 document.addEventListener('input', e => { if (e.target.closest('#settings, #settings2')) dirty = true; });
 document.addEventListener('change', e => { if (e.target.closest('#settings, #settings2')) dirty = true; });
 
@@ -254,58 +265,11 @@ function renderGroups() {
   }
 }
 
-function fieldsToText(fields) {
-  return Object.entries(fields || {}).map(([k, s]) =>
-    'min' in s ? `${k}: ${s.min}..${s.max}` : 'values' in s ? `${k}: ${s.values.join(' | ')}` : `${k}: boolean`).join('\n');
-}
-
-function textToFields(txt, where) {
-  const fields = {};
-  for (const raw of txt.split('\n')) {
-    const line = raw.trim(); if (!line) continue;
-    const m = line.match(/^([a-z_][a-z0-9_]*)\s*:\s*(.+)$/);
-    if (!m) throw new Error(`${where}: can't read "${line}"`);
-    const [, name, spec] = m, range = spec.match(/^(-?[\d.]+)\s*\.\.\s*(-?[\d.]+)$/);
-    if (range) fields[name] = {min: Number(range[1]), max: Number(range[2])};
-    else if (spec.trim() === 'boolean') fields[name] = {type: 'boolean'};
-    else fields[name] = {values: spec.split('|').map(v => v.trim()).filter(Boolean)
-      .map(v => /^-?\d+(\.\d+)?$/.test(v) ? Number(v) : v)};
-  }
-  return fields;
-}
-
-function actionCard(rule = {service: '', entities: [], fields: {}, senders: [], contexts: ['dm']}) {
-  const service = el('input', {type: 'text', placeholder: 'light.turn_on', value: rule.service, 'data-k': 'service'});
-  const entities = el('input', {type: 'text', placeholder: 'light.kitchen, light.hallway', value: rule.entities.join(', '), 'data-k': 'entities'});
-  const fields = el('textarea', {placeholder: 'brightness_pct: 1..100', 'data-k': 'fields'});
-  fields.value = fieldsToText(rule.fields);
-  const who = el('div', {class: 'checks'}, 'Who: ', state.users.map(u =>
-    el('label', {}, el('input', {type: 'checkbox', 'data-user': u.name, ...(rule.senders.includes(u.name) ? {checked: ''} : {})}), u.name)));
-  const where = el('div', {class: 'checks'}, 'Where: ', ['dm', 'group'].map(c =>
-    el('label', {}, el('input', {type: 'checkbox', 'data-context': c, ...(rule.contexts.includes(c) ? {checked: ''} : {})}),
-      c === 'dm' ? 'private chat' : 'groups')));
-  const card = el('div', {class: 'action'},
-    el('div', {class: 'row'}, el('div', {}, el('label', {}, 'Service'), service),
-      el('div', {}, el('label', {}, 'Entities'), entities)),
-    el('label', {}, 'Allowed extra fields'), fields, who, where,
-    el('button', {class: 'small', onclick: () => { dirty = true; card.remove(); }}, 'Remove action'));
-  return card;
-}
-
-function addAction() { dirty = true; document.getElementById('actions').append(actionCard()); }
-
-function collectActions() {
-  return [...document.querySelectorAll('#actions .action')].map((card, i) => ({
-    service: card.querySelector('[data-k=service]').value.trim(),
-    entities: card.querySelector('[data-k=entities]').value.split(',').map(s => s.trim()).filter(Boolean),
-    fields: textToFields(card.querySelector('[data-k=fields]').value, `Action ${i + 1}`),
-    senders: [...card.querySelectorAll('[data-user]:checked')].map(c => c.dataset.user),
-    contexts: [...card.querySelectorAll('[data-context]:checked')].map(c => c.dataset.context),
-  }));
-}
-
 function renderSettings() {
   document.getElementById('allow_writes').checked = state.allow_writes;
+  document.getElementById('auto_approve').checked = state.auto_approve;
+  document.getElementById('rules').value = state.rules || '';
+  document.getElementById('deny').value = (state.deny || []).join('\n');
   document.getElementById('require_verified_identity').checked = state.require_verified_identity;
   document.getElementById('bot_name').value = state.account.bot_name;
   document.getElementById('command_max_age').value = state.command_max_age;
@@ -314,15 +278,15 @@ function renderSettings() {
   document.getElementById('model').value = state.model || 'opus';
   document.getElementById('write-token-hint').textContent = state.ha.write_token ? '' :
     'Changes also need an ha_token in the app Configuration tab.';
-  const box = document.getElementById('actions');
-  box.replaceChildren(...state.actions.map(r => actionCard(r)));
 }
 
 async function saveSettings() {
   try {
     await api('settings', {
-      actions: collectActions(),
       allow_writes: document.getElementById('allow_writes').checked,
+      auto_approve: document.getElementById('auto_approve').checked,
+      rules: document.getElementById('rules').value,
+      deny: document.getElementById('deny').value.split('\n').map(s => s.trim()).filter(Boolean),
       require_verified_identity: document.getElementById('require_verified_identity').checked,
       bot_name: document.getElementById('bot_name').value.trim(),
       command_max_age: Number(document.getElementById('command_max_age').value),
