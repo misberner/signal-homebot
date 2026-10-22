@@ -903,6 +903,50 @@ class ScheduleTests(Integration):
         await self.advance(86400)
         self.assertEqual(len(self.claude.calls), 3)
 
+    async def test_repeating_action_confirmed_once(self):
+        self.claude.set(reply='Okay.', actions=[{**LAMP_ON, 'at': self.at(600), 'repeat': 'daily'}])
+        await self.deliver(sender=USER1, text='mach jeden Tag das Licht an')
+        [q] = self.questions(USER1)
+        self.assertIn(', then daily (asked here)?', q['message'])
+        await self.deliver(sender=USER1, text='yes')
+        self.assertRegex(self.dm(USER1)[-1], r'Scheduled #\d+: .* then daily')
+        await self.advance(660)
+        self.assertEqual(len(self.ha.calls), 1)
+        [(nxt, _, _, service, _, run_at)] = self.bot.store.scheduled(USER1)
+        self.assertEqual(service, 'light.turn_on')
+        self.now = run_at - 30
+        await self.advance(60)
+        self.assertEqual(len(self.ha.calls), 2)                  # no new question
+        self.assertEqual(len(self.questions(USER1)), 1)
+        self.assertEqual(len(self.bot.store.scheduled(USER1)), 1)
+
+    async def test_task_with_grants_acts_without_asking(self):
+        lamp_off = {'service': 'light.turn_off', 'entity_id': 'light.test_lamp', 'data': {}}
+        self.answer(reply='Mache ich.', tasks=[{'at': self.at(900), 'prompt': 'Turn the lamp on if it is off.',
+                                                'repeat': 'daily', 'grants': [{'service': 'light.turn_on',
+                                                                               'entity_id': 'light.test_lamp'}]}])
+        await self.deliver(sender=USER1, text='schalte jeden Abend die Lampe an falls aus')
+        [q] = self.questions(USER1)
+        self.assertIn('Shall I set up task', q['message'])
+        self.assertIn('may do without asking: light.turn_on on light.test_lamp', q['message'])
+        self.assertEqual(self.bot.store.scheduled(USER1), [])   # nothing until confirmed
+        await self.deliver(sender=USER1, text='ja')
+        self.assertRegex(self.dm(USER1)[-1], r'Task #\d+ set for .*, then daily')
+        job = int(self.dm(USER1)[-1].split('#')[1].split(' ')[0])
+        # When it runs: the granted action happens right away; another one is still asked.
+        self.answer(reply='Lampe war aus.', actions=[LAMP_ON, lamp_off])
+        await self.advance(960)
+        self.assertEqual(self.ha.calls, [('light.turn_on', {'entity_id': 'light.test_lamp'})])
+        self.assertIn(f'(approved with task #{job})', self.dm(USER1)[-2] + self.dm(USER1)[-1])
+        self.assertIn('light.turn_off', self.questions(USER1)[-1]['message'])
+        self.assertIn('explicitly approved this service', self.claude.reviews[0]['prompt'])
+        # The reviewer can still say no.
+        [(nxt, *_)] = self.bot.store.scheduled(USER1)
+        self.claude.set(reply='x', actions=[LAMP_ON], verdict={'decision': 'deny', 'reason': 'Urlaub.'})
+        self.now = self.bot.store.scheduled(USER1)[0][5] - 30
+        await self.advance(60)
+        self.assertEqual(len(self.ha.calls), 1)
+
     async def test_task_cannot_create_tasks(self):
         self.answer(reply='ok', tasks=[{'at': self.at(900), 'prompt': 'say hi', 'repeat': 'once'}])
         await self.deliver(sender=USER1, group=GROUP, text='/ha say hi in 15 minutes')

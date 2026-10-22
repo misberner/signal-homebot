@@ -26,6 +26,7 @@ REMIND = 'homebot.remind'        # internal "service" for reminders: a message, 
 TASK = 'homebot.task'            # internal "service": run Claude with a stored instruction, then post its answer
 REPEATS = ('once', 'daily', 'weekdays', 'weekly')
 MAX_TASKS = 20                   # pending tasks per user
+MAX_GRANTS = 5                   # actions a task may run without asking (confirmed when it is set up)
 OUTBOX_MAX_AGE = 3600
 OUTBOX_MAX_ATTEMPTS = 8
 OBJECT_REPLACEMENT = '￼'  # Signal puts this where an @mention was
@@ -301,7 +302,7 @@ def validate_action(action: object, deny: list[str], allow: list[str] | None = N
     if one is active (``allow`` not None), and flat service data (no extra
     targets). Returns (service, service_data incl. entity_id).
     """
-    if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at'}:
+    if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at', 'repeat'}:
         raise Denied('unexpected action fields')
     service, entity_id, data = action.get('service'), action.get('entity_id'), action.get('data') or {}
     if not isinstance(service, str) or not isinstance(entity_id, str) or not isinstance(data, dict):
@@ -333,7 +334,9 @@ def describe(service: str, data: dict) -> str:
         return f'reminder "{data.get("text", "")}"'
     if service == TASK:
         repeat = data.get('repeat', 'once')
-        return f'task "{data.get("prompt", "")}"' + (f' ({repeat})' if repeat != 'once' else '')
+        grants = '; '.join(f'{g["service"]} on {g["entity_id"]}' for g in data.get('grants') or [])
+        return (f'task "{data.get("prompt", "")}"' + (f' ({repeat})' if repeat != 'once' else '')
+                + (f', may do without asking: {grants}' if grants else ''))
     extra = ', '.join(f'{k}={v}' for k, v in data.items() if k != 'entity_id')
     return f'{service} on {data["entity_id"]}' + (f' ({extra})' if extra else '')
 
@@ -391,6 +394,7 @@ def build_schema(writes: bool) -> dict:
             'entity_id': {'type': 'string'},
             'data': {'type': 'object'},
             'at': {'type': ['string', 'null']},
+            'repeat': {'type': 'string', 'enum': list(REPEATS)},
         },
         'required': ['service', 'entity_id', 'data'],
         'additionalProperties': False,
@@ -398,9 +402,13 @@ def build_schema(writes: bool) -> dict:
     actions = {'type': 'array', 'items': item, 'maxItems': 3 if writes else 0}
     reminder = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'text': {'type': 'string'}},
                 'required': ['at', 'text'], 'additionalProperties': False}
+    grant = {'type': 'object', 'properties': {'service': {'type': 'string'}, 'entity_id': {'type': 'string'}},
+             'required': ['service', 'entity_id'], 'additionalProperties': False}
     task = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'prompt': {'type': 'string'},
-                                             'repeat': {'type': 'string', 'enum': list(REPEATS)}},
-            'required': ['at', 'prompt', 'repeat'], 'additionalProperties': False}
+                                             'repeat': {'type': 'string', 'enum': list(REPEATS)},
+                                             'grants': {'type': 'array', 'items': grant,
+                                                        'maxItems': MAX_GRANTS if writes else 0}},
+            'required': ['at', 'prompt', 'repeat', 'grants'], 'additionalProperties': False}
     return {
         'type': 'object',
         'properties': {'reply': {'type': 'string'}, 'actions': actions,
@@ -532,7 +540,7 @@ def _check_output(obj: dict) -> dict:
 
 # ---------------------------------------------------------------- storage
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Store:
@@ -586,7 +594,9 @@ class Store:
         # v3: the confirmation prompt's Signal timestamp, to match replies/reactions.
         for table, column in (('approvals', 'prompt_ts INTEGER'), ('outbox', 'approval_code TEXT'),
                               ('approvals', 'run_at INTEGER'), ('actions', 'run_at INTEGER'),
-                              ('outbox', 'edit_ts INTEGER')):
+                              ('outbox', 'edit_ts INTEGER'),
+                              # v4: repeating scheduled actions ('once', 'daily', ...).
+                              ('approvals', 'repeat TEXT'), ('actions', 'repeat TEXT')):
             have = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
             if column.split()[0] not in have:
                 self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column}')
@@ -685,13 +695,13 @@ class Store:
     # -- approvals and the action journal ---------------------------------
 
     def add_approval(self, code: str, sender: str, request_conv: str, service: str,
-                     data: dict, now: int, prompt: str, run_at: int | None = None) -> None:
+                     data: dict, now: int, prompt: str, run_at: int | None = None, repeat: str = 'once') -> None:
         """Record a pending approval and queue its private DM atomically."""
         with self._tx():
             self.db.execute('INSERT INTO approvals(code,sender,request_conv,service,data_json,created_at,'
-                            'expires_at,status,run_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                            'expires_at,status,run_at,repeat) VALUES(?,?,?,?,?,?,?,?,?,?)',
                             (code, sender, request_conv, service, json.dumps(data),
-                             now, now + APPROVAL_TTL, 'pending', run_at))
+                             now, now + APPROVAL_TTL, 'pending', run_at, repeat))
             self._enqueue([(f'dm:{sender}', prompt)], now, approval_code=code)
 
     PROMPT_AMBIGUOUS = 'ambiguous'
@@ -725,16 +735,16 @@ class Store:
         Returns (action_id, request_conv, service, data, run_at) or None.
         """
         with self._tx():
-            row = self.db.execute("SELECT request_conv,service,data_json,run_at FROM approvals "
+            row = self.db.execute("SELECT request_conv,service,data_json,run_at,repeat FROM approvals "
                                   "WHERE code=? AND sender=? AND status='pending' AND expires_at>?",
                                   (code, sender, now)).fetchone()
             if not row:
                 return None
             self.db.execute("UPDATE approvals SET status='consumed' WHERE code=?", (code,))
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,"
-                                  "data_json,status,created_at,run_at) VALUES(?,?,?,?,?,?,?,?)",
+                                  "data_json,status,created_at,run_at,repeat) VALUES(?,?,?,?,?,?,?,?,?)",
                                   (code, sender, row[0], row[1], row[2],
-                                   'scheduled' if row[3] else 'executing', now, row[3]))
+                                   'scheduled' if row[3] else 'executing', now, row[3], row[4] or 'once'))
             return cur.lastrowid, row[0], row[1], json.loads(row[2]), row[3]
 
     def add_action(self, sender: str, request_conv: str, service: str, data: dict, now: int) -> int:
@@ -746,13 +756,13 @@ class Store:
                                     json.dumps(data), now)).lastrowid
 
     def add_scheduled(self, sender: str, request_conv: str, service: str, data: dict,
-                      run_at: int, now: int) -> int:
+                      run_at: int, now: int, repeat: str = 'once') -> int:
         """A job that needs no (further) confirmation: reminders, tasks, auto-approved actions."""
         with self._tx():
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
-                                  "status,created_at,run_at) VALUES(?,?,?,?,?,'scheduled',?,?)",
+                                  "status,created_at,run_at,repeat) VALUES(?,?,?,?,?,'scheduled',?,?,?)",
                                   (f'job-{now}-{os.urandom(6).hex()}', sender, request_conv, service,
-                                   json.dumps(data), now, run_at))
+                                   json.dumps(data), now, run_at, repeat))
             return cur.lastrowid
 
     def scheduled(self, sender: str | None = None) -> list[tuple[int, str, str, str, dict, int]]:
@@ -761,6 +771,15 @@ class Store:
         rows = self.db.execute(query + (' AND sender=?' if sender else '') + ' ORDER BY run_at',
                                (sender,) if sender else ()).fetchall()
         return [(i, s, c, svc, json.loads(d), r) for i, s, c, svc, d, r in rows]
+
+    def repeat_of(self, action_id: int) -> str:
+        """How a job repeats: a task's own setting, else the action's column."""
+        row = self.db.execute('SELECT service,data_json,repeat FROM actions WHERE id=?', (action_id,)).fetchone()
+        if not row:
+            return 'once'
+        if row[0] == TASK:
+            return json.loads(row[1]).get('repeat', 'once')
+        return row[2] or 'once'
 
     def due_scheduled(self, now: int) -> list[tuple[int, str, str, str, dict, int]]:
         return [job for job in self.scheduled() if job[5] <= now]
@@ -788,17 +807,20 @@ class Store:
             return self._repeat_task(action_id, now)
 
     def _repeat_task(self, action_id: int, now: int) -> int | None:
-        row = self.db.execute('SELECT sender,request_conv,service,data_json,run_at FROM actions WHERE id=?',
-                              (action_id,)).fetchone()
-        if not row or row[2] != TASK:
+        """Schedule the next run of a repeating task or action (a confirmed
+        action keeps its confirmation for the whole series)."""
+        row = self.db.execute('SELECT sender,request_conv,service,data_json,run_at,repeat FROM actions '
+                              'WHERE id=?', (action_id,)).fetchone()
+        if not row or not row[4]:
             return None
-        sender, conv, service, data_json, run_at = row
-        when = next_run(run_at, json.loads(data_json).get('repeat', 'once'), now)
+        sender, conv, service, data_json, run_at, repeat = row
+        when = next_run(run_at, self.repeat_of(action_id), now)
         if when is None:
             return None
         cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
-                              "status,created_at,run_at) VALUES(?,?,?,?,?,'scheduled',?,?)",
-                              (f'job-{now}-{os.urandom(6).hex()}', sender, conv, service, data_json, now, when))
+                              "status,created_at,run_at,repeat) VALUES(?,?,?,?,?,'scheduled',?,?,?)",
+                              (f'job-{now}-{os.urandom(6).hex()}', sender, conv, service, data_json, now, when,
+                               repeat))
         return cur.lastrowid
 
     def cancel_scheduled(self, action_id: int, sender: str, now: int) -> bool:
@@ -848,6 +870,7 @@ class Store:
                                 f'The bot restarted while running {describe(service, json.loads(data_json))}. '
                                 'The outcome is UNKNOWN and it was NOT retried; please check the device.')],
                               now)
+                self._repeat_task(action_id, now)  # a repeating series continues
             jobs = self.db.execute("SELECT conv,sender,timestamp FROM jobs WHERE status='pending'").fetchall()
             for conv, _sender, ts in jobs:
                 self.db.execute("UPDATE jobs SET status='interrupted' WHERE conv=? AND sender=? AND timestamp=?",

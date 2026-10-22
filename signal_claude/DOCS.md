@@ -132,7 +132,9 @@ runs. A reviewer call takes about 10-20 s with Opus.
 
 **Later and on a schedule.** Ask for a time ("turn on the hot water at
 2:45") and the question says "… at Thu 23.10. 02:45". Your yes (or an
-auto-approval) schedules it, for up to 7 days ahead. When it's due, the bot checks the switch and the
+auto-approval) schedules it, for up to 7 days ahead. Fixed actions can repeat
+("every day at 22:00 turn off the lights"): you confirm once, and every run
+happens without asking. When it's due, the bot checks the switch and the
 denylist again, runs it once and tells you the result. If the bot was offline and the
 time passed by more than 10 minutes, it doesn't run late; it reports
 "missed". Reminders ("remind us at 8 to …") need no confirmation and arrive
@@ -141,8 +143,13 @@ it will rain", "at 22:00 check which windows are open") run Claude when
 they are due: once, daily, on weekdays or weekly. Claude is told that a
 scheduled task is firing (not a new message), with who set it up, when, and
 the original request. Its answer is posted as "⏰ #12: …" in the chat, or
-nothing if the task's condition doesn't hold. Actions it proposes go through
-the same checks (the reviewer knows it's a scheduled run); a running task can't create further tasks. Up to 20 per person;
+nothing if the task's condition doesn't hold. A task that may need to change
+something ("at 22:00, if a window is open, turn the heating down to 16 °C")
+asks you once when it is set up: "Shall I set up task …, may do without
+asking: climate.set_temperature on climate.wohnzimmer?". After your yes, it
+does those calls when it runs without asking you again; the allowlist,
+denylist, your rules and the reviewer (which can still deny) apply each time.
+Other changes it proposes are asked as usual. A running task can't create further tasks. Up to 20 per person;
 cancelling a repeating task stops the series. `/scheduled` lists your pending items and
 `/cancel 12` cancels one (or just ask). Scheduling is done by the bot,
 durably, not by Claude: Claude Code's own scheduling only lives as long as

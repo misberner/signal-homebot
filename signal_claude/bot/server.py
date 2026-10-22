@@ -28,7 +28,7 @@ from .core import (Store, Incoming, Reaction, RemoteDelete, Denied, ClaudeError,
                    parse_signal_event, validate_action, describe, build_schema, parse_verdict,
                    CLASSIFIER_SCHEMA, WRITABLE_DOMAINS,
                    parse_claude_output, identity_trusted, group_roster_problem, parse_when, local_time,
-                   APPROVAL_TTL, REMIND, TASK, REPEATS, MAX_TASKS, SCHEDULE_GRACE)
+                   APPROVAL_TTL, REMIND, TASK, REPEATS, MAX_TASKS, MAX_GRANTS, SCHEDULE_GRACE)
 from .household import Household, HouseholdStore
 from .ha_tools import HaTools
 
@@ -48,6 +48,7 @@ TOOL_LABELS = {'search_entities': '🔎 Searching', 'get_states': '📊 Reading'
                'get_history': '📈 History', 'get_live_context': '🏠 Reading the home',
                'get_dashboard': '🗂️ Dashboard', 'get_automation_config': '⚙️ Automation',
                'get_script_config': '📜 Script', 'get_image': '🖼️ Image'}
+EVERY = {'once': '', 'daily': ', then daily', 'weekdays': ', then on weekdays', 'weekly': ', then weekly'}
 ORDER_MARGIN_MS = 20
 MAX_ORDER_WAIT = 3.0  # seconds; a phone clock further ahead than this is not waited for
 CLASSIFIER_SYSTEM = """You review one proposed smart-home action before a household bot performs it.
@@ -463,7 +464,7 @@ class HomeBot:
         return state
 
     async def classify(self, msg: Incoming, task: dict | None, service: str, data: dict,
-                       run_at: int | None, state: dict) -> tuple[str, str]:
+                       run_at: int | None, state: dict, granted: bool = False) -> tuple[str, str]:
         """Ask the reviewer (a separate Claude call without tools or chat history)
         whether this exact action fits the household rules: allow, ask or deny."""
         user = self.roles.get(msg.sender, 'unknown')
@@ -474,7 +475,10 @@ class HomeBot:
             origin = (f'A scheduled task #{task["id"]} that {user} set up on {task.get("set_on", "?")} '
                       f'(repeat: {task.get("repeat", "once")}) is running now; nobody is watching live.\n'
                       f'Original request:\n<<UNTRUSTED>>\n{defuse(task.get("request", ""))}\n<<END-UNTRUSTED>>\n'
-                      f'Task prompt:\n<<UNTRUSTED>>\n{defuse(task.get("prompt", ""))}\n<<END-UNTRUSTED>>')
+                      f'Task prompt:\n<<UNTRUSTED>>\n{defuse(task.get("prompt", ""))}\n<<END-UNTRUSTED>>'
+                      + (f'\n{user} explicitly approved this service on this entity for the task when '
+                         'setting it up; deny only if this call breaks the rules or is clearly unsafe now.'
+                         if granted else ''))
         else:
             origin = f'Request:\n<<UNTRUSTED>>\n{defuse(msg.text)}\n<<END-UNTRUSTED>>'
         now = time.strftime('%A, %Y-%m-%d %H:%M %Z', time.localtime(self.clock()))
@@ -546,14 +550,20 @@ and actions (list).{notes}"""
                             'control something, still work out which entity and service it would be (look '
                             'it up), say so concretely, and that an admin can allow it in the HomeBot setup page.')
         capabilities += ('\nTo do something later, give the action "at": "YYYY-MM-DDTHH:MM" (local time, '
-                         'within 7 days); the user confirms now and it runs then. For reminders use '
+                         'within 7 days) and optionally "repeat": "daily|weekdays|weekly"; the user confirms '
+                         'once now and it runs then (and on every repeat). For reminders use '
                          '"reminders": [{"at": "...", "text": "..."}]: a fixed text posted then, no '
                          'confirmation needed. When something must be looked up or decided at that time '
                          '(e.g. "tell me at 7 whether it will rain", "every weekday at 22:00 tell me which '
                          'windows are open"), use "tasks": [{"at": "...", "prompt": "...", "repeat": '
                          '"once|daily|weekdays|weekly"}]: at that time you are run again with the prompt and '
                          'your answer is posted in this chat. Write the prompt as a self-contained instruction '
-                         'to your future self (what to check, what to report, and when to stay silent). To '
+                         'to your future self (what to check, what to report, and when to stay silent). "grants" '
+                         'lists every {"service", "entity_id"} the task may need to change when it runs (e.g. '
+                         'climate.set_temperature on the exact climate entity; look them up now), or [] if it '
+                         'only reports. The user approves the grants once when the task is set up; at run time '
+                         'only granted calls happen without asking, anything else waits for a confirmation '
+                         'nobody may be awake to give. To '
                          'cancel one of the user\'s scheduled items (a repeating task: its next run), list '
                          'its number in "cancel".')
         jobs = self.store.scheduled(request.sender)
@@ -807,39 +817,48 @@ Task prompt:
             try:
                 service, data = validate_action(proposal, self.house.deny, self.house.active_allow)
                 run_at = parse_when(proposal.get('at'), self.clock())
+                repeat = proposal.get('repeat') or 'once'
+                if repeat not in REPEATS:
+                    raise Denied('repeat must be once, daily, weekdays or weekly')
+                if repeat != 'once' and not run_at:
+                    raise Denied('a repeating action needs a start time')
             except Denied as err:
                 notes.append(f'Not allowed: {err}.')
                 continue
-            key = (service, json.dumps(data, sort_keys=True), run_at)
+            key = (service, json.dumps(data, sort_keys=True), run_at, repeat)
             if key in seen:
                 continue
             seen.add(key)
-            what = describe(service, data) + (f' at {local_time(run_at)}' if run_at else '')
+            what = describe(service, data) + (f' at {local_time(run_at)}{EVERY[repeat]}' if run_at else '')
             try:
                 state = await self.ha_state(data['entity_id'])
             except Denied as err:
                 notes.append(f'Not allowed: {err}.')
                 continue
-            decision, reason = await self.classify(msg, task, service, data, run_at, state)
-            LOG.info('Reviewer decision: %s', decision)
+            # A running task may do what the user approved when setting it up.
+            granted = task is not None and not run_at and {'service': service, 'entity_id': data['entity_id']} \
+                in (task.get('grants') or [])
+            decision, reason = await self.classify(msg, task, service, data, run_at, state, granted)
+            LOG.info('Reviewer decision: %s%s', decision, ' (granted)' if granted else '')
             if decision == 'deny':
                 notes.append(f'Not doing {what}: {reason}')
                 continue
-            if decision == 'allow' and self.house.auto_approve:
+            if granted or (decision == 'allow' and self.house.auto_approve):
+                label = f'approved with task #{task["id"]}' if granted else f'auto-approved: {reason}'
                 if run_at:
-                    job = self.store.add_scheduled(msg.sender, msg.conv, service, data, run_at, self.now())
-                    notes.append(f'Scheduled #{job}: {what} (auto-approved: {reason}). /cancel {job} cancels.')
+                    job = self.store.add_scheduled(msg.sender, msg.conv, service, data, run_at, self.now(), repeat)
+                    notes.append(f'Scheduled #{job}: {what} ({label}). /cancel {job} cancels.')
                 else:
                     action_id = self.store.add_action(msg.sender, msg.conv, service, data, self.now())
                     status, detail, text = await self.perform(action_id, service, data)
                     self.store.finish_action(action_id, status, detail, [], self.now())
-                    notes.append(f'{text} (auto-approved: {reason})')
+                    notes.append(f'{text} ({label})')
                 continue
             where = 'in the group' if msg.group else ('by a scheduled task' if task else 'here')
             self.store.add_approval(
                 secrets.token_urlsafe(9), msg.sender, msg.conv, service, data, self.now(),
                 f'Shall I {what} (asked {where})?\nCheck: {reason}\n'
-                f'Reply "yes" or react 👍 within {APPROVAL_TTL // 60} minutes; "no" or 👎 cancels.', run_at)
+                f'Reply "yes" or react 👍 within {APPROVAL_TTL // 60} minutes; "no" or 👎 cancels.', run_at, repeat)
             notes.append(f'Proposed: {what}. Confirm it in your private chat with me.'
                          if msg.group or (task and not msg.conv.startswith('dm:'))
                          else f'Proposed: {what}. Waiting for your yes.')
@@ -848,6 +867,7 @@ Task prompt:
             notes.append('(A scheduled task cannot set up further tasks or reminders.)')
         for item in result['tasks'][:3]:
             prompt, repeat = item.get('prompt'), item.get('repeat', 'once')
+            grants = []
             try:
                 run_at = parse_when(item.get('at'), self.clock())
                 if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1000 or run_at is None:
@@ -856,15 +876,36 @@ Task prompt:
                     raise Denied('repeat must be once, daily, weekdays or weekly')
                 if sum(1 for j in self.store.scheduled(msg.sender) if j[3] == TASK) >= MAX_TASKS:
                     raise Denied(f'you already have {MAX_TASKS} scheduled tasks')
+                requested = item.get('grants') or []
+                if requested and not writes:
+                    raise Denied('changes are switched off')
+                for grant in requested[:MAX_GRANTS]:
+                    if not isinstance(grant, dict):
+                        raise Denied('malformed grant')
+                    service, data = validate_action({'service': grant.get('service'),
+                                                     'entity_id': grant.get('entity_id'), 'data': {}},
+                                                    self.house.deny, self.house.active_allow)
+                    await self.ha_state(data['entity_id'])
+                    if (pair := {'service': service, 'entity_id': data['entity_id']}) not in grants:
+                        grants.append(pair)
             except Denied as err:
                 notes.append(f'No task: {err}.')
                 continue
             data = {'prompt': prompt.strip(), 'repeat': repeat, 'request': msg.text[:500],
                     'set_on': local_time(self.clock())}
+            if grants:  # a standing permission: always confirmed by the user, even in auto mode
+                data['grants'] = grants
+                self.store.add_approval(
+                    secrets.token_urlsafe(9), msg.sender, msg.conv, TASK, data, self.now(),
+                    f'Shall I set up {describe(TASK, data)}, first at {local_time(run_at)}{EVERY[repeat]}?\n'
+                    'The task may then do these without asking you each time; your rules, the lists '
+                    'and the reviewer still apply.\n'
+                    f'Reply "yes" or react 👍 within {APPROVAL_TTL // 60} minutes; "no" or 👎 cancels.', run_at)
+                notes.append('Task proposed. Confirm it in your private chat with me.'
+                             if msg.group else 'Task proposed. Waiting for your yes.')
+                continue
             job = self.store.add_scheduled(msg.sender, msg.conv, TASK, data, run_at, self.now())
-            every = {'once': '', 'daily': ', then daily', 'weekdays': ', then on weekdays',
-                     'weekly': ', then weekly'}[repeat]
-            notes.append(f'Task #{job} set for {local_time(run_at)}{every}. /cancel {job} stops it.')
+            notes.append(f'Task #{job} set for {local_time(run_at)}{EVERY[repeat]}. /cancel {job} stops it.')
         for reminder in result['reminders'][:3]:
             text = reminder.get('text')
             try:
@@ -899,14 +940,23 @@ Task prompt:
             return
         action_id, request_conv, service, data, run_at = approval
         what = describe(service, data)
+        every = EVERY.get(self.store.repeat_of(action_id), '')
         try:
-            self.recheck(sender, service, data)
+            for grant in (data.get('grants') or []) if service == TASK else [None]:
+                if grant is None:
+                    self.recheck(sender, service, data)
+                else:
+                    self.recheck(sender, grant['service'], {'entity_id': grant['entity_id']})
         except Denied as err:
             self.store.finish_action(action_id, 'failed', str(err), [(conv, f'Not executed: {err}.')], self.now())
             self.outbox_wake.set()
             return
+        if service == TASK:
+            self.enqueue((conv, f'Task #{action_id} set for {local_time(run_at)}{every}. '
+                                f'/cancel {action_id} stops it.'))
+            return
         if run_at:
-            self.enqueue((conv, f'Scheduled #{action_id}: {what} at {local_time(run_at)}. '
+            self.enqueue((conv, f'Scheduled #{action_id}: {what} at {local_time(run_at)}{every}. '
                                 f'/scheduled lists, /cancel {action_id} cancels.'))
             return
         await self.execute(action_id, sender, conv, request_conv, service, data)
@@ -1036,15 +1086,17 @@ Task prompt:
                 except Denied as err:
                     self.store.finish_action(action_id, 'failed', str(err), [(dm, (
                         f'Scheduled #{action_id} not executed: {err}.'))], self.now())
+                    self.store.repeat_task(action_id, self.now())
                     self.outbox_wake.set()
                     continue
                 await self.execute(action_id, sender, dm, request_conv, service, data, f'Scheduled #{action_id}: ')
+                self.store.repeat_task(action_id, self.now())
             await asyncio.sleep(interval)
 
     async def run_task(self, action_id: int, sender: str, dest: str, data: dict) -> None:
         """Run a due scheduled task: Claude gets the task's prompt, clearly marked as
         a schedule firing (not a new message), and its answer is posted in the chat.
-        Proposed actions still need the user's confirmation."""
+        Actions the user granted when setting up the task run without asking."""
         msg = Incoming(sender=sender, conv=dest, group=dest.startswith('group:'),
                        timestamp=int(self.clock() * 1000), text=f'(scheduled task #{action_id})')
         async with self.lock:

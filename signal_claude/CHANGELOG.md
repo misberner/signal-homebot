@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0 — 2026-10-22
+
+### Added
+- **Repeating actions**: an action with `at` can repeat (daily, weekdays,
+  weekly); it is confirmed once and every run happens without asking (the
+  switch, allowlist and denylist are re-checked each time).
+- **Task grants**: a scheduled task lists the calls it may need
+  (`grants`: service + entity). Such a task is confirmed once when set up
+  (also in auto mode); when it runs, granted calls happen without asking
+  (allowlist/denylist checked, the reviewer is told about the grant and can
+  still deny). Other proposals are asked as before.
+
 ## 0.10.2 — 2026-10-22
 
 ### Fixed
