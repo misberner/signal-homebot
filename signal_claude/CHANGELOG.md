@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.2 — 2026-10-22
+
+### Fixed
+- Updating from before 0.10 no longer widens what the bot may change: a
+  non-empty old action table becomes an active allowlist of its entities
+  (instead of being dropped).
+
 ## 0.10.1 — 2026-10-22
 
 ### Added
@@ -22,9 +29,8 @@
   request, the exact call and the entity's state, and answers allow / ask /
   deny. "ask" (and any reviewer failure) asks the requester to confirm as
   before; "allow" runs without asking only when **Auto mode** is on (off by
-  default). Settings from earlier versions load; their action table is
-  dropped, so changes are asked or denied by the reviewer until you write
-  rules.
+  default). Settings from earlier versions load (see 0.10.2 for the action
+  table).
 
 ### Fixed
 - **Replies sorted above the request** (seen on Signal Desktop): Signal

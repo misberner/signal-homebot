@@ -12,7 +12,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from .core import NAME_RE, Settings, load_deny
+from .core import DENY_RE, NAME_RE, Settings, load_deny
 
 ACI_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 PHONE_RE = r'\+[1-9][0-9]{6,14}'
@@ -104,8 +104,8 @@ class Household:
 
     @classmethod
     def from_json(cls, data: object) -> 'Household':
-        if isinstance(data, dict):
-            data = {k: v for k, v in data.items() if k != 'actions'}  # the pre-0.10 action table
+        if isinstance(data, dict) and 'actions' in data:
+            data = migrate_actions(data)
         if not isinstance(data, dict) or set(data) - set(cls.__dataclass_fields__):
             raise HouseholdError('Unknown settings')
         try:
@@ -123,6 +123,21 @@ class Household:
                 raise HouseholdError(f'{key} has the wrong type')
         house.validate()
         return house
+
+
+def migrate_actions(data: dict) -> dict:
+    """Settings from before 0.10 had an action table. Keep its scope: if it
+    had entries, their entities become an active allowlist."""
+    actions = data.get('actions')
+    data = {k: v for k, v in data.items() if k != 'actions'}
+    entities = []
+    for rule in actions if isinstance(actions, list) else []:
+        for entity in (rule.get('entities') or []) if isinstance(rule, dict) else []:
+            if isinstance(entity, str) and re.fullmatch(DENY_RE, entity) and entity not in entities:
+                entities.append(entity)
+    if actions and 'allowlist_on' not in data:
+        data['allowlist_on'], data['allow'] = True, entities
+    return data
 
 
 class HouseholdStore:

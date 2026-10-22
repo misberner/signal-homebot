@@ -240,9 +240,16 @@ class HouseholdTests(unittest.TestCase):
                               allowlist_on=True, allow=['light.*'])
             store.save(house)
             self.assertEqual(store.load(), house)
-            # Settings from before 0.10 (with an action table) still load; the table is dropped.
-            store.path.write_text(json.dumps({**house.to_json(), 'actions': [{'service': 'light.turn_on'}]}))
-            self.assertEqual(store.load(), house)
+            # Settings from before 0.10 still load; a non-empty action table becomes an active
+            # allowlist of its entities, so the scope never grows on update.
+            old = {k: v for k, v in house.to_json().items() if k not in ('allowlist_on', 'allow')}
+            store.path.write_text(json.dumps({**old, 'actions': [
+                {'service': 'light.turn_on', 'entities': ['light.*'], 'senders': ['malte']},
+                {'service': 'water_heater.set_operation_mode', 'entities': ['water_heater.dhw', 'light.*']}]}))
+            migrated = store.load()
+            self.assertEqual((migrated.allowlist_on, migrated.allow), (True, ['light.*', 'water_heater.dhw']))
+            store.path.write_text(json.dumps({**old, 'actions': []}))
+            self.assertEqual((store.load().allowlist_on, store.load().allow), (False, []))
             self.assertEqual(oct(store.path.stat().st_mode & 0o777), '0o600')
             for bad in ({'allow_writes': 'yes'}, {'surprise': 1}, {'command_max_age': True}, []):
                 store.path.write_text(json.dumps(bad if isinstance(bad, list) else {**house.to_json(), **bad}))
