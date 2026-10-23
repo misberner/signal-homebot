@@ -1,6 +1,6 @@
 name: "Signal HomeBot (Claude)"
 description: "Private Signal bot powered by Claude Code and Home Assistant MCP"
-version: "0.17.0"
+version: "0.18.0"
 slug: "signal_claude"
 url: "https://github.com/misberner/signal-homebot"
 arch:

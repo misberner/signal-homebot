@@ -1,0 +1,9 @@
+{
+  "name": "homebot-render",
+  "private": true,
+  "description": "Renders Home Assistant cards with Home Assistant's own frontend in headless Chromium.",
+  "type": "module",
+  "dependencies": {
+    "puppeteer-core": "25.12.0"
+  }
+}

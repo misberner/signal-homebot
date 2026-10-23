@@ -2,7 +2,7 @@
 # Base image pinned by digest (node:22-trixie-slim, multi-arch index).
 FROM node:22-trixie-slim@sha256:8eb619e402eaede1748a3c8173bffab391592812e85136452f781741c7242ddf
 
-ARG BUILD_VERSION=0.17.0
+ARG BUILD_VERSION=0.18.0
 ARG BUILD_ARCH=amd64
 LABEL io.hass.version="${BUILD_VERSION}" \
       io.hass.type="app" \
@@ -10,6 +10,7 @@ LABEL io.hass.version="${BUILD_VERSION}" \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv curl ca-certificates util-linux openjdk-25-jre-headless tzdata \
+      chromium fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # One unprivileged user per process (node, uid 1000, comes with the image and
@@ -17,7 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd --system signal && useradd --system --gid signal --home-dir /data/signal \
       --no-create-home --shell /usr/sbin/nologin signal && \
     groupadd --system homebot && useradd --system --gid homebot --home-dir /data/homebot \
-      --no-create-home --shell /usr/sbin/nologin homebot
+      --no-create-home --shell /usr/sbin/nologin homebot && \
+    groupadd --system render && useradd --system --gid render --home-dir /nonexistent \
+      --no-create-home --shell /usr/sbin/nologin render
 
 # signal-cli's Java distribution on Debian's Java 25. Not the Linux-native
 # build: that one requires x86-64-v3 CPUs and fails on older HA boxes with
@@ -42,6 +45,10 @@ WORKDIR /opt/homebot
 COPY requirements.lock /opt/homebot/
 RUN python3 -m venv /opt/homebot/.venv && \
     /opt/homebot/.venv/bin/pip install --no-cache-dir --retries 5 --no-deps -r requirements.lock
+# Renders Home Assistant cards with HA's own frontend in headless Chromium.
+COPY render/package.json render/package-lock.json /opt/homebot/render/
+RUN cd /opt/homebot/render && npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY render/render.mjs /opt/homebot/render/
 COPY bot/ /opt/homebot/bot/
 COPY scripts/ /opt/homebot/scripts/
 COPY run.sh /run.sh

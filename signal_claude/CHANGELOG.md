@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.18.0 — 2026-10-23
+
+### Changed
+- **Charts are Home Assistant's own cards**: Claude proposes a card (energy
+  sankey, energy distribution, power sankey, statistics/history graphs,
+  gauges, …) and Home Assistant's frontend draws it in headless Chromium
+  (render broker, own `render` user, logged in with `ha_token`, HA's origin
+  only). Dashboard views are rendered the same way. Only display cards are
+  allowed. Replaces the matplotlib charts and the self-drawn energy flow.
+- **One message**: an answer with pictures is sent as one message and the
+  "working on it" message is deleted (Signal edits can't add pictures).
+
 ## 0.17.0 — 2026-10-23
 
 ### Added

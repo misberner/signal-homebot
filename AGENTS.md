@@ -34,7 +34,9 @@ This repository is an agent connected to **physical home devices**.
   rate limited; event prompts are read-only. The HA WebSocket connection only
   subscribes to events; never send commands over it.
 - Process users: signal-cli = `signal`, bot = `homebot`, Claude broker +
-  Claude = `node`; root only in `run.sh`. Never give the bot the Claude token
+  Claude = `node`, card renderer (headless Chromium) = `render`; root only in
+  `run.sh`. Cards Claude proposes are limited to `bot/cards.py` (display cards
+  only), checked by the bot and the render broker. Never give the bot the Claude token
   or let it run Claude directly; flags live in `bot/claude_broker.py`.
 - Senders must have verified identity keys (`listIdentities`), and the group
   roster must contain only the bot and configured users before anything is

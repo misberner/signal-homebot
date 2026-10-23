@@ -407,7 +407,7 @@ class StoreTests(unittest.TestCase):
 
     def test_outbox_backoff_and_dead_letter(self):
         self.db.enqueue([('dm:' + USER1, 'hi')], self.now)
-        [(item, _, _, attempts, created, _, _)] = self.db.due_outbox(self.now)
+        [(item, _, _, attempts, created, _, _, _)] = self.db.due_outbox(self.now)
         self.assertEqual(self.db.outbox_failed(item, attempts, created, 'E', self.now), 'pending')
         self.assertEqual(self.db.due_outbox(self.now), [])
         self.assertEqual(len(self.db.due_outbox(self.now + 5)), 1)
@@ -569,80 +569,32 @@ class PhotoParseTests(unittest.TestCase):
         self.assertIsNone(image_type(b'<svg xmlns="http://www.w3.org/2000/svg"/>'))
 
 
-class ChartUnitTests(unittest.TestCase):
-    def test_parse_and_render(self):
-        try:
-            import matplotlib  # noqa: F401
-        except ImportError:
-            self.skipTest('matplotlib not installed')
-        from datetime import datetime, timedelta
-        from bot.charts import statistics_series, history_series, render, check_spec, period_for, ChartError
-        now = int(time.time() * 1000)
-        stats = json.dumps({'data': {'entities': [
-            {'entity_id': 'sensor.p', 'statistics': [{'start': now - 600000, 'end': now - 300000, 'mean': 1.0,
-                                                       'min': 0.5, 'max': 2.0}]},
-            {'entity_id': 'sensor.e', 'statistics': [{'start': now - 3600000, 'end': now, 'change': 0.4, 'sum': 9}]},
-            {'entity_id': 'sensor.none', 'statistics': []}]}})
-        found = statistics_series(stats, {'sensor.p': {'label': 'P', 'unit': 'kW'}})
-        self.assertEqual({k: v.kind for k, v in found.items()}, {'sensor.p': 'band', 'sensor.e': 'bars'})
-        hist = json.dumps({'data': {'entities': [
-            {'entity_id': 'binary_sensor.w', 'states': [{'state': 'on', 'last_changed': '2026-10-23T10:00:00+02:00'},
-                                                        {'state': 'unavailable', 'last_changed': '2026-10-23T11:00:00+02:00'}]},
-            {'entity_id': 'sensor.t', 'states': [{'state': '21.5', 'last_changed': '2026-10-23T10:00:00+02:00'},
-                                                 {'state': 'x', 'last_changed': '2026-10-23T11:00:00+02:00'}]}]}})
-        found.update(history_series(hist, {}))
-        self.assertEqual((found['binary_sensor.w'].kind, found['binary_sensor.w'].y), ('binary', [1.0]))
-        self.assertEqual((found['sensor.t'].kind, found['sensor.t'].y), ('step', [21.5]))
-        end = datetime.now().astimezone()
-        png = render('t', list(found.values()), end - timedelta(hours=30), end)
-        self.assertTrue(png.startswith(b'\x89PNG'))
-        with self.assertRaises(ChartError):
-            render('t', [], end, end)
-        self.assertEqual([period_for(h) for h in (24, 72, 73, 1080, 1081)], ['5minute', '5minute', 'hour', 'hour', 'day'])
-        self.assertEqual(check_spec({'title': 'a', 'entity_ids': ['sensor.p', 'sensor.p'], 'hours': 2}),
-                         ('a', ['sensor.p'], 2))
-        for bad in ({'entity_ids': [], 'hours': 1}, {'entity_ids': ['sensor.p'], 'hours': True},
-                    {'entity_ids': ['sensor.p'] * 7, 'hours': 1}, {'entity_ids': ['sensor.p'], 'hours': 1, 'x': 1}):
-            with self.assertRaises(ChartError):
-                check_spec(bad)
-
-
-class EnergyFlowUnitTests(unittest.TestCase):
-    def test_split_flows(self):
-        from bot.charts import split_flows
-        f = split_flows(solar=18.4, grid_in=3.1, grid_out=6.2, battery_in=5.0, battery_out=4.2)
-        self.assertAlmostEqual(f['solar_grid'], 6.2)
-        self.assertAlmostEqual(f['solar_battery'], 5.0)
-        self.assertAlmostEqual(f['solar_home'], 7.2)
-        self.assertAlmostEqual(f['grid_home'], 3.1)
-        self.assertAlmostEqual(f['battery_home'], 4.2)
-        # Exports beyond solar come from the battery; charging beyond solar from the grid.
-        f = split_flows(solar=1.0, grid_in=2.0, grid_out=1.5, battery_in=0.5, battery_out=2.0)
-        self.assertEqual((f['solar_grid'], f['battery_grid'], f['solar_battery'], f['grid_battery']),
-                         (1.0, 0.5, 0.0, 0.5))
-        self.assertEqual((f['battery_home'], f['grid_home']), (1.5, 1.5))
-        self.assertTrue(all(v >= 0 for v in split_flows(-1, -1, 5, 5, -1).values()))
-
-    def test_energy_sensors_both_formats(self):
-        from bot.charts import energy_sensors, find_energy_sources
-        old = {'energy_sources': [{'type': 'grid', 'flow_from': [{'stat_energy_from': 'sensor.a'}],
-                                   'flow_to': [{'stat_energy_to': 'sensor.b'}]},
-                                  {'type': 'gas', 'stat_energy_from': 'sensor.gas'}]}
-        new = {'result': {'prefs': {'energy_sources': [{'type': 'grid', 'stat_energy_from': 'sensor.a',
-                                                        'stat_energy_to': 'sensor.b', 'stat_rate': 'sensor.p'}]}}}
-        for prefs in (old, new):
-            roles = energy_sensors(find_energy_sources(json.dumps(prefs)))
-            self.assertEqual((roles['grid_in'], roles['grid_out']), (['sensor.a'], ['sensor.b']))
-        self.assertEqual(roles['grid_rate'], ['sensor.p'])
-        self.assertEqual(energy_sensors(find_energy_sources('{"energy_sources": [{"type": "solar", '
-                                                            '"stat_energy_from": "x; rm"}]}'))['solar'], [])
-
-    def test_render_flow(self):
-        try:
-            import matplotlib  # noqa: F401
-        except ImportError:
-            self.skipTest('matplotlib not installed')
-        from bot.charts import render_flow
-        png = render_flow('t', {'solar': 1, 'grid_in': 2, 'grid_out': 0, 'battery_in': 0, 'battery_out': 0},
-                          'kWh', {'solar', 'grid'})
-        self.assertTrue(png.startswith(b'\x89PNG'))
+class CardCheckTests(unittest.TestCase):
+    def test_allowed_cards_and_requests(self):
+        from bot.cards import CardError, check_card, check_request
+        ok = [{'type': 'energy-sankey'}, {'type': 'statistics-graph', 'entities': ['sensor.p'], 'chart_type': 'bar',
+                                          'period': 'hour', 'days_to_show': 2, 'stat_types': ['change']},
+              {'type': 'horizontal-stack', 'cards': [{'type': 'gauge', 'entity': 'sensor.t', 'min': 0, 'max': 30}]},
+              {'type': 'entities', 'entities': ['light.a', {'entity': 'sensor.b', 'name': 'B'}]}]
+        for card in ok:
+            self.assertEqual(check_card(card), card)
+        bad = [{'type': 'markdown', 'content': 'x'}, {'type': 'custom:x'}, {'type': 'picture', 'image': '/local/a.png'},
+               {'type': 'sensor', 'entity': 'sensor.a', 'card_mod': {'style': 'x'}},
+               {'type': 'tile', 'entity': 'light.a', 'tap_action': {'action': 'toggle'}},
+               {'type': 'entities', 'entities': [{'type': 'weblink', 'url': 'https://x'}]},
+               {'type': 'sensor', 'entity': 'sensor.a', 'name': '{{ states("sensor.secret") }}'},
+               {'type': 'vertical-stack', 'cards': [{'type': 'vertical-stack', 'cards': [
+                   {'type': 'vertical-stack', 'cards': [{'type': 'vertical-stack', 'cards': [{'type': 'sensor'}]}]}]}]},
+               {'type': 'grid', 'cards': []}, 'energy-sankey', {'type': 'sensor', 'name': 'x' * 7000}]
+        for card in bad:
+            with self.assertRaises(CardError, msg=card):
+                check_card(card)
+        self.assertEqual(check_request({'card': {'type': 'energy-sankey'}, 'period': 'now-30d', 'language': 'de'}),
+                         {'card': {'type': 'energy-sankey'}, 'period': 'now-30d', 'language': 'de'})
+        self.assertEqual(check_request({'dashboard': 'lovelace/0'})['dashboard'], 'lovelace/0')
+        for req in ({'card': {'type': 'energy-sankey'}, 'period': 'last_decade'},
+                    {'card': {'type': 'energy-sankey'}, 'language': 'de"><script>'},
+                    {'dashboard': 'config/users'}, {'dashboard': 'developer-tools/state'},
+                    {'dashboard': '../api/states'}, {'dashboard': 'a-b', 'card': {'type': 'sensor'}}, {'x': 1}):
+            with self.assertRaises(CardError, msg=req):
+                check_request(req)

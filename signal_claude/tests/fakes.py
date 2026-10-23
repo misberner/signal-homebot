@@ -81,6 +81,7 @@ class FakeSignalDaemon:
         self.reject_edits = False
         self.profile_names: dict[str, str] = {}
         self.attachments: dict[str, bytes] = {}  # downloaded attachments by id
+        self.deleted: list[int] = []  # timestamps of remote-deleted messages
         self.edits: list[tuple[int, str]] = []
         self.runner: web.AppRunner | None = None
         self.url = ''
@@ -138,6 +139,14 @@ class FakeSignalDaemon:
             if params.get('id') not in self.attachments or not (params.get('recipient') or params.get('groupId')):
                 return error(f'Could not find attachment with ID: {params.get("id")}')
             return ok({'data': base64.b64encode(self.attachments[params['id']]).decode()})
+        if method == 'remoteDelete':  # RemoteDeleteCommand: targetTimestamp + recipient|groupId
+            target = params.get('targetTimestamp')
+            before = len(self.sent)
+            self.sent = [m for m in self.sent if m['_ts'] != target]
+            if len(self.sent) == before:
+                return error('Message not found')
+            self.deleted.append(target)
+            return ok({'timestamp': target, 'results': [{'type': 'SUCCESS'}]})
         if method in ('sendTyping', 'sendReceipt'):
             self.indicators.append((method, params))
             return ok({})

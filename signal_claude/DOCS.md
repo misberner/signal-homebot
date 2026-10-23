@@ -26,7 +26,7 @@ Python 3.13 and the bot in one amd64 container. See
 | `claude_oauth_token` | Run `claude setup-token` on your computer (Claude Pro/Max login, not an API key), paste the result. Never post it in chats or git. |
 | `ha_mcp_kind`, `ha_mcp_url` | How the bot reads Home Assistant, see [Reading Home Assistant](#reading-home-assistant). |
 | `ha_mcp_domains` | Domains for the overview tool (default `light,climate,cover,weather`). |
-| `ha_token` | Long-lived token of a **non-admin** HA user. Needed for writes, and for the built-in MCP server. |
+| `ha_token` | Long-lived token of a **non-admin** HA user. Needed for writes, for pictures of cards and dashboards (the renderer logs in to the frontend with it), and for the built-in MCP server. |
 | `ha_base_url` | Usually `http://homeassistant:8123`. |
 | `notify_token` | Optional, for n8n/automation notifications (≥ 32 random characters). |
 | `ha_user_tokens` | Optional: per person (`user` = their name on the setup page) a long-lived token of their own HA user. Changes they ask for are then made with it, so HA's logbook shows them, not the bot, and automations can tell who it was (`context.user_id`). Everyone else uses `ha_token`. This changes attribution only: what the bot may do is decided by the permission list, not by HA user rights. |
@@ -233,27 +233,23 @@ line too (e.g. `deny climate.*` and `review script.heizung_*`).
   that one request sees them: the history keeps just "[photo]". signal-cli
   keeps received attachments in its data folder (`/data/signal`). View-once
   photos, voice notes and other files are ignored.
-- Claude can **send pictures** back: camera snapshots, `image.*` entities
-  ("show me the front door") and dashboard screenshots ("show me the power
-  use today": a dashboard or one of its views), up to 3, as a message after
-  the answer (needs ha-mcp). The history notes only that pictures were sent.
-  Dashboard screenshots need ha-mcp's *dashboard screenshot* beta feature and
-  its rendering engine (balloob's Puppet app), see ha-mcp's `docs/beta.md`.
-- **Charts**: for "power use today", "temperatures this week" or "when did
-  the washing machine run", Claude names up to 6 entities and a span (up to
-  90 days); the bot draws the chart itself from HA's long-term statistics
-  (5-minute, hourly or daily mean with min/max band; energy counters as bars
-  per period) or, for entities without statistics such as on/off sensors,
-  the state history. Needs ha-mcp.
-- **Energy flow** ("Energiefluss heute"): boxes for solar, grid, battery and
-  home with arrows sized by what flowed, for now, today, yesterday, the last
-  week or month. The sensors come from HA's energy dashboard settings (read
-  by the bot with ha-mcp's `ha_manage_energy_prefs` in mode `get` only; Claude
-  never gets that tool), the amounts from HA's hourly statistics. Who
-  supplied whom is split the way HA's energy card does it (exports and
-  battery charging come from solar first). "Now" needs power sensors for each
-  part in the energy settings (grid positive = import, battery positive =
-  discharging).
+- Claude can **send pictures** with its answer (one message; the "⏳"
+  message is deleted):
+  - camera snapshots and `image.*` entities ("show me the front door");
+  - **Home Assistant cards**, drawn by Home Assistant's own frontend exactly
+    as on a dashboard: the energy sankey ("Energiefluss heute"), energy
+    distribution, energy usage, power sankey ("right now"), statistics and
+    history graphs, gauges, entities, tiles, thermostats, weather and stacks
+    of them, with a period for the energy cards (today, yesterday, this
+    week/month/year, last 7/30 days, last 12 months);
+  - a whole dashboard view ("dashboard:dashboard-heating/raume").
+
+  Claude proposes the card configuration; the bot and the render broker
+  allow only these display cards (no custom cards, markdown/templates,
+  iframes, pictures, maps, links or actions). Rendering runs headless
+  Chromium as its own `render` user, logged in with `ha_token`; it may only
+  load Home Assistant's own pages. The cards show what that HA user may see,
+  in Home Assistant's language. A picture takes a few seconds.
 - While working, the bot marks your message read, shows "typing…" and posts
   one "⏳ Looking into it…" message. It updates that message as Claude looks
   things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.

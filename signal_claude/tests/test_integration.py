@@ -8,6 +8,7 @@ import dataclasses
 import json
 import os
 import socket
+import sys
 import tempfile
 import time
 import unittest
@@ -22,6 +23,7 @@ except ImportError:  # pragma: no cover
 
 if aiohttp:
     from bot.claude_broker import Broker
+    from bot.render_broker import RenderBroker
     from bot.core import Incoming
     from bot.household import Household, HouseholdError, HouseholdStore
     from bot.server import Config, HomeBot
@@ -37,6 +39,20 @@ def household(**changes):
                 groups={'home': GROUP}, allow_writes=True)
     base.update(changes)
     return Household(**base)
+
+
+FAKE_RENDER = '''#!{python}
+import base64, json, os, sys
+request = json.load(sys.stdin)
+with open({record!r}, 'a') as f:
+    f.write(json.dumps({{'request': request, 'ha_url': os.environ.get('HA_URL'),
+                        'token': os.environ.get('HA_TOKEN'), 'chromium': os.environ.get('CHROMIUM')}}) + '\\n')
+card = request.get('card') or {{}}
+if card.get('entities') == ['sensor.broken']:
+    print(json.dumps({{'error': 'Home Assistant could not show this card'}}))
+else:
+    print(json.dumps({{'png': base64.b64encode(b'\\x89PNG\\r\\n\\x1a\\n' + json.dumps(request).encode()).decode()}}))
+'''
 
 
 @unittest.skipUnless(aiohttp, 'integration tests need aiohttp and mcp (pip install -r requirements.lock)')
@@ -62,6 +78,14 @@ class Integration(unittest.IsolatedAsyncioTestCase):
                              claude_bin=str(self.claude.path), timeout=self.claude_timeout,
                              mcp_url=f'http://127.0.0.1:{self.proxy_port}/mcp')
         self.broker_server = await self.broker.serve(self.socket)
+        # The render broker with a stand-in for headless Chromium (records requests).
+        self.render_socket = os.path.join(self._sockdir.name, 'r.sock')
+        self.renders = self.dir / 'renders.jsonl'
+        fake_render = self.dir / 'fake-render'
+        fake_render.write_text(FAKE_RENDER.format(python=sys.executable, record=str(self.renders)))
+        fake_render.chmod(0o755)
+        self.render_broker = RenderBroker(ha_url=self.ha.url, ha_token=self.ha.token, command=(str(fake_render),))
+        self.render_server = await self.render_broker.serve(self.render_socket)
         self.now = time.time()
         self.households = HouseholdStore(str(self.dir / 'settings.json'))
         self.households.save(self.house())
@@ -74,6 +98,8 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         await self.ha.stop()
         self.broker_server.close()
         await self.broker_server.wait_closed()
+        self.render_server.close()
+        await self.render_server.wait_closed()
         self._sockdir.cleanup()
         for k, v in self._saved_env.items():
             if v is None:
@@ -87,7 +113,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
                       ha_url=self.ha.url, mcp_url=self.ha.mcp_url, ha_token=self.ha.token,
                       signal_url=self.signal.url, notify_token='n' * 40, ui_peer=None,
                       proxy_port=self.proxy_port, claude_socket=self.socket, claude_timeout=self.claude_timeout,
-                      ha_timeout=1)
+                      ha_timeout=1, render_socket=self.render_socket, render_configured=True)
         values.update(overrides)
         return Config(**values)
 
@@ -466,128 +492,77 @@ class PictureTests(Integration):
             'reply': 'Hier die Haustür.', 'actions': [], 'images': ['camera.front_door', 'image.vacuum_map',
                                                                     'light.test_lamp']}}))
         await self.deliver(sender=USER1, text='zeig mir die haustür')
-        msgs = self.signal.messages_to(f'dm:{USER1}')
-        self.assertTrue(msgs[0]['message'].startswith('Hier die Haustür.'))
-        self.assertIn('could not get a picture of light.test_lamp', msgs[0]['message'])
-        self.assertEqual(msgs[1]['message'], '')
-        self.assertEqual([a.split(';')[:2] for a in msgs[1]['attachments']],
+        # One message with text and pictures; the "working on it" message is deleted.
+        [msg] = self.signal.messages_to(f'dm:{USER1}')
+        self.assertTrue(msg['message'].startswith('Hier die Haustür.'))
+        self.assertIn('could not get a picture of light.test_lamp', msg['message'])
+        self.assertEqual([a.split(';')[:2] for a in msg['attachments']],
                          [['data:image/png', 'filename=camera_front_door.png'],
                           ['data:image/png', 'filename=image_vacuum_map.png']])
-        self.assertEqual(base64.b64decode(msgs[1]['attachments'][0].split('base64,')[1]), PNG)
+        self.assertEqual(base64.b64decode(msg['attachments'][0].split('base64,')[1]), PNG)
+        self.assertEqual(len(self.signal.deleted), 1)
         # The history only notes that pictures were sent.
         self.assertIn('[sent 2 picture(s)]', self.bot.store.context(f'dm:{USER1}', self.bot.now()))
         self.assertEqual(self.bot.store.db.execute(
             'SELECT COUNT(*) FROM outbox WHERE attachments IS NOT NULL').fetchone()[0], 0)
 
 
-class DashboardPictureTests(Integration):
-    async def test_dashboard_screenshot_sent_or_explained(self):
-        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
-        out = {'reply': 'Hier der Verlauf.', 'actions': [], 'images': ['dashboard:dashboard-energy/strom']}
-        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': out}))
-        await self.deliver(sender=USER1, text='zeig mir den stromverbrauch')
-        msgs = self.signal.messages_to(f'dm:{USER1}')
-        self.assertEqual(msgs[-1]['attachments'][0].split(';')[:2],
-                         ['data:image/png', 'filename=dashboard_dashboard-energy_strom.png'])
-        self.assertEqual(self.ha.mcp_args[-1], {'url_path': 'dashboard-energy', 'list_only': False,
-                                                'include_screenshot': True})
-        self.ha.screenshots = False
-        await self.deliver(sender=USER1, text='nochmal')
-        self.assertIn("dashboard screenshots are switched off in ha-mcp", self.dm(USER1)[-1])
-        for bad in ('dashboard:../x', 'dashboard:', 'dashboard:a/b/c'):
-            out['images'] = [bad]
-            self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': out}))
-            await self.deliver(sender=USER1, text=bad)
-            self.assertIn('could not get a picture', self.dm(USER1)[-1])
+class CardTests(Integration):
+    def answer(self, **output):
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {'reply': '', 'actions': [], **output}}))
 
+    def requests(self):
+        return [json.loads(line) for line in self.renders.read_text().splitlines()] if self.renders.exists() else []
 
-class ChartTests(Integration):
-    async def test_chart_from_statistics_and_history(self):
-        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
-        self.ha.states.update({'sensor.load_power': '0.7', 'binary_sensor.washer': 'off'})
-        self.ha.attributes.update({'sensor.load_power': {'unit_of_measurement': 'kW', 'friendly_name': 'Load'}})
-        self.ha.statistics['sensor.load_power'] = [{'mean': 0.5 + i % 3, 'min': 0.1, 'max': 4.0} for i in range(50)]
-        self.ha.history['binary_sensor.washer'] = [(7200, 'on'), (3600, 'off')]
-        out = {'reply': 'Hier der Verlauf.', 'actions': [], 'charts': [
-            {'title': 'Strom heute', 'entity_ids': ['sensor.load_power', 'binary_sensor.washer'], 'hours': 24}]}
-        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': out}))
-        await self.deliver(sender=USER1, text='zeig mir den stromverbrauch heute')
-        msgs = self.signal.messages_to(f'dm:{USER1}')
-        self.assertEqual(msgs[0]['message'], 'Hier der Verlauf.')
-        [chart] = msgs[1]['attachments']
-        self.assertTrue(chart.startswith('data:image/png;filename=strom_heute.png;base64,'))
-        self.assertTrue(base64.b64decode(chart.split('base64,')[1]).startswith(b'\x89PNG'))
-        stats, hist = [a for a in self.ha.mcp_args if a.get('source') in ('statistics', 'history')][-2:]
-        self.assertEqual((stats['source'], stats['period'], stats['start_time'], stats['limit']),
-                         ('statistics', '5minute', '24h', 1000))
-        self.assertEqual((hist['source'], hist['entity_ids']), ('history', ['binary_sensor.washer']))
-        # Bad specs and missing data are explained, not drawn.
-        for chart, why in (({'title': 'x', 'entity_ids': ['light.x; rm'], 'hours': 5}, '1-6 entities'),
-                           ({'title': 'x', 'entity_ids': ['sensor.nothing'], 'hours': 5}, 'no data'),
-                           ({'title': 'x', 'entity_ids': ['sensor.load_power'], 'hours': 99999}, 'hours')):
-            self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {**out, 'charts': [chart]}}))
-            await self.deliver(sender=USER1, text=why)
-            self.assertIn(f'No chart:', self.dm(USER1)[-1])
-            self.assertIn(why, self.dm(USER1)[-1])
+    async def test_cards_rendered_by_home_assistant(self):
+        self.answer(reply='Hier der Energiefluss.', cards=[
+            {'card': {'type': 'energy-sankey'}, 'period': 'yesterday'},
+            {'card': {'type': 'vertical-stack', 'cards': [{'type': 'history-graph', 'entities': ['sun.sun']}]},
+             'period': None}])
+        await self.deliver(sender=USER1, text='energiefluss gestern')
+        [msg] = self.signal.messages_to(f'dm:{USER1}')
+        self.assertEqual(msg['message'], 'Hier der Energiefluss.')
+        self.assertEqual([a.split(';')[1] for a in msg['attachments']],
+                         ['filename=energy-sankey.png', 'filename=vertical-stack.png'])
+        first, second = self.requests()
+        self.assertEqual(first['request'], {'card': {'type': 'energy-sankey'}, 'period': 'yesterday',
+                                            'language': None})
+        self.assertEqual((first['ha_url'], first['token'], first['chromium']), (self.ha.url, self.ha.token,
+                                                                                '/usr/bin/chromium'))
+        self.assertEqual(second['request']['card']['cards'][0]['type'], 'history-graph')
+        self.assertEqual(len(self.signal.deleted), 1)                   # the status message
 
+    async def test_unsafe_or_broken_cards_explained(self):
+        bad = [{'type': 'markdown', 'content': '{{ states.sensor | list }}'},
+               {'type': 'iframe', 'url': 'https://evil.example'},
+               {'type': 'custom:button-card'},
+               {'type': 'entities', 'entities': [{'entity': 'light.x', 'tap_action': {'action': 'toggle'}}]},
+               {'type': 'sensor', 'entity': 'sensor.x', 'name': 'https://evil.example/x.png'},
+               {'type': 'grid', 'cards': [{'type': 'iframe', 'url': 'x'}]}]
+        for card in bad:
+            self.answer(reply='Bitte.', cards=[{'card': card, 'period': None}])
+            await self.deliver(sender=USER1, text=card['type'])
+            self.assertIn('I could not show that card', self.dm(USER1)[-1])
+        self.assertEqual(self.requests(), [])                           # never reached the browser
+        self.answer(reply='Bitte.', cards=[{'card': {'type': 'history-graph', 'entities': ['sensor.broken']}}])
+        await self.deliver(sender=USER1, text='kaputt')
+        self.assertIn('Home Assistant could not show this card', self.dm(USER1)[-1])
 
-class EnergyFlowTests(Integration):
-    PREFS = {'energy_sources': [
-        {'type': 'grid', 'flow_from': [{'stat_energy_from': 'sensor.grid_import', 'stat_cost': None}],
-         'flow_to': [{'stat_energy_to': 'sensor.grid_export'}], 'cost_adjustment_day': 0},
-        {'type': 'solar', 'stat_energy_from': 'sensor.pv_energy', 'stat_rate': 'sensor.pv_power'},
-        {'type': 'battery', 'stat_energy_from': 'sensor.bat_out', 'stat_energy_to': 'sensor.bat_in'}],
-        'device_consumption': []}
+    async def test_dashboard_view_rendered(self):
+        self.answer(reply='Das Dashboard.', images=['dashboard:dashboard-heating/raume', 'dashboard:config/users',
+                                                    'dashboard:developer-tools/state'])
+        await self.deliver(sender=USER1, text='zeig mir das heizungsdashboard')
+        [msg] = self.signal.messages_to(f'dm:{USER1}')
+        self.assertEqual(len(msg['attachments']), 1)
+        self.assertEqual(self.requests()[0]['request'], {'dashboard': 'dashboard-heating/raume', 'language': None})
+        self.assertIn('dashboard:config/users: not a dashboard', msg['message'])
+        self.assertIn('dashboard:developer-tools/state: not a dashboard', msg['message'])
 
-    def ask(self, span):
-        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {
-            'reply': 'Bitte.', 'actions': [], 'charts': [{'title': 'Energie', 'kind': 'energy_flow', 'span': span}]}}))
-
-    async def test_energy_flow_today_from_prefs_and_statistics(self):
-        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
-        self.ha.energy_prefs = self.PREFS
-        for eid, unit, changes in (('sensor.grid_import', 'kWh', [1.0, 2.0]), ('sensor.grid_export', 'Wh', [3000.0]),
-                                   ('sensor.pv_energy', 'kWh', [8.0, 4.0]), ('sensor.bat_in', 'kWh', [2.0]),
-                                   ('sensor.bat_out', 'kWh', [1.5])):
-            self.ha.states[eid] = '1'
-            self.ha.attributes[eid] = {'unit_of_measurement': unit}
-            self.ha.statistics[eid] = [{'change': c, 'sum': 0} for c in changes]
-        self.ask('today')
-        await self.deliver(sender=USER1, text='energiefluss heute')
-        msgs = self.signal.messages_to(f'dm:{USER1}')
-        self.assertTrue(msgs[1]['attachments'][0].startswith('data:image/png;filename=energie.png;base64,'))
-        self.assertEqual(self.ha.mcp_args[[a.get('mode') for a in self.ha.mcp_args].index('get')]['mode'], 'get')
-        self.assertEqual(self.ha.energy_writes, 0)
-        stats = [a for a in self.ha.mcp_args if a.get('source') == 'statistics'][-1]
-        self.assertEqual((stats['period'], stats['start_time'][11:19]), ('hour', '00:00:00'))
-        self.assertIsNotNone(stats['end_time'])
-        totals, unit, has = await self.bot.tools.energy_totals(stats['start_time'], stats['end_time'])
-        self.assertEqual((unit, has), ('kWh', {'solar', 'grid', 'battery'}))
-        self.assertEqual(totals, {'solar': 12.0, 'grid_in': 3.0, 'grid_out': 3.0, 'battery_in': 2.0,
-                                  'battery_out': 1.5})   # Wh converted
-        # "now" needs a power sensor for every part: explained, not guessed.
-        self.ask('now')
-        await self.deliver(sender=USER1, text='energiefluss jetzt')
-        self.assertIn('no power sensors for a live view', self.dm(USER1)[-1])
-
-    async def test_energy_flow_now_and_no_energy_dashboard(self):
-        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
-        self.ha.energy_prefs = {'energy_sources': [
-            {'type': 'grid', 'stat_energy_from': 'sensor.gi', 'stat_energy_to': 'sensor.ge', 'stat_rate': 'sensor.grid_power'},
-            {'type': 'solar', 'stat_energy_from': 'sensor.pv', 'stat_rate': 'sensor.pv_power'}]}
-        self.ha.states.update({'sensor.grid_power': '-1200', 'sensor.pv_power': '2.5'})
-        self.ha.attributes.update({'sensor.grid_power': {'unit_of_measurement': 'W'},
-                                   'sensor.pv_power': {'unit_of_measurement': 'kW'}})
-        totals, unit, has = await self.bot.tools.energy_totals(None, None)
-        self.assertEqual((unit, has), ('kW', {'solar', 'grid'}))
-        self.assertEqual(totals, {'solar': 2.5, 'grid_in': 0.0, 'grid_out': 1.2, 'battery_out': 0.0, 'battery_in': 0.0})
-        self.ask('now')
-        await self.deliver(sender=USER1, text='jetzt')
-        self.assertEqual(len(self.signal.messages_to(f'dm:{USER1}')[-1]['attachments']), 1)
-        self.ha.energy_prefs = {'energy_sources': []}
-        self.ask('week')
-        await self.deliver(sender=USER1, text='woche')
-        self.assertIn('no solar, grid or battery sensors', self.dm(USER1)[-1])
+    async def test_without_renderer(self):
+        await self.restart_bot(render_configured=False)
+        self.answer(reply='x', cards=[{'card': {'type': 'energy-sankey'}, 'period': 'today'}])
+        await self.deliver(sender=USER1, text='x')
+        self.assertIn('need an ha_token', self.dm(USER1)[-1])
 
 
 class ToolTests(Integration):

@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .cards import PERIODS
+
 MAX_TEXT = 4000
 APPROVAL_TTL = 120
 SCHEDULE_MAX_AHEAD = 7 * 86400   # actions/reminders may be scheduled up to a week ahead
@@ -566,15 +568,10 @@ def build_schema(writes: bool) -> dict:
         'type': 'object',
         'properties': {'reply': {'type': 'string'}, 'actions': actions,
                        'images': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 3},
-                       'charts': {'type': 'array', 'maxItems': 2, 'items': {
-                           'type': 'object', 'additionalProperties': False,
-                           'required': ['title', 'kind'],
-                           'properties': {'title': {'type': 'string'},
-                                          'kind': {'type': 'string', 'enum': ['line', 'energy_flow']},
-                                          'entity_ids': {'type': 'array', 'items': {'type': 'string'}},
-                                          'hours': {'type': 'integer'},
-                                          'span': {'type': 'string',
-                                                   'enum': ['now', 'today', 'yesterday', 'week', 'month']}}}},
+                       'cards': {'type': 'array', 'maxItems': 2, 'items': {
+                           'type': 'object', 'additionalProperties': False, 'required': ['card'],
+                           'properties': {'card': {'type': 'object'},
+                                          'period': {'type': ['string', 'null'], 'enum': [*PERIODS, None]}}}},
                        'reminders': {'type': 'array', 'items': reminder, 'maxItems': 3},
                        'tasks': {'type': 'array', 'items': task, 'maxItems': 3},
                        'cancel': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 5}},
@@ -688,11 +685,11 @@ def _structured_output(stdout: bytes, returncode: int = 0) -> dict:
 
 def _check_output(obj: dict) -> dict:
     if (not isinstance(obj, dict) or not {'reply', 'actions'} <= set(obj)
-            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel', 'images', 'charts'}):
+            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel', 'images', 'cards'}):
         raise ClaudeError('invalid', 'missing structured output')
-    obj = {'reminders': [], 'tasks': [], 'cancel': [], 'images': [], 'charts': [], **obj}
-    if not isinstance(obj['charts'], list):
-        raise ClaudeError('invalid', 'charts must be a list')
+    obj = {'reminders': [], 'tasks': [], 'cancel': [], 'images': [], 'cards': [], **obj}
+    if not isinstance(obj['cards'], list):
+        raise ClaudeError('invalid', 'cards must be a list')
     if not isinstance(obj['images'], list) or not all(isinstance(i, str) for i in obj['images']):
         raise ClaudeError('invalid', 'images must list entity ids')
     if (not isinstance(obj['reply'], str) or not isinstance(obj['actions'], list)
@@ -707,7 +704,7 @@ def _check_output(obj: dict) -> dict:
 
 # ---------------------------------------------------------------- storage
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class Store:
@@ -764,6 +761,8 @@ class Store:
                               ('outbox', 'edit_ts INTEGER'),
                               # v5: pictures sent with a message (JSON list of data URIs).
                               ('outbox', 'attachments TEXT'),
+                              # v6: the status message a message with pictures replaces (deleted after).
+                              ('outbox', 'delete_ts INTEGER'),
                               # v4: repeating scheduled actions ('once', 'daily', ...).
                               ('approvals', 'repeat TEXT'), ('actions', 'repeat TEXT')):
             have = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
@@ -1073,20 +1072,22 @@ class Store:
 
     def _enqueue(self, outgoing: list[tuple], now: int, approval_code: str | None = None,
                  edit_ts: int | None = None) -> None:
-        """Queue (dest, text) or (dest, text, [data URIs of pictures]) messages."""
+        """Queue (dest, text) or (dest, text, [data URIs of pictures]) messages. An edit
+        can't add pictures: such a message is sent anew and replaces (deletes) the
+        status message ``edit_ts`` instead."""
         for dest, text, *rest in outgoing:
             pictures = rest[0] if rest else []
             if text.strip() or pictures:
                 self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt,approval_code,edit_ts,'
-                                'attachments) VALUES(?,?,?,?,?,?,?)',
+                                'attachments,delete_ts) VALUES(?,?,?,?,?,?,?,?)',
                                 (dest, text[:MAX_TEXT], now, now, approval_code, None if pictures else edit_ts,
-                                 json.dumps(pictures) if pictures else None))
+                                 json.dumps(pictures) if pictures else None, edit_ts if pictures else None))
 
-    def due_outbox(self, now: int, limit: int = 20) -> list[tuple[int, str, str, int, int, int | None, list]]:
-        """(id, dest, text, attempts, created_at, edit_ts, pictures) of messages due to be sent."""
-        return [(*row[:6], json.loads(row[6]) if row[6] else [])
-                for row in self.db.execute("SELECT id,dest,text,attempts,created_at,edit_ts,attachments FROM outbox "
-                                           "WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT ?",
+    def due_outbox(self, now: int, limit: int = 20) -> list[tuple]:
+        """(id, dest, text, attempts, created_at, edit_ts, pictures, delete_ts) of messages due to be sent."""
+        return [(*row[:6], json.loads(row[6]) if row[6] else [], row[7])
+                for row in self.db.execute("SELECT id,dest,text,attempts,created_at,edit_ts,attachments,delete_ts "
+                                           "FROM outbox WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT ?",
                                            (now, limit)).fetchall()]
 
     def outbox_unedit(self, item_id: int) -> None:

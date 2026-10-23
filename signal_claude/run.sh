@@ -6,6 +6,8 @@ set -euo pipefail
 #   node    - Claude broker + Claude Code, owns /data/claude and the OAuth token
 #   homebot - the bot and its setup page, owns /data/homebot (settings, SQLite),
 #             holds the HA/notify tokens (incl. personal HA tokens)
+#   render  - headless Chromium drawing Home Assistant cards; holds ha_token
+#             (to log in to the frontend), no files
 # Household settings (number, people, groups, actions) are managed in the
 # setup page (Open Web UI); the app options hold only secrets and connections.
 umask 077
@@ -28,7 +30,7 @@ run_as() {
 }
 as_user() { ( run_as "$@" ); }
 
-mkdir -p /data/signal /data/claude/config /data/homebot /run/homebot-claude
+mkdir -p /data/signal /data/claude/config /data/homebot /run/homebot-claude /run/homebot-render
 # 0.3.x kept the database directly in /data (root-owned); move it once.
 for f in /data/bot.sqlite3 /data/bot.sqlite3-wal /data/bot.sqlite3-shm; do
   if [[ -e "$f" && ! -e "/data/homebot/${f#/data/}" ]]; then mv "$f" /data/homebot/; fi
@@ -42,6 +44,7 @@ chmod 600 /data/options.json
 chmod 600 /data/homebot/bot.sqlite3* /data/homebot/settings.json 2>/dev/null || true
 # Only node and homebot may reach the broker socket.
 chown node:homebot /run/homebot-claude && chmod 750 /run/homebot-claude
+chown render:homebot /run/homebot-render && chmod 750 /run/homebot-render
 
 echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
 echo -n "Signal crypto library: "
@@ -84,6 +87,17 @@ else
   echo 'No claude_oauth_token set: the bot will answer that Claude is not configured.'
 fi
 
+render_pid=''
+if [[ -n "${HA_TOKEN}" ]]; then
+  echo 'Starting render broker'
+  run_as render env -i PATH="$BASE_PATH" HOME=/tmp LANG=C.UTF-8 TZ="$TZ" PYTHONUNBUFFERED=1 \
+    RENDER_SOCKET=/run/homebot-render/render.sock BROKER_ALLOWED_UID="$(id -u homebot)" \
+    HA_URL="${HA_BASE_URL}" HA_TOKEN="${HA_TOKEN}" CHROMIUM=/usr/bin/chromium \
+    python3 -m bot.render_broker &
+  render_pid=$!
+  for n in $(seq 1 50); do [[ -S /run/homebot-render/render.sock ]] && break; sleep 0.2; done
+fi
+
 echo 'Starting HomeBot (setup page: Open Web UI)'
 run_as homebot env -i PATH="$BASE_PATH" HOME=/data/homebot LANG=C.UTF-8 TZ="$TZ" PYTHONUNBUFFERED=1 \
   SIGNAL_DAEMON_URL=http://127.0.0.1:7583 \
@@ -93,9 +107,10 @@ run_as homebot env -i PATH="$BASE_PATH" HOME=/data/homebot LANG=C.UTF-8 TZ="$TZ"
   NOTIFY_BIND="${NOTIFY_BIND:-0.0.0.0}" NOTIFY_PORT="${NOTIFY_PORT:-8999}" \
   BOT_DB=/data/homebot/bot.sqlite3 SETTINGS_FILE=/data/homebot/settings.json \
   CLAUDE_SOCKET="$CLAUDE_SOCKET" CLAUDE_CONFIGURED="$([[ -n "${CLAUDE_OAUTH_TOKEN}" ]] && echo true || echo false)" \
+  RENDER_SOCKET=/run/homebot-render/render.sock RENDER_CONFIGURED="$([[ -n "${render_pid}" ]] && echo true || echo false)" \
   python3 -m bot.server &
 bot_pid=$!
-pids=("$bot_pid" ${broker_pid:+"$broker_pid"} "$sig_pid")
+pids=("$bot_pid" ${broker_pid:+"$broker_pid"} ${render_pid:+"$render_pid"} "$sig_pid")
 # If any process stops, terminate and let Supervisor manage restarts.
 wait -n "${pids[@]}"
 echo 'One of the services stopped' >&2
