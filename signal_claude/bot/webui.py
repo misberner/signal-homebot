@@ -156,6 +156,7 @@ class SetupApi:
             'model': house.model,
             'skills': house.skills,
             'persons': house.persons,
+            'memory': house.memory,
             'ha': {'kind': bot.cfg.mcp_kind, 'write_token': bool(bot.cfg.ha_token)},
             'claude_configured': bot.cfg.claude_configured,
         })
@@ -275,7 +276,7 @@ class SetupApi:
         for key, typ in (('bot_name', str), ('allow_writes', bool), ('require_verified_identity', bool),
                          ('command_max_age', int), ('history_days', int), ('notes', str), ('model', str),
                          ('auto_approve', bool), ('permissions', list), ('rules', str), ('skills', list),
-                         ('persons', dict)):
+                         ('persons', dict), ('memory', list)):
             if key in data:
                 value = data[key]
                 if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):

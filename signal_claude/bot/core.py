@@ -26,6 +26,7 @@ SCHEDULE_MAX_AHEAD = 7 * 86400   # actions/reminders may be scheduled up to a we
 SCHEDULE_GRACE = 600             # a job more than 10 min overdue (bot was down) is skipped, not run late
 REMIND = 'homebot.remind'        # internal "service" for reminders: a message, never an HA call
 TASK = 'homebot.task'            # internal "service": run Claude with a stored instruction, then post its answer
+MEMORY = 'homebot.memory'        # internal "service": remember or forget a fact (household memory)
 REPEATS = ('once', 'daily', 'weekdays', 'weekly')
 MAX_TASKS = 20                   # pending tasks per user
 MAX_GRANTS = 5                   # actions a task may run without asking (confirmed when it is set up)
@@ -392,6 +393,8 @@ def validate_action(action: object, rules: list[tuple[str, str]]) -> tuple[str, 
 def describe(service: str, data: dict) -> str:
     if service == REMIND:
         return f'reminder "{data.get("text", "")}"'
+    if service == MEMORY:
+        return f'{"remember" if data.get("add") else "forget"} "{data.get("text", "")}"'
     if service == TASK:
         repeat = data.get('repeat', 'once')
         grants = '; '.join(f'{g["service"]} on {g["entity_id"]}' for g in data.get('grants') or [])
@@ -577,7 +580,9 @@ def build_schema(writes: bool) -> dict:
                                           'period': {'type': ['string', 'null'], 'enum': [*PERIODS, None]}}}},
                        'reminders': {'type': 'array', 'items': reminder, 'maxItems': 3},
                        'tasks': {'type': 'array', 'items': task, 'maxItems': 3},
-                       'cancel': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 5}},
+                       'cancel': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 5},
+                       'remember': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 3},
+                       'forget': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 3}},
         'required': ['reply', 'actions'],
         'additionalProperties': False,
     }
@@ -688,9 +693,14 @@ def _structured_output(stdout: bytes, returncode: int = 0) -> dict:
 
 def _check_output(obj: dict) -> dict:
     if (not isinstance(obj, dict) or not {'reply', 'actions'} <= set(obj)
-            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel', 'images', 'cards'}):
+            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel', 'images', 'cards', 'remember',
+                           'forget'}):
         raise ClaudeError('invalid', 'missing structured output')
-    obj = {'reminders': [], 'tasks': [], 'cancel': [], 'images': [], 'cards': [], **obj}
+    obj = {'reminders': [], 'tasks': [], 'cancel': [], 'images': [], 'cards': [], 'remember': [], 'forget': [],
+           **obj}
+    if not all(isinstance(t, str) for t in obj['remember']) or not all(
+            isinstance(n, int) and not isinstance(n, bool) for n in obj['forget']):
+        raise ClaudeError('invalid', 'remember lists texts, forget lists numbers')
     if not isinstance(obj['cards'], list):
         raise ClaudeError('invalid', 'cards must be a list')
     if not isinstance(obj['images'], list) or not all(isinstance(i, str) for i in obj['images']):
@@ -1046,7 +1056,7 @@ class Store:
             actions = self.db.execute("SELECT id,sender,service,data_json FROM actions "
                                       "WHERE status='executing'").fetchall()
             for action_id, sender, service, data_json in actions:
-                if service in (TASK, REMIND):  # no device involved: report, and keep a series going
+                if service in (TASK, REMIND, MEMORY):  # no device involved: report, and keep a series going
                     self.db.execute("UPDATE actions SET status='failed', detail='interrupted by restart', "
                                     'finished_at=? WHERE id=?', (now, action_id))
                     self._enqueue([(f'dm:{sender}', f'#{action_id} ({describe(service, json.loads(data_json))}) '

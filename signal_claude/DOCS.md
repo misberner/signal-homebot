@@ -222,6 +222,16 @@ instead. Skills are trusted (admins only) and take precedence over Claude's
 own approach. They guide Claude; to *enforce* something, add a permission
 line too (e.g. `deny climate.*` and `review script.heizung_*`).
 
+## Memory
+
+"Merk dir: der Trockner heißt bei uns Schranktrockner" → the bot proposes a
+one-line memory entry and the requester confirms it privately (yes/👍), like
+a change; "vergiss das" works the same way. Section 7 of the setup page lists
+the entries (who, when) to edit or remove. Claude sees all of them in every
+request as context. Memories are not rules: the reviewer never sees them and
+they can't change permissions. Scheduled tasks and automations can't change
+the memory. Up to 100 entries of 300 characters.
+
 ## Message handling
 
 - Claude runs for every private message, and for group messages that start

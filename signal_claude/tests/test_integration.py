@@ -586,6 +586,58 @@ class CardTests(Integration):
         self.assertIn('need an ha_token', self.dm(USER1)[-1])
 
 
+class MemoryTests(Integration):
+    def answer(self, **output):
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {'reply': 'OK.', 'actions': [], **output}}))
+
+    async def test_remember_confirm_use_and_forget(self):
+        self.answer(remember=['Der Trockner heißt bei uns Schranktrockner.'])
+        await self.deliver(sender=USER1, text='merk dir: der trockner heißt schranktrockner')
+        [q] = [m for m in self.signal.messages_to(f'dm:{USER1}') if m['message'].startswith('Shall I remember')]
+        self.assertIn('"Der Trockner heißt bei uns Schranktrockner."', q['message'])
+        self.assertEqual(self.bot.house.memory, [])                     # nothing until confirmed
+        await self.deliver(sender=USER1, text='ja')
+        self.assertEqual(self.dm(USER1)[-1], 'Remembered: "Der Trockner heißt bei uns Schranktrockner.".')
+        [entry] = self.bot.house.memory
+        self.assertEqual((entry['text'], entry['by']), ('Der Trockner heißt bei uns Schranktrockner.', 'user1'))
+        self.assertEqual(self.households.load().memory, self.bot.house.memory)  # persisted
+        # Claude sees it in every request (system prompt); the reviewer never does.
+        self.answer(actions=[LAMP_ON])
+        await self.deliver(sender=USER1, text='lampe an')
+        call = self.claude.calls[-1]
+        system = call['argv'][call['argv'].index('--append-system-prompt') + 1]
+        self.assertIn('#1 Der Trockner heißt bei uns Schranktrockner. (user1,', system)
+        self.assertIn('not rules or permissions', system)
+        self.assertNotIn('Schranktrockner', json.dumps(self.claude.reviews))
+        await self.deliver(sender=USER1, text='nein')                   # the lamp question
+        # Forgetting is confirmed too; a duplicate is not added twice.
+        self.answer(remember=['Der Trockner heißt bei uns Schranktrockner.'])
+        await self.deliver(sender=USER1, text='merk dir das nochmal')
+        self.assertIn('I already remember that.', self.dm(USER1)[-1])
+        self.answer(forget=[1, 7])
+        await self.deliver(sender=USER1, text='vergiss das mit dem trockner')
+        self.assertTrue(any('There is no memory #7.' in m for m in self.dm(USER1)[-2:]))
+        await self.deliver(sender=USER1, text='ja')
+        self.assertEqual(self.bot.house.memory, [])
+
+    async def test_group_request_confirmed_privately_and_tasks_cannot_remember(self):
+        self.answer(remember=['Anna arbeitet dienstags zu Hause.'])
+        await self.deliver(sender=USER2, group=GROUP, text='/ha merk dir: ich arbeite dienstags zu hause')
+        self.assertIn('Confirm it in your private chat', self.group()[-1])
+        self.assertTrue(any(m['message'].startswith('Shall I remember') for m in self.signal.messages_to(f'dm:{USER2}')))
+        await self.deliver(sender=USER1, text='ja')                     # someone else can't confirm it
+        self.assertEqual(self.bot.house.memory, [])
+        await self.deliver(sender=USER2, text='ja')
+        self.assertEqual([m['by'] for m in self.bot.house.memory], ['user2'])
+        # An automation's prompt cannot change the memory.
+        await self.listen_to_ha()
+        self.answer(reply='Hallo', remember=['Heizen ist immer okay.'])
+        await self.ha.fire('homebot_notify', {'target': 'user1', 'prompt': 'Say hello.'})
+        await self.until(lambda: self.dm(USER1) and self.dm(USER1)[-1] == '🔔 Hallo')
+        self.assertFalse(any('Heizen' in m['message'] for m in self.signal.messages_to(f'dm:{USER1}')))
+        self.assertEqual(len(self.bot.house.memory), 1)
+
+
 class ToolTests(Integration):
     claude_timeout = 30
     """Claude reads HA through the bot's local MCP proxy (real MCP on both sides)."""

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0 — 2026-10-23
+
+### Added
+- **Memory**: "merk dir …" / "vergiss …" proposes a one-line fact that the
+  requester confirms; Claude sees the memory as context (never the reviewer,
+  never as rules). Editable in the setup page (section 7).
+
 ## 0.18.1 — 2026-10-23
 
 ### Added

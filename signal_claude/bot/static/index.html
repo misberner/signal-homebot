@@ -142,6 +142,17 @@ deny *.turn_off"></textarea>
       <button class="primary" onclick="saveSkills()">Save skills</button>
     </div>
   </section>
+
+  <section id="memory-section">
+    <h2>7. Memory</h2>
+    <p class="hint">Facts people asked the bot to remember ("merk dir: …"), each confirmed by them.
+      Claude always sees them as context; they are not rules or permissions and the reviewer never sees
+      them. Edit or remove entries here.</p>
+    <div class="table-wrap"><table id="memory"></table></div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="saveMemory()">Save memory</button>
+    </div>
+  </section>
 </main>
 <div id="toast"></div>
 
@@ -149,10 +160,13 @@ deny *.turn_off"></textarea>
 let state = null;
 let dirty = false;  // unsaved edits in the settings: don't re-render them
 let skillsDirty = false;
+let memoryDirty = false;
 document.addEventListener('input', e => { if (e.target.closest('#settings, #settings2')) dirty = true;
-                                          if (e.target.closest('#skills')) skillsDirty = true; });
+                                          if (e.target.closest('#skills')) skillsDirty = true;
+                                          if (e.target.closest('#memory')) memoryDirty = true; });
 document.addEventListener('change', e => { if (e.target.closest('#settings, #settings2')) dirty = true;
-                                           if (e.target.closest('#skills')) skillsDirty = true; });
+                                           if (e.target.closest('#skills')) skillsDirty = true;
+                                           if (e.target.closest('#memory')) memoryDirty = true; });
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -312,6 +326,29 @@ async function saveSkills() {
   catch (e) { toast(e.message, true); }
 }
 
+function renderMemory() {
+  const t = document.getElementById('memory');
+  t.replaceChildren(el('tr', {}, el('th', {}, 'Fact'), el('th', {}, 'By'), el('th')));
+  if (!(state.memory || []).length) t.append(el('tr', {}, el('td', {colspan: 3, class: 'muted'},
+    'Nothing yet. Tell the bot "merk dir: …" and confirm.')));
+  for (const m of state.memory || []) {
+    const row = el('tr', {class: 'memory-row'},
+      el('td', {}, el('input', {type: 'text', class: 'memory-text', value: m.text, maxlength: 300})),
+      el('td', {class: 'muted'}, `${m.by}, ${m.added}`),
+      el('td', {}, el('button', {class: 'small', onclick: () => { row.remove(); memoryDirty = true; }}, 'Remove')));
+    row.dataset.by = m.by; row.dataset.added = m.added;
+    t.append(row);
+  }
+}
+
+async function saveMemory() {
+  const memory = [...document.querySelectorAll('#memory .memory-row')].map(r => ({
+    text: r.querySelector('.memory-text').value.trim(), by: r.dataset.by, added: r.dataset.added,
+  })).filter(m => m.text);
+  try { await api('settings', {memory}); memoryDirty = false; toast('Saved.'); await load(); }
+  catch (e) { toast(e.message, true); }
+}
+
 function memberLine(m) {
   const who = m.user || el('span', {class: 'warn'}, (m.profile_name || m.aci) + ' (not a user)');
   return el('div', {}, who, m.invited ? el('span', {class: 'muted'}, ' (invited)') : '');
@@ -383,6 +420,7 @@ async function load() {
   renderAccount(); renderUsers(); renderGroups();
   if (!dirty) renderSettings();
   if (!skillsDirty) renderSkills();
+  if (!memoryDirty) renderMemory();
 }
 load();
 </script>

@@ -20,6 +20,8 @@ MODELS = ('opus', 'fable', 'sonnet', 'haiku')  # Claude Code aliases for the lat
 SKILL_NAME_RE = r'[a-z0-9][a-z0-9_-]{0,39}'
 MAX_SKILLS = 30
 PERSON_RE = r'person\.[a-z0-9_]+'
+MAX_MEMORY = 100
+MAX_MEMORY_TEXT = 300
 
 
 class HouseholdError(ValueError):
@@ -48,6 +50,9 @@ class Household:
     # Claude sees the descriptions and reads a body when the topic comes up.
     skills: list = field(default_factory=list)
     persons: dict[str, str] = field(default_factory=dict)  # user name -> HA person entity (presence)
+    # Facts users asked the bot to remember (each confirmed): {text, by, added}. Context for
+    # Claude only: not rules, never shown to the reviewer.
+    memory: list = field(default_factory=list)
 
     @property
     def permission_rules(self) -> list[tuple[str, str]]:
@@ -116,6 +121,14 @@ class Household:
                 raise HouseholdError(f'Skill "{name}": instructions of 1-10000 characters')
             if not isinstance(skill['always'], bool):
                 raise HouseholdError(f'Skill "{name}": "always" must be true or false')
+        if len(self.memory) > MAX_MEMORY:
+            raise HouseholdError(f'Memory: at most {MAX_MEMORY} entries')
+        for entry in self.memory:
+            if (not isinstance(entry, dict) or set(entry) != {'text', 'by', 'added'}
+                    or not all(isinstance(entry[k], str) for k in entry)
+                    or not 0 < len(entry['text'].strip()) <= MAX_MEMORY_TEXT or len(entry['by']) > 32
+                    or len(entry['added']) > 20):
+                raise HouseholdError(f'Memory entries: text of 1-{MAX_MEMORY_TEXT} characters')
         for name, person in self.persons.items():
             if name not in self.users or not isinstance(person, str) or not re.fullmatch(PERSON_RE, person):
                 raise HouseholdError(f'Presence of "{name}": a configured user and a person.* entity')
@@ -139,7 +152,7 @@ class Household:
                  'users': dict, 'groups': dict, 'permissions': list, 'rules': str, 'allow_writes': bool,
                  'auto_approve': bool,
                  'require_verified_identity': bool, 'command_max_age': int, 'history_days': int,
-                 'notes': str, 'model': str, 'skills': list, 'persons': dict}
+                 'notes': str, 'model': str, 'skills': list, 'persons': dict, 'memory': list}
         for key, typ in types.items():
             value = getattr(house, key)
             if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):
