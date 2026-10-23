@@ -29,7 +29,8 @@ LIVE_CONTEXT_TOOLS = ('homeassistant__GetLiveContext', 'GetLiveContext')
 HA_MCP_WRITE_TOOLS = ('ha_call_service', 'ha_write_file', 'ha_restart', 'ha_bulk_control')
 TOOLS = {
     'ha_mcp': ('search_entities', 'get_states', 'get_overview', 'get_history', 'get_dashboard',
-               'get_automation_config', 'get_script_config', 'get_image'),
+               'get_automation_config', 'get_script_config', 'get_image', 'get_calendar_events',
+               'get_todo_items', 'get_logbook', 'get_traces'),
     'hass': ('get_live_context',),
 }
 MAX_RESULT = 30000
@@ -44,6 +45,11 @@ EntityIds = Annotated[list[str], Field(min_length=1, max_length=25)]
 HistoryIds = Annotated[list[str], Field(min_length=1, max_length=10)]
 SearchLimit = Annotated[int, Field(ge=1, le=25)]
 HistoryLimit = Annotated[int, Field(ge=1, le=200)]
+EventLimit = Annotated[int, Field(ge=1, le=50)]
+LogbookHours = Annotated[int, Field(ge=1, le=168)]
+LogbookLimit = Annotated[int, Field(ge=1, le=100)]
+TraceLimit = Annotated[int, Field(ge=1, le=20)]
+ISO_TIME_RE = r'\d{4}-\d\d-\d\d([T ][\d:.+Z-]{0,20})?'
 PREFLIGHT_TTL = 60
 
 
@@ -276,6 +282,59 @@ class HaTools:
                 if not re.fullmatch(r'image\.[a-z0-9_]+', entity_id):
                     raise ValueError('entity_id must be an image.* or camera.* entity')
                 return await tools.image(entity_id)
+
+            @server.tool(name='get_calendar_events')
+            async def get_calendar_events(entity_id: str, start: str | None = None, end: str | None = None,
+                                          max_results: EventLimit = 20) -> str:
+                """Events of a calendar.* entity (default: the next 7 days). start/end are ISO
+                datetimes; pass end whenever you pass start."""
+                if not re.fullmatch(r'calendar\.[a-z0-9_]+', entity_id):
+                    raise ValueError('entity_id must be a calendar.* entity')
+                args = {'entity_id': entity_id, 'max_results': max_results}
+                for key, value in (('start', start), ('end', end)):
+                    if value is not None:
+                        if not re.fullmatch(ISO_TIME_RE, value):
+                            raise ValueError(f'{key} must be an ISO datetime')
+                        args[key] = value
+                return result_summary(await tools.call('ha_config_get_calendar_events', args))
+
+            @server.tool(name='get_todo_items')
+            async def get_todo_items(entity_id: str | None = None, status: str | None = None) -> str:
+                """Without entity_id: all todo lists (e.g. shopping lists). With a todo.* entity:
+                its items; status 'needs_action' (open) or 'completed' filters them."""
+                args = {}
+                if entity_id is not None:
+                    if not re.fullmatch(r'todo\.[a-z0-9_]+', entity_id):
+                        raise ValueError('entity_id must be a todo.* entity')
+                    args['entity_id'] = entity_id
+                if status is not None:
+                    if status not in ('needs_action', 'completed'):
+                        raise ValueError("status must be 'needs_action' or 'completed'")
+                    args['status'] = status
+                return result_summary(await tools.call('ha_get_todo', args))
+
+            @server.tool(name='get_logbook')
+            async def get_logbook(entity_id: str | None = None, hours_back: LogbookHours = 24,
+                                  limit: LogbookLimit = 50) -> str:
+                """The logbook (what happened, and what triggered it), newest first, optionally
+                for one entity, up to 7 days back."""
+                args = {'source': 'logbook', 'hours_back': hours_back, 'limit': limit}
+                if entity_id is not None:
+                    args['entity_id'] = check_entities([entity_id])[0]
+                return result_summary(await tools.call('ha_get_logs', args))
+
+            @server.tool(name='get_traces')
+            async def get_traces(automation_id: str, run_id: str | None = None, limit: TraceLimit = 5) -> str:
+                """Recent runs of an automation.* or script.* entity: what triggered them, which
+                conditions passed, which actions ran. run_id gives one run in detail."""
+                if not re.fullmatch(r'(automation|script)\.[a-z0-9_]+', automation_id):
+                    raise ValueError('automation_id must be an automation.* or script.* entity')
+                args = {'automation_id': automation_id, 'limit': limit}
+                if run_id is not None:
+                    if not re.fullmatch(r'[0-9A-Za-z._-]{1,64}', run_id):
+                        raise ValueError('invalid run_id')
+                    args['run_id'] = run_id
+                return result_summary(await tools.call('ha_get_automation_traces', args), MAX_CONFIG_RESULT)
         else:
             @server.tool(name='get_live_context')
             async def get_live_context() -> str:

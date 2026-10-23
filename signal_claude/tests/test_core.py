@@ -462,3 +462,87 @@ class NextRunTests(unittest.TestCase):
         monday_8 = time.mktime((2026, 10, 26, 8, 0, 0, 0, 0, -1))
         self.assertEqual(fmt(next_run(friday_7, 'daily', monday_8)), 'Tue 07:00')
 
+
+
+class TriggerTests(unittest.TestCase):
+    @staticmethod
+    def st(value, **attributes):
+        return {'state': value, 'attributes': attributes}
+
+    def test_parse_trigger(self):
+        from bot.core import parse_trigger
+        self.assertEqual(parse_trigger({'entity_id': 'sensor.p', 'below': 5, 'for_minutes': 0, 'to': None}),
+                         {'entity_id': 'sensor.p', 'below': 5})
+        self.assertEqual(parse_trigger({'entity_id': 'person.a', 'to': 'home'})['to'], 'home')
+        for bad in ({'entity_id': 'sensor.p'}, {'to': 'on'}, {'entity_id': 'x', 'to': 'on'},
+                    {'entity_id': 'sensor.p', 'above': True}, {'entity_id': 'sensor.p', 'to': ['on']},
+                    {'entity_id': 'sensor.p', 'to': 'on', 'for_minutes': 5000},
+                    {'entity_id': 'sensor.p', 'to': 'on', 'attribute': 'a b'},
+                    {'entity_id': 'sensor.p', 'to': 'on', 'service': 'lock.unlock'}, 'sensor.p'):
+            with self.assertRaises(Denied, msg=bad):
+                parse_trigger(bad)
+
+    def test_fires_on_transition_only(self):
+        from bot.core import trigger_fires
+        to_home = {'entity_id': 'person.a', 'to': 'home'}
+        self.assertTrue(trigger_fires(to_home, self.st('not_home'), self.st('home')))
+        self.assertFalse(trigger_fires(to_home, self.st('home'), self.st('home', gps=1)))  # attribute update
+        self.assertFalse(trigger_fires(to_home, self.st('unavailable'), self.st('home')))
+        self.assertFalse(trigger_fires(to_home, None, self.st('home')))
+        below = {'entity_id': 'sensor.p', 'below': 5}
+        self.assertTrue(trigger_fires(below, self.st('120'), self.st('2')))
+        self.assertFalse(trigger_fires(below, self.st('3'), self.st('2')))
+        self.assertFalse(trigger_fires(below, self.st('120'), self.st('abc')))
+        leave = {'entity_id': 'binary_sensor.door', 'from': 'on'}
+        self.assertTrue(trigger_fires(leave, self.st('on'), self.st('off')))
+        self.assertFalse(trigger_fires(leave, self.st('off'), self.st('on')))
+        attr = {'entity_id': 'climate.x', 'attribute': 'current_temperature', 'above': 22}
+        self.assertTrue(trigger_fires(attr, self.st('heat', current_temperature=21.5),
+                                      self.st('heat', current_temperature=22.5)))
+
+    def test_describe(self):
+        from bot.core import describe_trigger, TASK
+        self.assertEqual(describe_trigger({'entity_id': 'sensor.p', 'below': 5, 'for_minutes': 3}),
+                         'sensor.p is below 5 for 3 min')
+        self.assertEqual(describe_trigger({'entity_id': 'cover.x', 'from': 'open', 'to': 'closed'}),
+                         'cover.x changes from "open" to "closed"')
+        self.assertEqual(describe(TASK, {'prompt': 'p', 'repeat': 'always',
+                                         'trigger': {'entity_id': 'person.a', 'to': 'home'}}),
+                         'task "p" when person.a becomes "home", every time')
+
+    def test_store_watching_and_rearm(self):
+        from bot.core import TASK, TRIGGER_COOLDOWN
+        with tempfile.TemporaryDirectory() as d:
+            store = Store(str(Path(d) / 'db.sqlite3'))
+            data = {'prompt': 'p', 'repeat': 'always', 'trigger': {'entity_id': 'person.a', 'to': 'home'}}
+            job = store.add_scheduled(USER1, f'dm:{USER1}', TASK, data, None, 1000)
+            store.add_scheduled(USER1, f'dm:{USER1}', TASK, {'prompt': 'q', 'repeat': 'once'}, 5000, 1000)
+            self.assertEqual([j[0] for j in store.watching()], [job])
+            self.assertEqual(store.due_scheduled(10 ** 9)[0][4]['prompt'], 'q')  # triggers are never "due"
+            self.assertTrue(store.start_scheduled(job))
+            store.finish_action(job, 'succeeded', 'ran', [], 2000)
+            nxt = store.repeat_task(job, 2000)
+            [(i, *_, d2, run_at)] = store.watching()
+            self.assertEqual((i, run_at, d2['not_before']), (nxt, None, 2000 + TRIGGER_COOLDOWN))
+            # A one-off trigger is not re-armed.
+            once = store.add_scheduled(USER1, f'dm:{USER1}', TASK, {**data, 'repeat': 'once'}, None, 1000)
+            store.start_scheduled(once)
+            self.assertIsNone(store.repeat_task(once, 2000))
+            store.db.close()
+
+    def test_confirmed_trigger_task_waits(self):
+        from bot.core import TASK
+        with tempfile.TemporaryDirectory() as d:
+            store = Store(str(Path(d) / 'db.sqlite3'))
+            data = {'prompt': 'p', 'repeat': 'once', 'trigger': {'entity_id': 'person.a', 'to': 'home'},
+                    'grants': [{'service': 'light.turn_on', 'entity_id': 'light.x'}]}
+            store.add_approval('code', USER1, f'dm:{USER1}', TASK, data, 1000, 'Shall I?')
+            action_id, *_ = store.consume_approval('code', USER1, 1001)
+            self.assertEqual(store.action_status(action_id), 'scheduled')
+            self.assertEqual([j[0] for j in store.watching()], [action_id])
+            store.db.close()
+
+    def test_schema_allows_triggers(self):
+        task = build_schema(True)['properties']['tasks']['items']
+        self.assertIn('when', task['required'])
+        self.assertIn('always', task['properties']['repeat']['enum'])

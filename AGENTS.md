@@ -30,6 +30,9 @@ This repository is an agent connected to **physical home devices**.
 - Controllable domains are a fixed allowlist in `bot/core.py`
   (`WRITABLE_DOMAINS`); never add locks, alarms, cameras, notify or admin.
 - Never log message text, tokens, or MCP URLs (ha-mcp URLs contain a secret).
+- Runs nobody started in person (state triggers, `homebot_notify` prompts) are
+  rate limited; event prompts are read-only. The HA WebSocket connection only
+  subscribes to events; never send commands over it.
 - Process users: signal-cli = `signal`, bot = `homebot`, Claude broker +
   Claude = `node`; root only in `run.sh`. Never give the bot the Claude token
   or let it run Claude directly; flags live in `bot/claude_broker.py`.

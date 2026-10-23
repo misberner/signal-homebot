@@ -3,6 +3,7 @@
 Every scenario that must not write asserts ``self.ha.calls == []``.
 """
 import asyncio
+import dataclasses
 import json
 import os
 import socket
@@ -115,6 +116,15 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         await self.http.close()
         self.bot.store.db.close()
         await self.until(lambda: not self.port_open(self.proxy_port))
+
+    async def listen_to_ha(self):
+        """Start the bot's HA event subscription (not part of the default loops)."""
+        from bot import ha_events
+        subscribed = len(self.ha.ws_subscriptions)
+        self.tasks.append(asyncio.create_task(ha_events.listen(
+            self.http, self.bot.cfg.ha_url, self.bot.cfg.ha_token, self.bot.on_ha_event,
+            self.bot.trigger_since.clear)))
+        await self.until(lambda: len(self.ha.ws_subscriptions) >= subscribed + 2)
 
     async def restart_bot(self, house=None, **overrides):
         await self.stop_bot()
@@ -389,15 +399,18 @@ class ToolTests(Integration):
         self.claude.set(call_tool={'name': 'get_states', 'args': {'entity_ids': ['sensor.living_room_temperature']}})
         await self.deliver(sender=USER1, text='how warm is it?')
         result = json.loads(self.dm(USER1)[0])
-        self.assertEqual(sorted(result['tools']), ['get_automation_config', 'get_dashboard', 'get_history', 'get_image',
-                                                   'get_overview', 'get_script_config', 'get_states', 'search_entities'])
+        self.assertEqual(sorted(result['tools']), ['get_automation_config', 'get_calendar_events', 'get_dashboard',
+                                                   'get_history', 'get_image', 'get_logbook', 'get_overview',
+                                                   'get_script_config', 'get_states', 'get_todo_items', 'get_traces',
+                                                   'search_entities'])
         self.assertIn('21.5', result['text'])
         self.assertTrue(all(h is None for h in self.ha.mcp_auth_headers))  # no HA token to ha-mcp
         argv = self.claude.calls[0]['argv']
         self.assertEqual(argv[argv.index('--allowedTools') + 1].split(','),
                          [f'mcp__ha__{t}' for t in ('search_entities', 'get_states', 'get_overview', 'get_history',
                                                      'get_dashboard', 'get_automation_config', 'get_script_config',
-                                                     'get_image')])
+                                                     'get_image', 'get_calendar_events', 'get_todo_items',
+                                                     'get_logbook', 'get_traces')])
         # Invalid arguments never reach Home Assistant.
         self.ha.mcp_calls.clear()
         self.claude.set(call_tool={'name': 'get_states', 'args': {'entity_ids': ['light.x; rm -rf /']}})
@@ -409,6 +422,34 @@ class ToolTests(Integration):
         await self.deliver(sender=USER1, text='overview')
         self.assertIn('light.test_lamp (Test Lamp): off', json.loads(self.dm(USER1)[-1])['text'])
         self.assertNotIn('system_info', self.ha.mcp_args[-1]['fields'])
+
+    async def test_calendar_todo_logbook_and_trace_reads(self):
+        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url, ha_token='')
+        async def use(name, args):
+            self.claude.set(call_tool={'name': name, 'args': args})
+            await self.deliver(sender=USER1, text=f'use {name}')
+            return json.loads(self.dm(USER1)[-1])
+        out = await use('get_calendar_events', {'entity_id': 'calendar.mullmax', 'max_results': 5})
+        self.assertIn('Grau', out['text'])
+        self.assertEqual(self.ha.mcp_args[-1]['max_results'], 5)
+        out = await use('get_todo_items', {'entity_id': 'todo.einkauf', 'status': 'needs_action'})
+        self.assertIn('Milch', out['text'])
+        out = await use('get_logbook', {'entity_id': 'light.test_lamp', 'hours_back': 48})
+        self.assertIn('turned on', out['text'])
+        self.assertEqual(self.ha.mcp_args[-1], {'source': 'logbook', 'entity_id': 'light.test_lamp',
+                                                'hours_back': 48, 'limit': 50})
+        out = await use('get_traces', {'automation_id': 'automation.morning'})
+        self.assertIn('stopped', out['text'])
+        # Arguments are constrained: only the right domains, only the logbook, bounded ranges.
+        calls = len(self.ha.mcp_calls)
+        for name, args in (('get_calendar_events', {'entity_id': 'light.x'}),
+                           ('get_calendar_events', {'entity_id': 'calendar.x', 'start': 'yesterday'}),
+                           ('get_todo_items', {'entity_id': 'todo.x', 'status': 'all'}),
+                           ('get_logbook', {'hours_back': 5000}),
+                           ('get_traces', {'automation_id': 'light.x'})):
+            out = await use(name, args)
+            self.assertTrue(out['error'], name)
+        self.assertEqual([c for c in self.ha.mcp_calls[calls:] if c != 'ha_get_overview'], [])
 
     async def test_config_dashboard_and_image_reads(self):
         await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url, ha_token='')
@@ -594,6 +635,16 @@ class WriteTests(Integration):
         return self.deliver(sender=sender, text=None,
                             reaction={'emoji': emoji, 'targetAuthorUuid': BOT, 'targetAuthor': BOT,
                                       'targetSentTimestamp': question['_ts'], 'isRemove': False}, **kw)
+
+    async def test_personal_ha_token_for_writes(self):
+        self.ha.extra_tokens.add('user1-own-token')
+        await self.restart_bot(household(permissions=['allow light.test_lamp']),
+                               user_tokens={'user1': 'user1-own-token'})
+        self.claude.set(reply='ok', actions=[LAMP_ON])
+        await self.deliver(sender=USER1, text='licht an')
+        await self.deliver(sender=USER2, text='licht an')
+        self.assertEqual(self.ha.call_tokens, ['user1-own-token', self.ha.token])
+        self.assertEqual(len(self.ha.calls), 2)
 
     async def test_group_request_confirmed_by_yes_in_dm(self):
         [q] = await self.propose(group=GROUP)
@@ -950,6 +1001,111 @@ class ScheduleTests(Integration):
         await self.advance(60)
         self.assertEqual(len(self.ha.calls), 1)
 
+    WASHER = {'entity_id': 'sensor.washer_power', 'below': 5, 'for_minutes': 3}
+
+    async def test_triggered_task_fires_once_after_holding(self):
+        self.ha.states['sensor.washer_power'] = '400'
+        await self.listen_to_ha()
+        self.answer(reply='Mache ich.', tasks=[{'at': None, 'when': self.WASHER, 'repeat': 'once',
+                                                'prompt': 'Tell me the washing machine is done.', 'grants': []}])
+        await self.deliver(sender=USER1, text='sag mir wenn die waschmaschine fertig ist')
+        self.assertRegex(self.dm(USER1)[-1], r'Task #\d+ set: task .* when sensor.washer_power is below 5 '
+                                             r'for 3 min\. /cancel')
+        [(job, _, _, _, data, run_at)] = self.bot.store.scheduled(USER1)
+        self.assertIsNone(run_at)
+        self.assertIn('when sensor.washer_power', self.bot.job_command(
+            dataclasses.replace(self.bot_msg(), text='/scheduled')))
+        self.answer(reply='Die Waschmaschine ist fertig.')
+        await self.change('sensor.washer_power', '2', {'unit_of_measurement': 'W'})
+        await self.advance(60)                      # not yet held for 3 minutes
+        self.assertEqual(len(self.claude.calls), 1)
+        await self.change('sensor.washer_power', '120', {'unit_of_measurement': 'W'})  # spin cycle
+        await self.advance(200)
+        self.assertEqual(len(self.claude.calls), 1)
+        await self.change('sensor.washer_power', '1.5', {'unit_of_measurement': 'W'})
+        await self.advance(200)
+        await self.until(lambda: len(self.dm(USER1)) == 2)
+        self.assertEqual(len(self.claude.calls), 2)
+        prompt = self.claude.calls[-1]['prompt']
+        self.assertIn(f'TASK #{job} WAS TRIGGERED NOW: sensor.washer_power is below 5 for 3 min', prompt)
+        self.assertIn('sensor.washer_power: 120 W → 1.5 W (for 3 min)', prompt)
+        self.assertEqual(self.dm(USER1)[-1], f'🔔 #{job}: Die Waschmaschine ist fertig.')
+        self.assertEqual(self.bot.store.scheduled(USER1), [])   # once: done
+        await self.change('sensor.washer_power', '300')
+        await self.change('sensor.washer_power', '0')
+        await self.advance(400)
+        self.assertEqual(len(self.claude.calls), 2)
+
+    async def change(self, *args):
+        await self.ha.change(*args)
+        await asyncio.sleep(0.1)  # let the bot see it before the test clock moves
+
+    def bot_msg(self):
+        from bot.core import Incoming
+        return Incoming(USER1, f'dm:{USER1}', False, int(self.now * 1000), '')
+
+    async def test_triggered_task_always_with_grant_and_cooldown(self):
+        self.ha.states['person.anna'] = 'not_home'
+        await self.listen_to_ha()
+        self.answer(reply='Okay.', tasks=[{'at': None, 'when': {'entity_id': 'person.anna', 'to': 'home'},
+                                           'repeat': 'always', 'prompt': 'Turn on the lamp.',
+                                           'grants': [{'service': 'light.turn_on', 'entity_id': 'light.test_lamp'}]}])
+        await self.deliver(sender=USER1, text='wenn anna heimkommt mach die lampe an')
+        [q] = self.questions(USER1)
+        self.assertIn('when person.anna becomes "home", every time', q['message'])
+        self.assertNotIn('first at', q['message'])
+        await self.deliver(sender=USER1, text='ja')
+        self.assertRegex(self.dm(USER1)[-1], r'Task #\d+ set: task .*/cancel')
+        self.answer(reply='Lampe an.', actions=[LAMP_ON])
+        await self.change('person.anna', 'home')
+        await self.until(lambda: self.ha.calls and 'approved with task' in self.dm(USER1)[-1])
+        self.assertEqual(self.ha.calls, [('light.turn_on', {'entity_id': 'light.test_lamp'})])
+        self.assertIn('approved with task', self.dm(USER1)[-1])
+        # Re-armed for next time, with a pause against flapping.
+        [(nxt, _, _, _, data, None_)] = self.bot.store.scheduled(USER1)
+        self.assertEqual(data['not_before'], self.bot.now() + 600)
+        await self.change('person.anna', 'not_home')
+        await self.change('person.anna', 'home')
+        await self.advance(1)
+        self.assertEqual(len(self.ha.calls), 1)                 # within the pause
+        await self.advance(700)
+        await self.change('person.anna', 'not_home')
+        await self.change('person.anna', 'unavailable')
+        await self.change('person.anna', 'home')            # from unavailable: not a real arrival
+        await self.advance(1)
+        self.assertEqual(len(self.ha.calls), 1)
+        await self.change('person.anna', 'not_home')
+        await self.change('person.anna', 'home')
+        await self.until(lambda: len(self.ha.calls) == 2)
+        await self.settle()
+        # Cancelling stops it.
+        [(nxt, *_)] = self.bot.store.scheduled(USER1)
+        self.assertTrue(self.bot.store.cancel_scheduled(nxt, USER1, self.bot.now()))
+        await self.advance(700)
+        await self.change('person.anna', 'not_home')
+        await self.change('person.anna', 'home')
+        await self.advance(1)
+        self.assertEqual(len(self.ha.calls), 2)
+
+    async def test_one_off_trigger_expires_and_invalid_triggers(self):
+        self.ha.states['binary_sensor.door'] = 'off'
+        for when, repeat, error in (({'entity_id': 'sensor.nope', 'to': 'on'}, 'once', 'does not exist'),
+                                    ({'entity_id': 'binary_sensor.door'}, 'once', 'needs to, from, above'),
+                                    ({'entity_id': 'binary_sensor.door', 'to': 'on'}, 'daily', 'once or always'),
+                                    ({'entity_id': 'binary_sensor.door', 'above': 'x'}, 'once', 'must be a number')):
+            self.answer(reply='ok', tasks=[{'at': None, 'when': when, 'repeat': repeat, 'prompt': 'p', 'grants': []}])
+            await self.deliver(sender=USER1, text=f'trigger {error}')
+            self.assertIn(error, self.dm(USER1)[-1])
+        self.assertEqual(self.bot.store.scheduled(USER1), [])
+        self.answer(reply='ok', tasks=[{'at': None, 'when': {'entity_id': 'binary_sensor.door', 'to': 'on'},
+                                        'repeat': 'once', 'prompt': 'say door', 'grants': []}])
+        await self.deliver(sender=USER1, text='sag wenn die tür aufgeht')
+        [(job, *_)] = self.bot.store.scheduled(USER1)
+        await self.advance(7 * 86400 + 60)
+        self.assertIn(f'Task #{job} ended: binary_sensor.door becomes "on" did not happen within 7 days.',
+                      self.dm(USER1)[-1])
+        self.assertEqual(self.bot.store.scheduled(USER1), [])
+
     async def test_task_cannot_create_tasks(self):
         self.answer(reply='ok', tasks=[{'at': self.at(900), 'prompt': 'say hi', 'repeat': 'once'}])
         await self.deliver(sender=USER1, group=GROUP, text='/ha say hi in 15 minutes')
@@ -1048,6 +1204,51 @@ class FailureTests(Integration):
         await self.settle()
         self.assertEqual(self.claude.calls, [])
         self.assertIn('restarted while handling', self.dm(USER1)[-1])
+
+
+class HaEventTests(Integration):
+    async def test_notify_event_message_and_prompt(self):
+        await self.listen_to_ha()
+        await self.ha.fire('homebot_notify', {'target': 'user1', 'message': 'Waschmaschine fertig', 'id': 'w1'})
+        await self.ha.fire('homebot_notify', {'target': 'user1', 'message': 'Waschmaschine fertig', 'id': 'w1'})
+        await asyncio.sleep(0.2)
+        await self.settle()
+        self.assertEqual(self.dm(USER1), ['Waschmaschine fertig'])        # deduplicated by id
+        self.assertEqual(self.claude.calls, [])
+        self.claude.set(reply='Im Wohnzimmer sind es 21,5 °C.')
+        await self.ha.fire('homebot_notify', {'target': 'user1', 'prompt': 'Report the living room temperature.'})
+        await self.until(lambda: len(self.dm(USER1)) == 2)
+        self.assertEqual(self.dm(USER1)[-1], '🔔 Im Wohnzimmer sind es 21,5 °C.')
+        [call] = self.claude.calls
+        self.assertIn('A HOME ASSISTANT AUTOMATION ASKS FOR A MESSAGE NOW', call['prompt'])
+        self.assertIn('Report the living room temperature.', call['prompt'])
+        argv = call['argv']
+        schema = json.loads(argv[argv.index('--json-schema') + 1])
+        self.assertEqual(schema['properties']['actions']['maxItems'], 0)   # never actions from an event
+        # Unknown targets and malformed events are ignored.
+        for data in ({'target': 'nobody', 'message': 'x'}, {'target': 'user1'},
+                     {'target': 'user1', 'message': 'x', 'prompt': 'y'}, {'target': 'user1', 'message': 'x', 'cmd': 1}):
+            await self.ha.fire('homebot_notify', data)
+        await asyncio.sleep(0.3)
+        await self.settle()
+        self.assertEqual(len(self.dm(USER1)), 2)
+
+    async def test_event_prompt_cannot_act(self):
+        await self.listen_to_ha()
+        self.claude.set(reply='Lampe an?', actions=[LAMP_ON])
+        await self.ha.fire('homebot_notify', {'target': 'user1', 'prompt': 'Turn on the lamp.'})
+        await self.until(lambda: self.dm(USER1))
+        self.assertEqual(self.ha.calls, [])
+        self.assertEqual(self.questions(USER1), [])
+
+    async def test_bad_ha_token_does_not_subscribe(self):
+        await self.restart_bot(ha_token='wrong')
+        from bot import ha_events
+        task = asyncio.create_task(ha_events.listen(self.http, self.bot.cfg.ha_url, 'wrong', self.bot.on_ha_event))
+        await asyncio.sleep(0.5)
+        self.assertEqual(self.ha.ws_subscriptions, [])
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 class NotifyTests(Integration):

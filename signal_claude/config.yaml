@@ -1,6 +1,6 @@
 name: "Signal HomeBot (Claude)"
 description: "Private Signal bot powered by Claude Code and Home Assistant MCP"
-version: "0.12.0"
+version: "0.13.0"
 slug: "signal_claude"
 url: "https://github.com/misberner/signal-homebot"
 arch:
@@ -23,6 +23,7 @@ options:
   ha_base_url: "http://homeassistant:8123"
   ha_token: ""
   notify_token: ""
+  ha_user_tokens: []
 schema:
   claude_oauth_token: "password?"
   ha_mcp_kind: "list(hass|ha_mcp)"
@@ -31,3 +32,6 @@ schema:
   ha_base_url: "url"
   ha_token: "password?"
   notify_token: "password?"
+  ha_user_tokens:
+    - user: "match(^[a-z][a-z0-9_]{0,31}$)"
+      token: password

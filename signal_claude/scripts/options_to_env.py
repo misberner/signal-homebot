@@ -23,3 +23,11 @@ for key, env in fields.items():
     if not isinstance(val, str):
         raise ValueError(f'{key} must be a string')
     print(f'export {env}={shlex.quote(val.strip())}')
+# Personal HA tokens (writes are then logged in HA as that person's).
+tokens = {}
+for item in opts.get('ha_user_tokens') or []:
+    if not isinstance(item, dict) or not isinstance(item.get('user'), str) or not isinstance(item.get('token'), str):
+        raise ValueError('ha_user_tokens entries need a user and a token')
+    if item['token'].strip():
+        tokens[item['user'].strip()] = item['token'].strip()
+print(f'export HA_USER_TOKENS={shlex.quote(json.dumps(tokens))}')

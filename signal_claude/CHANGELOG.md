@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.0 — 2026-10-23
+
+### Added
+- **Tasks on a change**: a task can start when an entity changes (`to`,
+  `from`, `above`, `below`, optional `attribute` and `for_minutes`), once
+  (within 7 days) or every time (at most every 10 minutes). The bot follows
+  states over HA's WebSocket API; Claude is told what changed. Grants and the
+  reviewer apply as for timed tasks.
+- **`homebot_notify` event**: automations message a person or group, either
+  verbatim (`message`) or written by Claude with read-only tools (`prompt`).
+- **More reads**: calendar events, todo lists, the logbook and
+  automation/script traces.
+- **`todo`** is a controllable domain (e.g. adding to the shopping list).
+- **`ha_user_tokens`**: optional personal HA tokens, so HA logs changes as
+  the person who asked.
+
 ## 0.12.0 — 2026-10-23
 
 ### Changed

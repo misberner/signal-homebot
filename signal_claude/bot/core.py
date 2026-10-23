@@ -27,6 +27,10 @@ TASK = 'homebot.task'            # internal "service": run Claude with a stored 
 REPEATS = ('once', 'daily', 'weekdays', 'weekly')
 MAX_TASKS = 20                   # pending tasks per user
 MAX_GRANTS = 5                   # actions a task may run without asking (confirmed when it is set up)
+TRIGGER_REPEATS = ('once', 'always')  # a task started by a state change: the first time, or every time
+TRIGGER_TTL = 7 * 86400          # a one-off trigger waits at most a week
+TRIGGER_COOLDOWN = 600           # an "always" trigger fires at most every 10 minutes
+TRIGGER_KEYS = frozenset({'entity_id', 'attribute', 'to', 'from', 'above', 'below', 'for_minutes'})
 OUTBOX_MAX_AGE = 3600
 OUTBOX_MAX_ATTEMPTS = 8
 OBJECT_REPLACEMENT = '￼'  # Signal puts this where an @mention was
@@ -37,7 +41,7 @@ OBJECT_REPLACEMENT = '￼'  # Signal puts this where an @mention was
 WRITABLE_DOMAINS = frozenset({
     'light', 'switch', 'fan', 'cover', 'climate', 'humidifier', 'water_heater',
     'media_player', 'scene', 'script', 'input_boolean', 'input_number',
-    'input_select', 'input_button', 'button', 'vacuum', 'select', 'number',
+    'input_select', 'input_button', 'button', 'vacuum', 'select', 'number', 'todo',
 })
 ENTITY_RE = r'[a-z_]+\.[a-z0-9_]+'
 FIELD_RE = r'[a-z_][a-z0-9_]{0,40}'
@@ -353,10 +357,100 @@ def describe(service: str, data: dict) -> str:
     if service == TASK:
         repeat = data.get('repeat', 'once')
         grants = '; '.join(f'{g["service"]} on {g["entity_id"]}' for g in data.get('grants') or [])
-        return (f'task "{data.get("prompt", "")}"' + (f' ({repeat})' if repeat != 'once' else '')
+        when = (f' when {describe_trigger(data["trigger"])}' + (', every time' if repeat == 'always' else '')
+                if data.get('trigger') else (f' ({repeat})' if repeat != 'once' else ''))
+        return (f'task "{data.get("prompt", "")}"' + when
                 + (f', may do without asking: {grants}' if grants else ''))
     extra = ', '.join(f'{k}={v}' for k, v in data.items() if k != 'entity_id')
     return f'{service} on {data["entity_id"]}' + (f' ({extra})' if extra else '')
+
+
+def parse_trigger(value: object) -> dict:
+    """A task's state trigger, like HA's state/numeric_state triggers: the
+    entity (or one attribute) changes to/from a state, rises above or falls
+    below a number, optionally for some minutes."""
+    if not isinstance(value, dict) or set(value) - TRIGGER_KEYS:
+        raise Denied('a trigger has entity_id, attribute, to, from, above, below and for_minutes')
+    trigger = {k: v for k, v in value.items() if v is not None}
+    if not isinstance(trigger.get('entity_id'), str) or not re.fullmatch(ENTITY_RE, trigger['entity_id']):
+        raise Denied('a trigger needs an entity_id')
+    if 'attribute' in trigger and not (isinstance(trigger['attribute'], str)
+                                       and re.fullmatch(FIELD_RE, trigger['attribute'])):
+        raise Denied('invalid trigger attribute')
+    for key in ('to', 'from'):
+        if key in trigger:
+            if isinstance(trigger[key], bool) or not isinstance(trigger[key], (str, int, float)):
+                raise Denied(f'trigger "{key}" must be a state')
+            trigger[key] = str(trigger[key])[:64]
+    for key in ('above', 'below'):
+        if key in trigger and (isinstance(trigger[key], bool) or not isinstance(trigger[key], (int, float))):
+            raise Denied(f'trigger "{key}" must be a number')
+    minutes = trigger.get('for_minutes', 0)
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or not 0 <= minutes <= 1440:
+        raise Denied('for_minutes must be 0-1440')
+    if not trigger.get('for_minutes'):
+        trigger.pop('for_minutes', None)
+    if not {'to', 'from', 'above', 'below'} & set(trigger):
+        raise Denied('a trigger needs to, from, above or below')
+    return trigger
+
+
+def describe_trigger(trigger: dict) -> str:
+    parts = []
+    if 'from' in trigger and 'to' in trigger:
+        parts.append(f'changes from "{trigger["from"]}" to "{trigger["to"]}"')
+    elif 'from' in trigger:
+        parts.append(f'leaves "{trigger["from"]}"')
+    elif 'to' in trigger:
+        parts.append(f'becomes "{trigger["to"]}"')
+    if 'above' in trigger:
+        parts.append(f'is above {trigger["above"]}')
+    if 'below' in trigger:
+        parts.append(f'is below {trigger["below"]}')
+    what = trigger['entity_id'] + (f' {trigger["attribute"]}' if 'attribute' in trigger else '')
+    return f'{what} {" and ".join(parts)}' + (f' for {trigger["for_minutes"]} min' if 'for_minutes' in trigger else '')
+
+
+def trigger_value(trigger: dict, state: object) -> object:
+    """The watched value in an HA state object, or None (missing, unavailable)."""
+    if not isinstance(state, dict):
+        return None
+    if 'attribute' in trigger:
+        attributes = state.get('attributes')
+        return attributes.get(trigger['attribute']) if isinstance(attributes, dict) else None
+    value = state.get('state')
+    return None if value in (None, 'unavailable', 'unknown') else value
+
+
+def trigger_holds(trigger: dict, state: object) -> bool:
+    """Whether the state satisfies the trigger's to/above/below (not "from")."""
+    value = trigger_value(trigger, state)
+    if value is None:
+        return False
+    if 'to' in trigger and str(value).casefold() != trigger['to'].casefold():
+        return False
+    if 'above' in trigger or 'below' in trigger:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        if 'above' in trigger and not number > trigger['above']:
+            return False
+        if 'below' in trigger and not number < trigger['below']:
+            return False
+    return True
+
+
+def trigger_fires(trigger: dict, old: object, new: object) -> bool:
+    """A state change that starts the trigger: the new state holds and either
+    the old one didn't or (with "from") the value left that state. Changes
+    from or to unavailable/unknown never fire."""
+    before, after = trigger_value(trigger, old), trigger_value(trigger, new)
+    if before is None or after is None or not trigger_holds(trigger, new):
+        return False
+    if 'from' in trigger:
+        return str(before).casefold() == trigger['from'].casefold() and str(before) != str(after)
+    return not trigger_holds(trigger, old)
 
 
 def parse_when(value: object, now: float) -> int | None:
@@ -422,11 +516,19 @@ def build_schema(writes: bool) -> dict:
                 'required': ['at', 'text'], 'additionalProperties': False}
     grant = {'type': 'object', 'properties': {'service': {'type': 'string'}, 'entity_id': {'type': 'string'}},
              'required': ['service', 'entity_id'], 'additionalProperties': False}
-    task = {'type': 'object', 'properties': {'at': {'type': 'string'}, 'prompt': {'type': 'string'},
-                                             'repeat': {'type': 'string', 'enum': list(REPEATS)},
+    trigger = {'type': ['object', 'null'],
+               'properties': {'entity_id': {'type': 'string'}, 'attribute': {'type': 'string'},
+                              'to': {'type': 'string'}, 'from': {'type': 'string'},
+                              'above': {'type': 'number'}, 'below': {'type': 'number'},
+                              'for_minutes': {'type': 'integer'}},
+               'required': ['entity_id'], 'additionalProperties': False}
+    task = {'type': 'object', 'properties': {'at': {'type': ['string', 'null']}, 'when': trigger,
+                                             'prompt': {'type': 'string'},
+                                             'repeat': {'type': 'string',
+                                                        'enum': list(REPEATS) + list(TRIGGER_REPEATS[1:])},
                                              'grants': {'type': 'array', 'items': grant,
                                                         'maxItems': MAX_GRANTS if writes else 0}},
-            'required': ['at', 'prompt', 'repeat', 'grants'], 'additionalProperties': False}
+            'required': ['at', 'when', 'prompt', 'repeat', 'grants'], 'additionalProperties': False}
     return {
         'type': 'object',
         'properties': {'reply': {'type': 'string'}, 'actions': actions,
@@ -759,10 +861,11 @@ class Store:
             if not row:
                 return None
             self.db.execute("UPDATE approvals SET status='consumed' WHERE code=?", (code,))
+            later = row[3] or row[1] == TASK  # a time, or a task waiting for its trigger
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,"
                                   "data_json,status,created_at,run_at,repeat) VALUES(?,?,?,?,?,?,?,?,?)",
                                   (code, sender, row[0], row[1], row[2],
-                                   'scheduled' if row[3] else 'executing', now, row[3], row[4] or 'once'))
+                                   'scheduled' if later else 'executing', now, row[3], row[4] or 'once'))
             return cur.lastrowid, row[0], row[1], json.loads(row[2]), row[3]
 
     def add_action(self, sender: str, request_conv: str, service: str, data: dict, now: int) -> int:
@@ -774,8 +877,9 @@ class Store:
                                     json.dumps(data), now)).lastrowid
 
     def add_scheduled(self, sender: str, request_conv: str, service: str, data: dict,
-                      run_at: int, now: int, repeat: str = 'once') -> int:
-        """A job that needs no (further) confirmation: reminders, tasks, auto-approved actions."""
+                      run_at: int | None, now: int, repeat: str = 'once') -> int:
+        """A job that needs no (further) confirmation: reminders, tasks, auto-approved
+        actions. A task without run_at waits for its state trigger."""
         with self._tx():
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
                                   "status,created_at,run_at,repeat) VALUES(?,?,?,?,?,'scheduled',?,?,?)",
@@ -783,10 +887,11 @@ class Store:
                                    json.dumps(data), now, run_at, repeat))
             return cur.lastrowid
 
-    def scheduled(self, sender: str | None = None) -> list[tuple[int, str, str, str, dict, int]]:
-        """Pending jobs (all, or one sender's): (id, sender, request_conv, service, data, run_at)."""
+    def scheduled(self, sender: str | None = None) -> list[tuple[int, str, str, str, dict, int | None]]:
+        """Pending jobs (all, or one sender's): (id, sender, request_conv, service, data, run_at);
+        run_at is None for a task waiting for its trigger."""
         query = "SELECT id,sender,request_conv,service,data_json,run_at FROM actions WHERE status='scheduled'"
-        rows = self.db.execute(query + (' AND sender=?' if sender else '') + ' ORDER BY run_at',
+        rows = self.db.execute(query + (' AND sender=?' if sender else '') + ' ORDER BY run_at IS NULL, run_at, id',
                                (sender,) if sender else ()).fetchall()
         return [(i, s, c, svc, json.loads(d), r) for i, s, c, svc, d, r in rows]
 
@@ -800,7 +905,11 @@ class Store:
         return row[2] or 'once'
 
     def due_scheduled(self, now: int) -> list[tuple[int, str, str, str, dict, int]]:
-        return [job for job in self.scheduled() if job[5] <= now]
+        return [job for job in self.scheduled() if job[5] is not None and job[5] <= now]
+
+    def watching(self) -> list[tuple[int, str, str, str, dict, None]]:
+        """Tasks waiting for a state trigger."""
+        return [job for job in self.scheduled() if job[5] is None and job[3] == TASK and job[4].get('trigger')]
 
     def start_scheduled(self, action_id: int) -> bool:
         """Claim a due job exactly once (scheduled -> executing)."""
@@ -829,9 +938,18 @@ class Store:
         action keeps its confirmation for the whole series)."""
         row = self.db.execute('SELECT sender,request_conv,service,data_json,run_at,repeat FROM actions '
                               'WHERE id=?', (action_id,)).fetchone()
-        if not row or not row[4]:
+        if not row:
             return None
         sender, conv, service, data_json, run_at, repeat = row
+        data = json.loads(data_json)
+        if run_at is None:  # a triggered task: wait for the next time, after a pause
+            if service != TASK or not data.get('trigger') or data.get('repeat') != 'always':
+                return None
+            data['not_before'] = now + TRIGGER_COOLDOWN
+            return self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
+                                   "status,created_at,repeat) VALUES(?,?,?,?,?,'scheduled',?,?)",
+                                   (f'job-{now}-{os.urandom(6).hex()}', sender, conv, service,
+                                    json.dumps(data), now, repeat)).lastrowid
         when = next_run(run_at, self.repeat_of(action_id), now)
         if when is None:
             return None
@@ -959,12 +1077,19 @@ class Store:
     def notify(self, notify_id: str | None, dest: str, text: str, now: int) -> bool:
         """Atomically dedupe and enqueue a proactive notification."""
         with self._tx():
-            if notify_id is not None:
-                cur = self.db.execute('INSERT OR IGNORE INTO notify_ids VALUES(?,?)', (notify_id, now))
-                if cur.rowcount == 0:
-                    return False
+            if not self._claim_notify_id(notify_id, now):
+                return False
             self._enqueue([(dest, text)], now)
             return True
+
+    def claim_notify_id(self, notify_id: str | None, now: int) -> bool:
+        """False if a notification with this id was already handled (7 days)."""
+        with self._tx():
+            return self._claim_notify_id(notify_id, now)
+
+    def _claim_notify_id(self, notify_id: str | None, now: int) -> bool:
+        return notify_id is None or self.db.execute('INSERT OR IGNORE INTO notify_ids VALUES(?,?)',
+                                                    (notify_id, now)).rowcount == 1
 
     # -- retention --------------------------------------------------------
 

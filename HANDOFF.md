@@ -53,7 +53,7 @@ The user approved fixing these, in this order:
    `{service, entities (exact or domain.*), fields {name: {min,max}|{values}|{type:boolean}}, senders, contexts}`.
    Allowed domains are a fixed list (light, switch, fan, cover, climate,
    humidifier, water_heater, media_player, scene, script, input_*, button,
-   vacuum, select, number). Never lock, alarm, camera, notify, HA
+   vacuum, select, number, todo). Never lock, alarm, camera, notify, HA
    administration or shell. Claude proposes `{service, entity_id, data}`.
 3. **+ 4. Setup in HA's UI (ingress, port 8099).** Accept connections only
    from 172.30.32.2 and require a custom header on POST. The UI covers:

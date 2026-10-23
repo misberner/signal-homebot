@@ -5,7 +5,7 @@ set -euo pipefail
 #   signal  - signal-cli daemon, owns /data/signal (identity keys)
 #   node    - Claude broker + Claude Code, owns /data/claude and the OAuth token
 #   homebot - the bot and its setup page, owns /data/homebot (settings, SQLite),
-#             holds the HA/notify tokens
+#             holds the HA/notify tokens (incl. personal HA tokens)
 # Household settings (number, people, groups, actions) are managed in the
 # setup page (Open Web UI); the app options hold only secrets and connections.
 umask 077
@@ -88,7 +88,8 @@ echo 'Starting HomeBot (setup page: Open Web UI)'
 run_as homebot env -i PATH="$BASE_PATH" HOME=/data/homebot LANG=C.UTF-8 TZ="$TZ" PYTHONUNBUFFERED=1 \
   SIGNAL_DAEMON_URL=http://127.0.0.1:7583 \
   HA_BASE_URL="${HA_BASE_URL}" HA_MCP_URL="${HA_MCP_URL}" HA_MCP_KIND="${HA_MCP_KIND}" \
-  HA_MCP_DOMAINS="${HA_MCP_DOMAINS}" HA_TOKEN="${HA_TOKEN}" NOTIFY_TOKEN="${NOTIFY_TOKEN}" \
+  HA_MCP_DOMAINS="${HA_MCP_DOMAINS}" HA_TOKEN="${HA_TOKEN}" HA_USER_TOKENS="${HA_USER_TOKENS}" \
+  NOTIFY_TOKEN="${NOTIFY_TOKEN}" \
   NOTIFY_BIND="${NOTIFY_BIND:-0.0.0.0}" NOTIFY_PORT="${NOTIFY_PORT:-8999}" \
   BOT_DB=/data/homebot/bot.sqlite3 SETTINGS_FILE=/data/homebot/settings.json \
   CLAUDE_SOCKET="$CLAUDE_SOCKET" CLAUDE_CONFIGURED="$([[ -n "${CLAUDE_OAUTH_TOKEN}" ]] && echo true || echo false)" \

@@ -29,6 +29,7 @@ Python 3.13 and the bot in one amd64 container. See
 | `ha_token` | Long-lived token of a **non-admin** HA user. Needed for writes, and for the built-in MCP server. |
 | `ha_base_url` | Usually `http://homeassistant:8123`. |
 | `notify_token` | Optional, for n8n/automation notifications (≥ 32 random characters). |
+| `ha_user_tokens` | Optional: per person (`user` = their name on the setup page) a long-lived token of their own HA user. Changes they ask for are then made with it, so HA's logbook shows them, not the bot, and automations can tell who it was (`context.user_id`). Everyone else uses `ha_token`. This changes attribution only: what the bot may do is decided by the permission list, not by HA user rights. |
 
 Start the app, then click **Open Web UI** (or "HomeBot" in the sidebar).
 Everything else happens there.
@@ -80,7 +81,7 @@ forwards each call to Home Assistant with constrained arguments:
 
 | `ha_mcp_kind` | Tools Claude gets | Upstream |
 |---|---|---|
-| `ha_mcp` (recommended) | `search_entities`, `get_states` (≤ 25 entities, with attributes such as temperatures), `get_overview` (states per domain, never your coordinates), `get_history` (≤ 10 entities), `get_dashboard` (list, read or search dashboards; screenshots if ha-mcp's screenshot beta is on), `get_automation_config` / `get_script_config` (sources), `get_image` (pictures of `image.*` entities via HA's image proxy, and `camera.*` snapshots via ha-mcp; ≤ 4 MB) | [ha-mcp](https://github.com/homeassistant-ai/ha-mcp) |
+| `ha_mcp` (recommended) | `search_entities`, `get_states` (≤ 25 entities, with attributes such as temperatures), `get_overview` (states per domain, never your coordinates), `get_history` (≤ 10 entities), `get_dashboard` (list, read or search dashboards; screenshots if ha-mcp's screenshot beta is on), `get_automation_config` / `get_script_config` (sources), `get_image` (pictures of `image.*` entities via HA's image proxy, and `camera.*` snapshots via ha-mcp; ≤ 4 MB), `get_calendar_events` (`calendar.*`), `get_todo_items` (`todo.*` lists, e.g. shopping), `get_logbook` (≤ 7 days, optionally one entity), `get_traces` (recent runs of an automation or script: trigger, conditions, actions) | [ha-mcp](https://github.com/homeassistant-ai/ha-mcp) |
 | `hass` | `get_live_context` | HA's built-in **Model Context Protocol Server** (Assist API, read-only option, exposed entities only) |
 
 **ha-mcp must be read-only.** The bot refuses any ha-mcp connection whose
@@ -162,7 +163,21 @@ asks you once when it is set up: "Shall I set up task …, may do without
 asking: climate.set_temperature on climate.wohnzimmer?". After your yes, it
 does those calls when it runs without asking you again; the permission list,
 your rules and the reviewer (which can still deny) apply each time.
-Other changes it proposes are asked as usual. A running task can't create further tasks. Up to 20 per person;
+Other changes it proposes are asked as usual.
+
+Tasks can also start on a **change** instead of a time ("tell me when the
+washing machine is done", "when Anna gets home, turn on the hall light"):
+Claude gives the entity and a condition (`to`, `from`, `above`, `below`,
+optionally an `attribute` and `for_minutes`), like an HA state trigger. It
+fires when the entity changes into the condition (not if it already holds;
+changes from `unavailable`/`unknown` don't count), either **once** (within
+7 days, then it ends with a note) or **every time** (at most every 10
+minutes, until cancelled). Claude is told what changed ("sensor.washer: 120 W
+→ 1.5 W (for 3 min)"); the answer arrives as "🔔 #12: …". Grants work the
+same. The bot follows changes through HA's WebSocket API with `ha_token`;
+changes while the bot is offline are not seen.
+
+A running task can't create further tasks. Up to 20 per person;
 cancelling a repeating task stops the series. `/scheduled` lists your pending items and
 `/cancel 12` cancels one (or just ask). Scheduling is done by the bot,
 durably, not by Claude: Claude Code's own scheduling only lives as long as
@@ -243,7 +258,27 @@ checked). The broker runs Claude with a fixed command line: no built-in tools
 read-tool server. The signal-cli HTTP port has no authentication of its own
 and is reachable only inside this container.
 
-## Proactive notifications (optional, n8n)
+## Notifications from Home Assistant
+
+An automation can message a person or group through the
+`homebot_notify` event (needs `ha_token`; the bot listens for it):
+
+```yaml
+actions:
+  - event: homebot_notify
+    event_data:
+      target: alex             # a person or group name from the setup page
+      message: "Waschmaschine fertig"
+```
+
+With `prompt` instead of `message`, Claude writes the message, looking things
+up with its read tools first ("prompt: Which windows are open? Say nothing if
+none."). Such a run can only read: no changes, tasks or reminders. An
+optional `id` deduplicates. Unknown targets and other fields are ignored.
+Triggered tasks and `prompt` events together start Claude at most 30 times
+an hour.
+
+### Webhook (optional, n8n)
 
 With `notify_token` set, `POST /notify` on port 8999 of the app's internal
 network sends a message:

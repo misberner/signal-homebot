@@ -251,6 +251,10 @@ class FakeHomeAssistant:
             'entity_picture': '/api/image_proxy/image.vacuum_map?token=' + IMAGE_TOKEN}}
         self.runner = None
         self.url = ''
+        self.extra_tokens: set[str] = set()   # personal tokens accepted for service calls
+        self.call_tokens: list[str] = []      # the token each service call used
+        self.ws_subscriptions: list[tuple[web.WebSocketResponse, int, str]] = []
+        self.ws_auth_ok = 0
 
     @property
     def mcp_url(self) -> str:
@@ -271,6 +275,7 @@ class FakeHomeAssistant:
         app.router.add_post('/api/services/{domain}/{service}', self.service)
         app.router.add_get('/api/image_proxy/{entity_id}', self.image_proxy)
         app.router.add_get('/api/states/{entity_id}', self.state)
+        app.router.add_get('/api/websocket', self.websocket)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         port = free_port()
@@ -290,6 +295,44 @@ class FakeHomeAssistant:
                                   'attributes': {'friendly_name': entity_id.split('.')[1].replace('_', ' ').title(),
                                                  **self.attributes.get(entity_id, {})}})
 
+    async def websocket(self, req: web.Request) -> web.WebSocketResponse:
+        """HA's WebSocket API: auth, then subscribe_events."""
+        ws = web.WebSocketResponse()
+        await ws.prepare(req)
+        await ws.send_json({'type': 'auth_required', 'ha_version': '2026.10.0'})
+        auth = await ws.receive_json()
+        if auth.get('type') != 'auth' or auth.get('access_token') != self.token:
+            await ws.send_json({'type': 'auth_invalid', 'message': 'Invalid access token'})
+            await ws.close()
+            return ws
+        await ws.send_json({'type': 'auth_ok', 'ha_version': '2026.10.0'})
+        self.ws_auth_ok += 1
+        async for message in ws:
+            item = json.loads(message.data)
+            if item.get('type') == 'subscribe_events':
+                self.ws_subscriptions.append((ws, item['id'], item.get('event_type')))
+                await ws.send_json({'id': item['id'], 'type': 'result', 'success': True, 'result': None})
+            else:
+                await ws.send_json({'id': item.get('id'), 'type': 'result', 'success': False})
+        self.ws_subscriptions = [sub for sub in self.ws_subscriptions if sub[0] is not ws]
+        return ws
+
+    async def fire(self, event_type: str, data: dict) -> None:
+        for ws, sub_id, wanted in list(self.ws_subscriptions):
+            if wanted == event_type and not ws.closed:
+                await ws.send_json({'id': sub_id, 'type': 'event', 'event': {
+                    'event_type': event_type, 'data': data, 'origin': 'LOCAL',
+                    'time_fired': '2026-10-23T10:00:00+00:00', 'context': {'id': 'x', 'user_id': None}}})
+
+    async def change(self, entity_id: str, state: str, attributes: dict | None = None) -> None:
+        """Change a state and fire state_changed like HA."""
+        def obj(value):
+            return None if value is None else {'entity_id': entity_id, 'state': value,
+                                               'attributes': attributes or {}}
+        old = self.states.get(entity_id)
+        self.states[entity_id] = state
+        await self.fire('state_changed', {'entity_id': entity_id, 'old_state': obj(old), 'new_state': obj(state)})
+
     async def image_proxy(self, req: web.Request) -> web.Response:
         # Like HA: the entity's access token authorizes this one image.
         if req.match_info['entity_id'] != 'image.vacuum_map' or req.query.get('token') != IMAGE_TOKEN:
@@ -301,8 +344,10 @@ class FakeHomeAssistant:
         await self.runner.cleanup()
 
     async def service(self, req: web.Request) -> web.Response:
-        if req.headers.get('Authorization') != f'Bearer {self.token}':
+        token = req.headers.get('Authorization', '').removeprefix('Bearer ')
+        if token != self.token and token not in self.extra_tokens:
             return web.Response(status=401)
+        self.call_tokens.append(token)
         name = f'{req.match_info["domain"]}.{req.match_info["service"]}'
         self.calls.append((name, await req.json()))
         if self.mode == 'slow':
@@ -415,6 +460,40 @@ def _start_mcp(read_only: bool) -> str:
         fake.mcp_args.append({'query': query, 'domain_filter': domain_filter, 'limit': limit})
         return json.dumps({'success': True, 'entities': [{'entity_id': e, 'state': st}
                                                          for e, st in fake.states.items()]})
+
+    @server.tool(name='ha_config_get_calendar_events')
+    def ha_config_get_calendar_events(entity_id: str, start: str | None = None, end: str | None = None,
+                                      max_results: int = 20) -> str:
+        """Calendar events."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_config_get_calendar_events')
+        fake.mcp_args.append({'entity_id': entity_id, 'start': start, 'end': end, 'max_results': max_results})
+        return json.dumps({'success': True, 'events': [{'start': {'date': '2026-10-26'}, 'summary': 'Grau'}]})
+
+    @server.tool(name='ha_get_todo')
+    def ha_get_todo(entity_id: str | None = None, status: str | None = None) -> str:
+        """Todo lists or items."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_get_todo')
+        fake.mcp_args.append({'entity_id': entity_id, 'status': status})
+        return json.dumps({'success': True, 'items': [{'summary': 'Milch', 'status': 'needs_action'}]})
+
+    @server.tool(name='ha_get_logs')
+    def ha_get_logs(source: str = 'logbook', entity_id: str | None = None, hours_back: int = 1,
+                    limit: int | None = None) -> str:
+        """Logs."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_get_logs')
+        fake.mcp_args.append({'source': source, 'entity_id': entity_id, 'hours_back': hours_back, 'limit': limit})
+        return json.dumps({'data': {'success': True, 'entries': [{'name': 'Flur', 'message': 'turned on'}]}})
+
+    @server.tool(name='ha_get_automation_traces')
+    def ha_get_automation_traces(automation_id: str, run_id: str | None = None, limit: int = 10) -> str:
+        """Automation traces."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_get_automation_traces')
+        fake.mcp_args.append({'automation_id': automation_id, 'run_id': run_id, 'limit': limit})
+        return json.dumps({'success': True, 'traces': [{'run_id': '1.2', 'state': 'stopped'}]})
 
     @server.tool(name='ha_get_history')
     def ha_get_history(entity_ids: str | list[str], start_time: str | None = None, limit: int | None = None,

@@ -88,7 +88,8 @@ class Broker:
     mcp_url: str = 'http://127.0.0.1:8765/mcp'
     allowed_tools: tuple[str, ...] = ('search_entities', 'get_states', 'get_overview', 'get_history',
                                       'get_dashboard', 'get_automation_config', 'get_script_config',
-                                      'get_image', 'get_live_context')
+                                      'get_image', 'get_calendar_events', 'get_todo_items',
+                                      'get_logbook', 'get_traces', 'get_live_context')
 
     def __post_init__(self):
         self.busy = asyncio.Lock()
@@ -158,7 +159,7 @@ class Broker:
         token, tools = request.get('mcp_token'), request.get('tools')
         if token is not None and (not isinstance(token, str) or not re.fullmatch(TOKEN_RE, token)):
             return False
-        if tools is not None and (not isinstance(tools, list) or len(tools) > 10 or token is None
+        if tools is not None and (not isinstance(tools, list) or len(tools) > len(self.allowed_tools) or token is None
                                   or not all(isinstance(t, str) and t in self.allowed_tools for t in tools)):
             return False
         return True
