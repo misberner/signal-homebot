@@ -41,6 +41,7 @@ def household(**changes):
 
 @unittest.skipUnless(aiohttp, 'integration tests need aiohttp and mcp (pip install -r requirements.lock)')
 class Integration(unittest.IsolatedAsyncioTestCase):
+    claude_timeout = 5  # seconds; tests where fake Claude makes real MCP calls need more under emulation
     house = staticmethod(household)
 
     async def asyncSetUp(self):
@@ -58,7 +59,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         self.socket = os.path.join(self._sockdir.name, 'c.sock')
         self.proxy_port = free_port()
         self.broker = Broker(token='oauth-test-token', claude_home=str(self.dir / 'claude'),
-                             claude_bin=str(self.claude.path), timeout=5,
+                             claude_bin=str(self.claude.path), timeout=self.claude_timeout,
                              mcp_url=f'http://127.0.0.1:{self.proxy_port}/mcp')
         self.broker_server = await self.broker.serve(self.socket)
         self.now = time.time()
@@ -85,7 +86,8 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         values = dict(db_path=str(self.dir / 'bot.sqlite3'), settings_path=str(self.dir / 'settings.json'),
                       ha_url=self.ha.url, mcp_url=self.ha.mcp_url, ha_token=self.ha.token,
                       signal_url=self.signal.url, notify_token='n' * 40, ui_peer=None,
-                      proxy_port=self.proxy_port, claude_socket=self.socket, claude_timeout=5, ha_timeout=1)
+                      proxy_port=self.proxy_port, claude_socket=self.socket, claude_timeout=self.claude_timeout,
+                      ha_timeout=1)
         values.update(overrides)
         return Config(**values)
 
@@ -427,6 +429,7 @@ class PhotoTests(Integration):
 
 
 class SkillTests(Integration):
+    claude_timeout = 30
     SKILLS = [{'name': 'heizung', 'description': 'Anything about heating or hot water',
                'body': 'Read from the ebusd integration first; myVaillant only as a fallback.', 'always': False},
               {'name': 'licht', 'description': 'Lights', 'body': 'Use script.licht_szene, not light.*', 'always': True}]
@@ -498,7 +501,38 @@ class DashboardPictureTests(Integration):
             self.assertIn('could not get a picture', self.dm(USER1)[-1])
 
 
+class ChartTests(Integration):
+    async def test_chart_from_statistics_and_history(self):
+        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
+        self.ha.states.update({'sensor.load_power': '0.7', 'binary_sensor.washer': 'off'})
+        self.ha.attributes.update({'sensor.load_power': {'unit_of_measurement': 'kW', 'friendly_name': 'Load'}})
+        self.ha.statistics['sensor.load_power'] = [{'mean': 0.5 + i % 3, 'min': 0.1, 'max': 4.0} for i in range(50)]
+        self.ha.history['binary_sensor.washer'] = [(7200, 'on'), (3600, 'off')]
+        out = {'reply': 'Hier der Verlauf.', 'actions': [], 'charts': [
+            {'title': 'Strom heute', 'entity_ids': ['sensor.load_power', 'binary_sensor.washer'], 'hours': 24}]}
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': out}))
+        await self.deliver(sender=USER1, text='zeig mir den stromverbrauch heute')
+        msgs = self.signal.messages_to(f'dm:{USER1}')
+        self.assertEqual(msgs[0]['message'], 'Hier der Verlauf.')
+        [chart] = msgs[1]['attachments']
+        self.assertTrue(chart.startswith('data:image/png;filename=strom_heute.png;base64,'))
+        self.assertTrue(base64.b64decode(chart.split('base64,')[1]).startswith(b'\x89PNG'))
+        stats, hist = [a for a in self.ha.mcp_args if a.get('source') in ('statistics', 'history')][-2:]
+        self.assertEqual((stats['source'], stats['period'], stats['start_time'], stats['limit']),
+                         ('statistics', '5minute', '24h', 1000))
+        self.assertEqual((hist['source'], hist['entity_ids']), ('history', ['binary_sensor.washer']))
+        # Bad specs and missing data are explained, not drawn.
+        for chart, why in (({'title': 'x', 'entity_ids': ['light.x; rm'], 'hours': 5}, '1-6 entities'),
+                           ({'title': 'x', 'entity_ids': ['sensor.nothing'], 'hours': 5}, 'no data'),
+                           ({'title': 'x', 'entity_ids': ['sensor.load_power'], 'hours': 99999}, 'hours')):
+            self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {**out, 'charts': [chart]}}))
+            await self.deliver(sender=USER1, text=why)
+            self.assertIn(f'No chart:', self.dm(USER1)[-1])
+            self.assertIn(why, self.dm(USER1)[-1])
+
+
 class ToolTests(Integration):
+    claude_timeout = 30
     """Claude reads HA through the bot's local MCP proxy (real MCP on both sides)."""
 
     async def test_claude_uses_proxy_read_tool(self):

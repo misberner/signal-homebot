@@ -262,6 +262,8 @@ class FakeHomeAssistant:
         self.ws_subscriptions: list[tuple[web.WebSocketResponse, int, str]] = []
         self.ws_auth_ok = 0
         self.screenshots = True  # ha-mcp's dashboard screenshot beta
+        self.statistics: dict[str, list[dict]] = {}       # entity -> 5-minute rows (mean/min/max or change)
+        self.history: dict[str, list[tuple[int, str]]] = {}  # entity -> (seconds ago, state)
 
     @property
     def mcp_url(self) -> str:
@@ -411,7 +413,8 @@ def _start_mcp(read_only: bool) -> str:
         return json.dumps(result)
 
     @server.tool(name='ha_get_state')
-    def ha_get_state(entity_id: str | list[str], fields: list[str] | None = None) -> str:
+    def ha_get_state(entity_id: str | list[str], fields: list[str] | None = None,
+                     attribute_keys: list[str] | None = None) -> str:
         """Get current state of entities."""
         fake = FakeHomeAssistant.active
         fake.mcp_calls.append('ha_get_state')
@@ -507,12 +510,26 @@ def _start_mcp(read_only: bool) -> str:
 
     @server.tool(name='ha_get_history')
     def ha_get_history(entity_ids: str | list[str], start_time: str | None = None, limit: int | None = None,
-                       minimal_response: bool = True) -> str:
-        """State history."""
+                       minimal_response: bool = True, source: str = 'history', period: str = 'day') -> str:
+        """State history, or long-term statistics (like ha-mcp 8.7)."""
         fake = FakeHomeAssistant.active
         fake.mcp_calls.append('ha_get_history')
-        fake.mcp_args.append({'entity_ids': entity_ids, 'start_time': start_time, 'limit': limit})
-        return json.dumps({'success': True, 'entities': {}})
+        fake.mcp_args.append({'entity_ids': entity_ids, 'start_time': start_time, 'limit': limit,
+                              'source': source, 'period': period})
+        ids = entity_ids if isinstance(entity_ids, list) else [entity_ids]
+        now_ms = int(time.time() * 1000)
+        entities = []
+        for e in ids:
+            if source == 'statistics' and e in fake.statistics:
+                entities.append({'entity_id': e, 'period': period, 'statistics': [
+                    {'start': now_ms - (n - i) * 300_000, 'end': now_ms - (n - i - 1) * 300_000, **row}
+                    for n in [len(fake.statistics[e])] for i, row in enumerate(fake.statistics[e])]})
+            elif source == 'history' and e in fake.history:
+                entities.append({'entity_id': e, 'states': [
+                    {'state': st, 'last_changed': time.strftime('%Y-%m-%dT%H:%M:%S+00:00',
+                                                                time.gmtime(time.time() - ago))}
+                    for ago, st in fake.history[e]]})
+        return json.dumps({'data': {'success': True, 'source': source, 'entities': entities}})
 
     if not read_only:  # ha-mcp hides write-capable tools in Read Only Mode
         @server.tool(name='ha_call_service')

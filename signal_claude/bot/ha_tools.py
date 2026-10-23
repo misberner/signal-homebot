@@ -197,6 +197,28 @@ class HaTools:
             return (await self.image(entity_id)).data
         raise UpstreamError('not an image.* or camera.* entity')
 
+    async def chart_series(self, entity_ids: list[str], hours: int) -> list:
+        """Data for a chart: long-term statistics where HA keeps them, else the
+        raw state history (e.g. on/off sensors). Read-only ha-mcp calls."""
+        from .charts import history_series, period_for, statistics_series
+        span = f'{hours // 24}d' if hours >= 48 and hours % 24 == 0 else f'{hours}h'
+        state = json.loads(await self.call('ha_get_state', {
+            'entity_id': entity_ids, 'fields': ['entity_id', 'attributes'],
+            'attribute_keys': ['friendly_name', 'unit_of_measurement']}))
+        states = (state.get('data') or state).get('states') or {}
+        meta = {eid: {'label': str(attrs.get('friendly_name') or eid)[:60],
+                      'unit': str(attrs.get('unit_of_measurement') or '')[:20]}
+                for eid, attrs in ((e, (states.get(e) or {}).get('attributes') or {}) for e in entity_ids)}
+        found = statistics_series(await self.call('ha_get_history', {
+            'entity_ids': entity_ids, 'source': 'statistics', 'start_time': span,
+            'period': period_for(hours), 'limit': 1000}), meta)
+        missing = [e for e in entity_ids if e not in found]
+        if missing:
+            found.update(history_series(await self.call('ha_get_history', {
+                'entity_ids': missing, 'source': 'history', 'start_time': span, 'limit': 1000,
+                'minimal_response': True}), meta))
+        return [found[e] for e in entity_ids if e in found]
+
     # ---------------------------------------------------------------- MCP server
 
     def asgi_app(self):

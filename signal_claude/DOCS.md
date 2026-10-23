@@ -239,6 +239,12 @@ line too (e.g. `deny climate.*` and `review script.heizung_*`).
   the answer (needs ha-mcp). The history notes only that pictures were sent.
   Dashboard screenshots need ha-mcp's *dashboard screenshot* beta feature and
   its rendering engine (balloob's Puppet app), see ha-mcp's `docs/beta.md`.
+- **Charts**: for "power use today", "temperatures this week" or "when did
+  the washing machine run", Claude names up to 6 entities and a span (up to
+  90 days); the bot draws the chart itself from HA's long-term statistics
+  (5-minute, hourly or daily mean with min/max band; energy counters as bars
+  per period) or, for entities without statistics such as on/off sensors,
+  the state history. Needs ha-mcp.
 - While working, the bot marks your message read, shows "typing…" and posts
   one "⏳ Looking into it…" message. It updates that message as Claude looks
   things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.

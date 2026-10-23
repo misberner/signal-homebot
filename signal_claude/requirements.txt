@@ -2,3 +2,4 @@
 # requirements.lock (generated inside the image's Python, see DOCS.md).
 aiohttp==3.14.5
 mcp==2.3.0
+matplotlib==3.11.2  # charts from HA statistics

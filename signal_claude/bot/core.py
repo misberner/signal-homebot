@@ -566,6 +566,12 @@ def build_schema(writes: bool) -> dict:
         'type': 'object',
         'properties': {'reply': {'type': 'string'}, 'actions': actions,
                        'images': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 3},
+                       'charts': {'type': 'array', 'maxItems': 2, 'items': {
+                           'type': 'object', 'additionalProperties': False,
+                           'required': ['title', 'entity_ids', 'hours'],
+                           'properties': {'title': {'type': 'string'},
+                                          'entity_ids': {'type': 'array', 'items': {'type': 'string'}},
+                                          'hours': {'type': 'integer'}}}},
                        'reminders': {'type': 'array', 'items': reminder, 'maxItems': 3},
                        'tasks': {'type': 'array', 'items': task, 'maxItems': 3},
                        'cancel': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 5}},
@@ -679,9 +685,11 @@ def _structured_output(stdout: bytes, returncode: int = 0) -> dict:
 
 def _check_output(obj: dict) -> dict:
     if (not isinstance(obj, dict) or not {'reply', 'actions'} <= set(obj)
-            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel', 'images'}):
+            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel', 'images', 'charts'}):
         raise ClaudeError('invalid', 'missing structured output')
-    obj = {'reminders': [], 'tasks': [], 'cancel': [], 'images': [], **obj}
+    obj = {'reminders': [], 'tasks': [], 'cancel': [], 'images': [], 'charts': [], **obj}
+    if not isinstance(obj['charts'], list):
+        raise ClaudeError('invalid', 'charts must be a list')
     if not isinstance(obj['images'], list) or not all(isinstance(i, str) for i in obj['images']):
         raise ClaudeError('invalid', 'images must list entity ids')
     if (not isinstance(obj['reply'], str) or not isinstance(obj['actions'], list)

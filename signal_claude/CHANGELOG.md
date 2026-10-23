@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.0 — 2026-10-23
+
+### Added
+- **Charts**: Claude asks for a chart (entities + hours) and the bot draws
+  it with matplotlib from HA's statistics or state history, then sends it as
+  a picture. matplotlib is a new dependency (image about 100 MB larger).
+
 ## 0.15.1 — 2026-10-23
 
 ### Added

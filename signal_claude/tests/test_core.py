@@ -567,3 +567,41 @@ class PhotoParseTests(unittest.TestCase):
         self.assertEqual(image_type(b'\xff\xd8\xff\xe0rest'), 'image/jpeg')
         self.assertEqual(image_type(b'RIFF1234WEBPVP8 '), 'image/webp')
         self.assertIsNone(image_type(b'<svg xmlns="http://www.w3.org/2000/svg"/>'))
+
+
+class ChartUnitTests(unittest.TestCase):
+    def test_parse_and_render(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest('matplotlib not installed')
+        from datetime import datetime, timedelta
+        from bot.charts import statistics_series, history_series, render, check_spec, period_for, ChartError
+        now = int(time.time() * 1000)
+        stats = json.dumps({'data': {'entities': [
+            {'entity_id': 'sensor.p', 'statistics': [{'start': now - 600000, 'end': now - 300000, 'mean': 1.0,
+                                                       'min': 0.5, 'max': 2.0}]},
+            {'entity_id': 'sensor.e', 'statistics': [{'start': now - 3600000, 'end': now, 'change': 0.4, 'sum': 9}]},
+            {'entity_id': 'sensor.none', 'statistics': []}]}})
+        found = statistics_series(stats, {'sensor.p': {'label': 'P', 'unit': 'kW'}})
+        self.assertEqual({k: v.kind for k, v in found.items()}, {'sensor.p': 'band', 'sensor.e': 'bars'})
+        hist = json.dumps({'data': {'entities': [
+            {'entity_id': 'binary_sensor.w', 'states': [{'state': 'on', 'last_changed': '2026-10-23T10:00:00+02:00'},
+                                                        {'state': 'unavailable', 'last_changed': '2026-10-23T11:00:00+02:00'}]},
+            {'entity_id': 'sensor.t', 'states': [{'state': '21.5', 'last_changed': '2026-10-23T10:00:00+02:00'},
+                                                 {'state': 'x', 'last_changed': '2026-10-23T11:00:00+02:00'}]}]}})
+        found.update(history_series(hist, {}))
+        self.assertEqual((found['binary_sensor.w'].kind, found['binary_sensor.w'].y), ('binary', [1.0]))
+        self.assertEqual((found['sensor.t'].kind, found['sensor.t'].y), ('step', [21.5]))
+        end = datetime.now().astimezone()
+        png = render('t', list(found.values()), end - timedelta(hours=30), end)
+        self.assertTrue(png.startswith(b'\x89PNG'))
+        with self.assertRaises(ChartError):
+            render('t', [], end, end)
+        self.assertEqual([period_for(h) for h in (24, 72, 73, 1080, 1081)], ['5minute', '5minute', 'hour', 'hour', 'day'])
+        self.assertEqual(check_spec({'title': 'a', 'entity_ids': ['sensor.p', 'sensor.p'], 'hours': 2}),
+                         ('a', ['sensor.p'], 2))
+        for bad in ({'entity_ids': [], 'hours': 1}, {'entity_ids': ['sensor.p'], 'hours': True},
+                    {'entity_ids': ['sensor.p'] * 7, 'hours': 1}, {'entity_ids': ['sensor.p'], 'hours': 1, 'x': 1}):
+            with self.assertRaises(ChartError):
+                check_spec(bad)
