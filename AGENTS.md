@@ -39,8 +39,9 @@ This repository is an agent connected to **physical home devices**.
 - Senders must have verified identity keys (`listIdentities`), and the group
   roster must contain only the bot and configured users before anything is
   posted there. Users and groups are lists in the app options (no fixed count).
-- Household settings (number, people, groups, actions) live in the setup page
-  (`bot/webui.py`, ingress-only); app options hold only secrets/connections.
+- Household settings (number, people, groups, permissions, rules, skills) live
+  in the setup page (`bot/webui.py`, ingress-only); app options hold only
+  secrets/connections.
 - Layout: HA app repository. The app lives in `signal_claude/` (keep the slug:
   changing it orphans the users' `/data`). Bump `version` in
   `signal_claude/config.yaml` for every release users should receive.

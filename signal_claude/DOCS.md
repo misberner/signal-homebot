@@ -210,6 +210,18 @@ The bot acts only for configured people, in layers:
 This can't protect against someone who controls a configured person's Signal
 account or devices (an unlocked phone, a linked Signal Desktop).
 
+## Skills
+
+Section 6 of the setup page holds **skills**: instructions for one topic,
+e.g. *heizung* — "anything about heating or hot water" — "Read from the
+ebusd integration and the Heizung (eBUS) dashboard; myVaillant only as a
+fallback. Change the heating only through `script.heizung_*`." Claude always
+sees each skill's name and description and reads the instructions (tool
+`read_skill`) when the topic comes up; "always" puts them into every request
+instead. Skills are trusted (admins only) and take precedence over Claude's
+own approach. They guide Claude; to *enforce* something, add a permission
+line too (e.g. `deny climate.*` and `review script.heizung_*`).
+
 ## Message handling
 
 - Claude runs for every private message, and for group messages that start
@@ -221,6 +233,9 @@ account or devices (an unlocked phone, a linked Signal Desktop).
   that one request sees them: the history keeps just "[photo]". signal-cli
   keeps received attachments in its data folder (`/data/signal`). View-once
   photos, voice notes and other files are ignored.
+- Claude can **send pictures** back: camera snapshots and `image.*`
+  entities (e.g. "show me the front door"), up to 3, as a message after the
+  answer (needs ha-mcp). The history notes only that pictures were sent.
 - While working, the bot marks your message read, shows "typing…" and posts
   one "⏳ Looking into it…" message. It updates that message as Claude looks
   things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.
@@ -276,6 +291,11 @@ actions:
       target: alex             # a person or group name from the setup page
       message: "Waschmaschine fertig"
 ```
+
+`target` can also be `@everyone` (each person privately), `@home` or `@away`
+(each person whose HA person entity is or isn't `home`; set it per person
+on the setup page under "Set presence"), or a list such as `[alex, "@away"]`.
+Nobody matching means nothing is sent.
 
 With `prompt` instead of `message`, Claude writes the message, looking things
 up with its read tools first ("prompt: Which windows are open? Say nothing if

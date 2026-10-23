@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.0 — 2026-10-23
+
+### Added
+- **Skills**: admin-written instructions per topic on the setup page. Claude
+  sees name and description and reads the body with `read_skill` when the
+  topic comes up; "always" skills go into every request.
+- **Pictures back**: Claude can attach camera snapshots and `image.*`
+  pictures (up to 3) to its answer.
+- **Presence targets** for `homebot_notify` and `/notify`: `@everyone`,
+  `@home`, `@away` (per-person HA person entity on the setup page), and
+  lists of targets.
+
 ## 0.14.0 — 2026-10-23
 
 ### Added

@@ -17,6 +17,9 @@ from .core import ENTITY_RE, NAME_RE, Settings, load_permissions
 ACI_RE = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 PHONE_RE = r'\+[1-9][0-9]{6,14}'
 MODELS = ('opus', 'fable', 'sonnet', 'haiku')  # Claude Code aliases for the latest models
+SKILL_NAME_RE = r'[a-z0-9][a-z0-9_-]{0,39}'
+MAX_SKILLS = 30
+PERSON_RE = r'person\.[a-z0-9_]+'
 
 
 class HouseholdError(ValueError):
@@ -41,6 +44,10 @@ class Household:
     history_days: int = 7
     notes: str = ''  # admin-written hints for Claude (trusted), e.g. where presence data lives
     model: str = 'opus'  # Claude Code model alias
+    # Admin-written instructions per topic (trusted): {name, description, body, always}.
+    # Claude sees the descriptions and reads a body when the topic comes up.
+    skills: list = field(default_factory=list)
+    persons: dict[str, str] = field(default_factory=dict)  # user name -> HA person entity (presence)
 
     @property
     def permission_rules(self) -> list[tuple[str, str]]:
@@ -93,6 +100,25 @@ class Household:
             raise HouseholdError(f'Model must be one of {", ".join(MODELS)}')
         if len(self.notes) > 4000:
             raise HouseholdError('Notes: at most 4000 characters')
+        if len(self.skills) > MAX_SKILLS:
+            raise HouseholdError(f'At most {MAX_SKILLS} skills')
+        names = set()
+        for skill in self.skills:
+            if not isinstance(skill, dict) or set(skill) != {'name', 'description', 'body', 'always'}:
+                raise HouseholdError('A skill has a name, description, body and "always"')
+            name = skill['name']
+            if not isinstance(name, str) or not re.fullmatch(SKILL_NAME_RE, name) or name in names:
+                raise HouseholdError(f'Skill name "{name}": unique, lowercase letters, digits, _ or -')
+            names.add(name)
+            if not isinstance(skill['description'], str) or not 0 < len(skill['description'].strip()) <= 300:
+                raise HouseholdError(f'Skill "{name}": a description of 1-300 characters (when it applies)')
+            if not isinstance(skill['body'], str) or not 0 < len(skill['body'].strip()) <= 10000:
+                raise HouseholdError(f'Skill "{name}": instructions of 1-10000 characters')
+            if not isinstance(skill['always'], bool):
+                raise HouseholdError(f'Skill "{name}": "always" must be true or false')
+        for name, person in self.persons.items():
+            if name not in self.users or not isinstance(person, str) or not re.fullmatch(PERSON_RE, person):
+                raise HouseholdError(f'Presence of "{name}": a configured user and a person.* entity')
         if not 30 <= self.command_max_age <= 3600 or not 1 <= self.history_days <= 30:
             raise HouseholdError('Request age must be 30-3600 s and history 1-30 days')
 
@@ -113,7 +139,7 @@ class Household:
                  'users': dict, 'groups': dict, 'permissions': list, 'rules': str, 'allow_writes': bool,
                  'auto_approve': bool,
                  'require_verified_identity': bool, 'command_max_age': int, 'history_days': int,
-                 'notes': str, 'model': str}
+                 'notes': str, 'model': str, 'skills': list, 'persons': dict}
         for key, typ in types.items():
             value = getattr(house, key)
             if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):

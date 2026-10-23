@@ -30,8 +30,8 @@ HA_MCP_WRITE_TOOLS = ('ha_call_service', 'ha_write_file', 'ha_restart', 'ha_bulk
 TOOLS = {
     'ha_mcp': ('search_entities', 'get_states', 'get_overview', 'get_history', 'get_dashboard',
                'get_automation_config', 'get_script_config', 'get_image', 'get_calendar_events',
-               'get_todo_items', 'get_logbook', 'get_traces'),
-    'hass': ('get_live_context',),
+               'get_todo_items', 'get_logbook', 'get_traces', 'read_skill'),
+    'hass': ('get_live_context', 'read_skill'),
 }
 MAX_RESULT = 30000
 MAX_CONFIG_RESULT = 80000  # dashboards and automation sources are bigger than states
@@ -58,8 +58,9 @@ class UpstreamError(RuntimeError):
 
 
 class HaTools:
-    def __init__(self, cfg):
+    def __init__(self, cfg, skills=lambda: []):
         self.cfg = cfg
+        self.skills = skills  # the household's skills (admin-written, trusted)
         self.tokens: dict[str, float] = {}
         self._preflight_ok_until = 0.0
 
@@ -172,6 +173,19 @@ class HaTools:
                     if len(data) > MAX_IMAGE:
                         raise UpstreamError('image larger than 4 MB')
         return Image(data=bytes(data), format=fmt)
+
+    async def picture(self, entity_id: str) -> bytes:
+        """The current picture of an image.* or camera.* entity (to send to the chat)."""
+        if self.cfg.mcp_kind != 'ha_mcp':
+            raise UpstreamError('pictures need ha-mcp')
+        if re.fullmatch(r'camera\.[a-z0-9_]+', entity_id):
+            _, images = await self.call_content('ha_get_camera_image', {'entity_id': entity_id})
+            if not images:
+                raise UpstreamError('no snapshot')
+            return images[0].data
+        if re.fullmatch(r'image\.[a-z0-9_]+', entity_id):
+            return (await self.image(entity_id)).data
+        raise UpstreamError('not an image.* or camera.* entity')
 
     # ---------------------------------------------------------------- MCP server
 
@@ -340,6 +354,14 @@ class HaTools:
             async def get_live_context() -> str:
                 """Current state of all entities exposed to Home Assistant's Assist."""
                 return result_summary(await tools.call('GetLiveContext', {}))
+
+        @server.tool(name='read_skill')
+        async def read_skill(name: str) -> str:
+            """Read one of the household's skills (the admin's instructions for a topic) by name."""
+            for skill in tools.skills():
+                if skill['name'] == name:
+                    return skill['body']
+            raise ValueError(f'no skill named {name!r}')
 
         app = server.streamable_http_app(streamable_http_path='/mcp', stateless_http=True)
 

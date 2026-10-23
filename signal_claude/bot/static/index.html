@@ -128,14 +128,31 @@ deny *.turn_off"></textarea>
       <button onclick="runTest('claude')">Test Claude</button>
     </div>
   </section>
+
+  <section id="skills-section">
+    <h2>6. Skills</h2>
+    <p class="hint">Instructions for one topic, e.g. "heating: read from the ebusd integration and the
+      Heizung (eBUS) dashboard; myVaillant only as a fallback; change the heating only through
+      script.heizung_*". Claude always sees the description and reads the instructions when the topic
+      comes up; "always" puts them into every request. Trusted: only admins can edit them. They guide
+      Claude; to enforce something, also add a permission line or a rule.</p>
+    <div id="skills"></div>
+    <div class="row" style="margin-top:12px">
+      <button onclick="addSkill()">Add skill</button>
+      <button class="primary" onclick="saveSkills()">Save skills</button>
+    </div>
+  </section>
 </main>
 <div id="toast"></div>
 
 <script>
 let state = null;
 let dirty = false;  // unsaved edits in the settings: don't re-render them
-document.addEventListener('input', e => { if (e.target.closest('#settings, #settings2')) dirty = true; });
-document.addEventListener('change', e => { if (e.target.closest('#settings, #settings2')) dirty = true; });
+let skillsDirty = false;
+document.addEventListener('input', e => { if (e.target.closest('#settings, #settings2')) dirty = true;
+                                          if (e.target.closest('#skills')) skillsDirty = true; });
+document.addEventListener('change', e => { if (e.target.closest('#settings, #settings2')) dirty = true;
+                                           if (e.target.closest('#skills')) skillsDirty = true; });
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -218,7 +235,7 @@ function renderUsers() {
   for (const u of state.users) {
     const sn = el('input', {type: 'text', placeholder: 'enter after comparing'});
     t.append(el('tr', {},
-      el('td', {}, el('strong', {}, u.name), el('div', {}, el('code', {}, u.aci))),
+      el('td', {}, el('strong', {}, u.name), el('div', {}, el('code', {}, u.aci)), personField(u.name)),
       el('td', {}, trustBadge(u.trust)),
       el('td', {}, u.safety_number ? el('code', {}, u.safety_number) : el('span', {class: 'muted'}, '—'),
         u.trust && u.trust !== 'TRUSTED_VERIFIED' ? el('div', {class: 'row', style: 'margin-top:6px'}, sn,
@@ -241,6 +258,58 @@ function renderUsers() {
       el('td', {}, el('div', {class: 'row'}, name,
         el('button', {class: 'small primary', onclick: () => act('users/add', {name: name.value, aci: p.aci})}, 'Add')))));
   }
+}
+
+function personField(name) {
+  const input = el('input', {type: 'text', placeholder: 'person.' + name, value: (state.persons || {})[name] || ''});
+  return el('div', {class: 'row', style: 'margin-top:6px'}, input,
+    el('button', {class: 'small', title: 'Home Assistant person for presence (@home/@away notifications)',
+                  onclick: () => setPerson(name, input.value.trim())}, 'Set presence'));
+}
+
+async function setPerson(name, entity) {
+  const persons = {...(state.persons || {})};
+  if (entity) persons[name] = entity; else delete persons[name];
+  try { await api('settings', {persons}); toast('Saved.'); await load(); } catch (e) { toast(e.message, true); }
+}
+
+function skillCard(skill) {
+  const card = el('div', {class: 'skill', style: 'border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px'},
+    el('div', {class: 'row'},
+      el('div', {}, el('label', {}, 'Name'), el('input', {type: 'text', class: 'skill-name', placeholder: 'heizung', value: skill.name || ''})),
+      el('div', {style: 'flex:3 1 300px'}, el('label', {}, 'When it applies'),
+        el('input', {type: 'text', class: 'skill-description', placeholder: 'Anything about heating, hot water or the heat pump', value: skill.description || ''}))),
+    el('label', {}, 'Instructions'),
+    el('textarea', {class: 'skill-body', style: 'min-height:110px'}),
+    el('div', {class: 'row', style: 'margin-top:6px'},
+      el('label', {class: 'checks'}, el('label', {}, el('input', {type: 'checkbox', class: 'skill-always'}), 'always')),
+      el('button', {class: 'small', onclick: () => { card.remove(); skillsDirty = true; }}, 'Remove')));
+  card.querySelector('.skill-body').value = skill.body || '';
+  card.querySelector('.skill-always').checked = !!skill.always;
+  return card;
+}
+
+function renderSkills() {
+  const list = document.getElementById('skills');
+  list.replaceChildren(...(state.skills || []).map(skillCard));
+  if (!(state.skills || []).length) list.append(el('p', {class: 'muted', id: 'no-skills'}, 'No skills yet.'));
+}
+
+function addSkill() {
+  document.getElementById('no-skills')?.remove();
+  document.getElementById('skills').append(skillCard({}));
+  skillsDirty = true;
+}
+
+async function saveSkills() {
+  const skills = [...document.querySelectorAll('#skills .skill')].map(c => ({
+    name: c.querySelector('.skill-name').value.trim(),
+    description: c.querySelector('.skill-description').value.trim(),
+    body: c.querySelector('.skill-body').value,
+    always: c.querySelector('.skill-always').checked,
+  }));
+  try { await api('settings', {skills}); skillsDirty = false; toast('Saved.'); await load(); }
+  catch (e) { toast(e.message, true); }
 }
 
 function memberLine(m) {
@@ -313,6 +382,7 @@ async function load() {
   try { state = await api('state'); } catch (e) { toast(e.message, true); return; }
   renderAccount(); renderUsers(); renderGroups();
   if (!dirty) renderSettings();
+  if (!skillsDirty) renderSkills();
 }
 load();
 </script>

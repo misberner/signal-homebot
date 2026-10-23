@@ -23,10 +23,10 @@ except ImportError:  # pragma: no cover
 if aiohttp:
     from bot.claude_broker import Broker
     from bot.core import Incoming
-    from bot.household import Household, HouseholdStore
+    from bot.household import Household, HouseholdError, HouseholdStore
     from bot.server import Config, HomeBot
     from bot.webui import make_app
-    from tests.fakes import FakeClaude, FakeHomeAssistant, FakeSignalDaemon, envelope, free_port, scrubbed_env
+    from tests.fakes import FakeClaude, FakeHomeAssistant, FakeSignalDaemon, PNG, envelope, free_port, scrubbed_env
 from tests.ids import ACCOUNT, BOT, GROUP, STRANGER, USER1, USER2
 
 LAMP_ON = {'service': 'light.turn_on', 'entity_id': 'light.test_lamp', 'data': {}}
@@ -180,7 +180,7 @@ class ConversationTests(Integration):
             self.assertIn(flag, argv)
         for flag in ('--dangerously-skip-permissions', '--bare', '--safe-mode'):
             self.assertNotIn(flag, argv)
-        self.assertEqual(argv[argv.index('--allowedTools') + 1], 'mcp__ha__get_live_context')
+        self.assertEqual(argv[argv.index('--allowedTools') + 1], 'mcp__ha__get_live_context,mcp__ha__read_skill')
         # The MCP config is a private file with a per-request token, never HA credentials.
         server = call['mcp_config']['mcpServers']['ha']
         self.assertEqual(server['url'], f'http://127.0.0.1:{self.proxy_port}/mcp')
@@ -426,6 +426,57 @@ class PhotoTests(Integration):
         self.assertIn('Schöne Lampe.', self.group()[-1])
 
 
+class SkillTests(Integration):
+    SKILLS = [{'name': 'heizung', 'description': 'Anything about heating or hot water',
+               'body': 'Read from the ebusd integration first; myVaillant only as a fallback.', 'always': False},
+              {'name': 'licht', 'description': 'Lights', 'body': 'Use script.licht_szene, not light.*', 'always': True}]
+
+    async def test_skills_in_prompt_and_read_on_demand(self):
+        await self.restart_bot(household(skills=self.SKILLS))
+        self.claude.set(call_tool={'name': 'read_skill', 'args': {'name': 'heizung'}})
+        await self.deliver(sender=USER1, text='wie warm ist das warmwasser?')
+        call = self.claude.calls[-1]
+        system = call['argv'][call['argv'].index('--append-system-prompt') + 1]
+        self.assertIn('- heizung: Anything about heating or hot water (read it with read_skill("heizung") first)',
+                      system)
+        self.assertNotIn('ebusd', system)                               # body only on demand
+        self.assertIn('- licht (Lights):\nUse script.licht_szene, not light.*', system)  # "always" inline
+        self.assertIn('read_skill', call['argv'][call['argv'].index('--allowedTools') + 1])
+        self.assertIn('ebusd integration first', json.loads(self.dm(USER1)[-1])['text'])
+        self.claude.set(call_tool={'name': 'read_skill', 'args': {'name': 'nope'}})
+        await self.deliver(sender=USER1, text='nochmal')
+        self.assertTrue(json.loads(self.dm(USER1)[-1])['error'])
+
+    def test_skill_validation(self):
+        good = household(skills=self.SKILLS)
+        for bad in ([{**self.SKILLS[0], 'name': 'Heizung!'}], [self.SKILLS[0], self.SKILLS[0]],
+                    [{**self.SKILLS[0], 'description': ''}], [{**self.SKILLS[0], 'body': 'x' * 10001}],
+                    [{**self.SKILLS[0], 'always': 'yes'}], [{'name': 'x'}]):
+            with self.assertRaises(HouseholdError, msg=bad):
+                good.change(skills=bad)
+
+
+class PictureTests(Integration):
+    async def test_bot_sends_camera_and_image_pictures(self):
+        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {
+            'reply': 'Hier die Haustür.', 'actions': [], 'images': ['camera.front_door', 'image.vacuum_map',
+                                                                    'light.test_lamp']}}))
+        await self.deliver(sender=USER1, text='zeig mir die haustür')
+        msgs = self.signal.messages_to(f'dm:{USER1}')
+        self.assertTrue(msgs[0]['message'].startswith('Hier die Haustür.'))
+        self.assertIn('could not get a picture of light.test_lamp', msgs[0]['message'])
+        self.assertEqual(msgs[1]['message'], '')
+        self.assertEqual([a.split(';')[:2] for a in msgs[1]['attachments']],
+                         [['data:image/png', 'filename=camera_front_door.png'],
+                          ['data:image/png', 'filename=image_vacuum_map.png']])
+        self.assertEqual(base64.b64decode(msgs[1]['attachments'][0].split('base64,')[1]), PNG)
+        # The history only notes that pictures were sent.
+        self.assertIn('[sent 2 picture(s)]', self.bot.store.context(f'dm:{USER1}', self.bot.now()))
+        self.assertEqual(self.bot.store.db.execute(
+            'SELECT COUNT(*) FROM outbox WHERE attachments IS NOT NULL').fetchone()[0], 0)
+
+
 class ToolTests(Integration):
     """Claude reads HA through the bot's local MCP proxy (real MCP on both sides)."""
 
@@ -433,7 +484,7 @@ class ToolTests(Integration):
         self.claude.set(call_tool={'name': 'get_live_context', 'args': {}})
         await self.deliver(sender=USER1, text='what is on?')
         result = json.loads(self.dm(USER1)[0])
-        self.assertEqual(result['tools'], ['get_live_context'])
+        self.assertEqual(result['tools'], ['get_live_context', 'read_skill'])
         self.assertFalse(result['error'])
         self.assertIn('light.test_lamp: off', result['text'])
         self.assertEqual(self.ha.mcp_calls, ['homeassistant__GetLiveContext'])
@@ -447,7 +498,7 @@ class ToolTests(Integration):
         self.assertEqual(sorted(result['tools']), ['get_automation_config', 'get_calendar_events', 'get_dashboard',
                                                    'get_history', 'get_image', 'get_logbook', 'get_overview',
                                                    'get_script_config', 'get_states', 'get_todo_items', 'get_traces',
-                                                   'search_entities'])
+                                                   'read_skill', 'search_entities'])
         self.assertIn('21.5', result['text'])
         self.assertTrue(all(h is None for h in self.ha.mcp_auth_headers))  # no HA token to ha-mcp
         argv = self.claude.calls[0]['argv']
@@ -455,7 +506,7 @@ class ToolTests(Integration):
                          [f'mcp__ha__{t}' for t in ('search_entities', 'get_states', 'get_overview', 'get_history',
                                                      'get_dashboard', 'get_automation_config', 'get_script_config',
                                                      'get_image', 'get_calendar_events', 'get_todo_items',
-                                                     'get_logbook', 'get_traces')])
+                                                     'get_logbook', 'get_traces', 'read_skill')])
         # Invalid arguments never reach Home Assistant.
         self.ha.mcp_calls.clear()
         self.claude.set(call_tool={'name': 'get_states', 'args': {'entity_ids': ['light.x; rm -rf /']}})
@@ -1285,6 +1336,26 @@ class HaEventTests(Integration):
         await self.until(lambda: self.dm(USER1))
         self.assertEqual(self.ha.calls, [])
         self.assertEqual(self.questions(USER1), [])
+
+    async def test_presence_targets(self):
+        self.ha.states.update({'person.one': 'home', 'person.two': 'not_home'})
+        await self.restart_bot(household(persons={'user1': 'person.one', 'user2': 'person.two'}))
+        await self.listen_to_ha()
+        for target, text in (('@away', 'Fenster offen'), ('@home', 'Willkommen'), ('@everyone', 'Alle'),
+                             (['user1', 'home'], 'Liste')):
+            await self.ha.fire('homebot_notify', {'target': target, 'message': text})
+        await asyncio.sleep(0.3)
+        await self.settle()
+        self.assertEqual(self.dm(USER1), ['Willkommen', 'Alle', 'Liste'])
+        self.assertEqual(self.dm(USER2), ['Fenster offen', 'Alle'])
+        self.assertEqual(self.group(), ['Liste'])
+        # Nobody away: nothing is sent; unknown keywords are rejected.
+        self.ha.states['person.two'] = 'home'
+        await self.ha.fire('homebot_notify', {'target': '@away', 'message': 'x'})
+        await self.ha.fire('homebot_notify', {'target': '@nobody', 'message': 'x'})
+        await asyncio.sleep(0.3)
+        await self.settle()
+        self.assertEqual(len(self.dm(USER1)) + len(self.dm(USER2)), 5)
 
     async def test_bad_ha_token_does_not_subscribe(self):
         await self.restart_bot(ha_token='wrong')

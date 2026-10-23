@@ -154,6 +154,8 @@ class SetupApi:
             'history_days': house.history_days,
             'notes': house.notes,
             'model': house.model,
+            'skills': house.skills,
+            'persons': house.persons,
             'ha': {'kind': bot.cfg.mcp_kind, 'write_token': bool(bot.cfg.ha_token)},
             'claude_configured': bot.cfg.claude_configured,
         })
@@ -220,7 +222,8 @@ class SetupApi:
     async def users_remove(self, request: web.Request) -> web.Response:
         name = text(await body(request), 'name')
         house = self.bot.house
-        self.bot.update_house(house.change(users={n: a for n, a in house.users.items() if n != name}))
+        self.bot.update_house(house.change(users={n: a for n, a in house.users.items() if n != name},
+                                           persons={n: p for n, p in house.persons.items() if n != name}))
         return web.json_response({'ok': True})
 
     async def groups_add(self, request: web.Request) -> web.Response:
@@ -271,7 +274,8 @@ class SetupApi:
         changes = {}
         for key, typ in (('bot_name', str), ('allow_writes', bool), ('require_verified_identity', bool),
                          ('command_max_age', int), ('history_days', int), ('notes', str), ('model', str),
-                         ('auto_approve', bool), ('permissions', list), ('rules', str)):
+                         ('auto_approve', bool), ('permissions', list), ('rules', str), ('skills', list),
+                         ('persons', dict)):
             if key in data:
                 value = data[key]
                 if not isinstance(value, typ) or (typ is int and isinstance(value, bool)):

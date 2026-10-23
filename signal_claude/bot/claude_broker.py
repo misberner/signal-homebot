@@ -74,7 +74,7 @@ def progress_detail(args: object) -> str:
     """A short, plain summary of a tool call's arguments for the status message."""
     if not isinstance(args, dict):
         return ''
-    for key in ('query', 'entity_ids', 'domains', 'entity_id', 'url_path', 'automation_id', 'script_id'):
+    for key in ('query', 'entity_ids', 'domains', 'entity_id', 'url_path', 'automation_id', 'script_id', 'name'):
         value = args.get(key)
         if isinstance(value, list) and value:
             first = str(value[0])[:40]
@@ -95,7 +95,7 @@ class Broker:
     allowed_tools: tuple[str, ...] = ('search_entities', 'get_states', 'get_overview', 'get_history',
                                       'get_dashboard', 'get_automation_config', 'get_script_config',
                                       'get_image', 'get_calendar_events', 'get_todo_items',
-                                      'get_logbook', 'get_traces', 'get_live_context')
+                                      'get_logbook', 'get_traces', 'get_live_context', 'read_skill')
 
     def __post_init__(self):
         self.busy = asyncio.Lock()

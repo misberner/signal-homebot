@@ -565,6 +565,7 @@ def build_schema(writes: bool) -> dict:
     return {
         'type': 'object',
         'properties': {'reply': {'type': 'string'}, 'actions': actions,
+                       'images': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 3},
                        'reminders': {'type': 'array', 'items': reminder, 'maxItems': 3},
                        'tasks': {'type': 'array', 'items': task, 'maxItems': 3},
                        'cancel': {'type': 'array', 'items': {'type': 'integer'}, 'maxItems': 5}},
@@ -678,9 +679,11 @@ def _structured_output(stdout: bytes, returncode: int = 0) -> dict:
 
 def _check_output(obj: dict) -> dict:
     if (not isinstance(obj, dict) or not {'reply', 'actions'} <= set(obj)
-            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel'}):
+            or set(obj) - {'reply', 'actions', 'reminders', 'tasks', 'cancel', 'images'}):
         raise ClaudeError('invalid', 'missing structured output')
-    obj = {'reminders': [], 'tasks': [], 'cancel': [], **obj}
+    obj = {'reminders': [], 'tasks': [], 'cancel': [], 'images': [], **obj}
+    if not isinstance(obj['images'], list) or not all(isinstance(i, str) for i in obj['images']):
+        raise ClaudeError('invalid', 'images must list entity ids')
     if (not isinstance(obj['reply'], str) or not isinstance(obj['actions'], list)
             or not all(isinstance(obj[k], list) for k in ('reminders', 'tasks', 'cancel'))):
         raise ClaudeError('invalid', 'output does not match the schema')
@@ -693,7 +696,7 @@ def _check_output(obj: dict) -> dict:
 
 # ---------------------------------------------------------------- storage
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Store:
@@ -748,6 +751,8 @@ class Store:
         for table, column in (('approvals', 'prompt_ts INTEGER'), ('outbox', 'approval_code TEXT'),
                               ('approvals', 'run_at INTEGER'), ('actions', 'run_at INTEGER'),
                               ('outbox', 'edit_ts INTEGER'),
+                              # v5: pictures sent with a message (JSON list of data URIs).
+                              ('outbox', 'attachments TEXT'),
                               # v4: repeating scheduled actions ('once', 'daily', ...).
                               ('approvals', 'repeat TEXT'), ('actions', 'repeat TEXT')):
             have = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
@@ -1055,18 +1060,23 @@ class Store:
         with self._tx():
             self._enqueue(outgoing, now)
 
-    def _enqueue(self, outgoing: list[tuple[str, str]], now: int, approval_code: str | None = None,
+    def _enqueue(self, outgoing: list[tuple], now: int, approval_code: str | None = None,
                  edit_ts: int | None = None) -> None:
-        for dest, text in outgoing:
-            if text.strip():
-                self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt,approval_code,edit_ts) '
-                                'VALUES(?,?,?,?,?,?)', (dest, text[:MAX_TEXT], now, now, approval_code, edit_ts))
+        """Queue (dest, text) or (dest, text, [data URIs of pictures]) messages."""
+        for dest, text, *rest in outgoing:
+            pictures = rest[0] if rest else []
+            if text.strip() or pictures:
+                self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt,approval_code,edit_ts,'
+                                'attachments) VALUES(?,?,?,?,?,?,?)',
+                                (dest, text[:MAX_TEXT], now, now, approval_code, None if pictures else edit_ts,
+                                 json.dumps(pictures) if pictures else None))
 
-    def due_outbox(self, now: int, limit: int = 20) -> list[tuple[int, str, str, int, int, int | None]]:
-        """(id, dest, text, attempts, created_at, edit_ts) of messages due to be sent."""
-        return self.db.execute("SELECT id,dest,text,attempts,created_at,edit_ts FROM outbox "
-                               "WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT ?",
-                               (now, limit)).fetchall()
+    def due_outbox(self, now: int, limit: int = 20) -> list[tuple[int, str, str, int, int, int | None, list]]:
+        """(id, dest, text, attempts, created_at, edit_ts, pictures) of messages due to be sent."""
+        return [(*row[:6], json.loads(row[6]) if row[6] else [])
+                for row in self.db.execute("SELECT id,dest,text,attempts,created_at,edit_ts,attachments FROM outbox "
+                                           "WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT ?",
+                                           (now, limit)).fetchall()]
 
     def outbox_unedit(self, item_id: int) -> None:
         """Editing the status message failed: send the text as a new message."""
@@ -1079,7 +1089,7 @@ class Store:
 
     def outbox_sent(self, item_id: int, sent_ts: int | None = None) -> None:
         with self._tx():  # drop the text: the outbox is not a second transcript
-            self.db.execute("UPDATE outbox SET status='sent', text='' WHERE id=?", (item_id,))
+            self.db.execute("UPDATE outbox SET status='sent', text='', attachments=NULL WHERE id=?", (item_id,))
             if isinstance(sent_ts, int):
                 self.db.execute('UPDATE approvals SET prompt_ts=? WHERE code=(SELECT approval_code '
                                 'FROM outbox WHERE id=?)', (sent_ts, item_id))
@@ -1087,7 +1097,7 @@ class Store:
     def outbox_failed(self, item_id: int, attempts: int, created_at: int, error: str, now: int) -> str:
         attempts += 1
         if attempts >= OUTBOX_MAX_ATTEMPTS or now - created_at > OUTBOX_MAX_AGE:
-            status, text_sql = 'dead', ", text=''"
+            status, text_sql = 'dead', ", text='', attachments=NULL"
         else:
             status, text_sql = 'pending', ''
         delay = min(300, 5 * 2 ** (attempts - 1))
@@ -1099,7 +1109,7 @@ class Store:
     def outbox_dead(self, item_id: int, error: str) -> None:
         """Give up on a message without retrying (e.g. unsafe destination)."""
         with self._tx():
-            self.db.execute("UPDATE outbox SET status='dead', text='', last_error=? WHERE id=?",
+            self.db.execute("UPDATE outbox SET status='dead', text='', attachments=NULL, last_error=? WHERE id=?",
                             (error[:200], item_id))
 
     def outbox_status(self) -> dict[str, int]:
@@ -1107,12 +1117,12 @@ class Store:
 
     # -- webhook idempotency -------------------------------------------
 
-    def notify(self, notify_id: str | None, dest: str, text: str, now: int) -> bool:
+    def notify(self, notify_id: str | None, dests: list[str], text: str, now: int) -> bool:
         """Atomically dedupe and enqueue a proactive notification."""
         with self._tx():
             if not self._claim_notify_id(notify_id, now):
                 return False
-            self._enqueue([(dest, text)], now)
+            self._enqueue([(dest, text) for dest in dests], now)
             return True
 
     def claim_notify_id(self, notify_id: str | None, now: int) -> bool:

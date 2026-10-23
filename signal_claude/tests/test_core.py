@@ -407,7 +407,7 @@ class StoreTests(unittest.TestCase):
 
     def test_outbox_backoff_and_dead_letter(self):
         self.db.enqueue([('dm:' + USER1, 'hi')], self.now)
-        [(item, _, _, attempts, created, _)] = self.db.due_outbox(self.now)
+        [(item, _, _, attempts, created, _, _)] = self.db.due_outbox(self.now)
         self.assertEqual(self.db.outbox_failed(item, attempts, created, 'E', self.now), 'pending')
         self.assertEqual(self.db.due_outbox(self.now), [])
         self.assertEqual(len(self.db.due_outbox(self.now + 5)), 1)
@@ -415,9 +415,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.db.outbox_status(), {'dead': 1})
 
     def test_notify_idempotency(self):
-        self.assertTrue(self.db.notify('evt-1', 'group:' + GROUP, 'x', self.now))
-        self.assertFalse(self.db.notify('evt-1', 'group:' + GROUP, 'x', self.now))
-        self.assertTrue(self.db.notify(None, 'group:' + GROUP, 'x', self.now))
+        self.assertTrue(self.db.notify('evt-1', ['group:' + GROUP], 'x', self.now))
+        self.assertFalse(self.db.notify('evt-1', ['group:' + GROUP], 'x', self.now))
+        self.assertTrue(self.db.notify(None, ['group:' + GROUP], 'x', self.now))
         self.assertEqual(len(self.db.due_outbox(self.now)), 2)
 
     def test_remote_delete_and_purge(self):
