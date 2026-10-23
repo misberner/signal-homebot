@@ -407,7 +407,7 @@ class StoreTests(unittest.TestCase):
 
     def test_outbox_backoff_and_dead_letter(self):
         self.db.enqueue([('dm:' + USER1, 'hi')], self.now)
-        [(item, _, _, attempts, created, _, _, _)] = self.db.due_outbox(self.now)
+        [(item, _, _, attempts, created, _, _, _, _)] = self.db.due_outbox(self.now)
         self.assertEqual(self.db.outbox_failed(item, attempts, created, 'E', self.now), 'pending')
         self.assertEqual(self.db.due_outbox(self.now), [])
         self.assertEqual(len(self.db.due_outbox(self.now + 5)), 1)
@@ -598,3 +598,12 @@ class CardCheckTests(unittest.TestCase):
                     {'dashboard': '../api/states'}, {'dashboard': 'a-b', 'card': {'type': 'sensor'}}, {'x': 1}):
             with self.assertRaises(CardError, msg=req):
                 check_request(req)
+
+
+class QuoteParseTests(unittest.TestCase):
+    def test_quote_text(self):
+        msg = parse_signal_event(signal_event(text='und das?', quote={'id': 123, 'authorUuid': USER2,
+                                                                      'text': 'x' * 3000}), BOT, USERS, {GROUP})
+        self.assertEqual((msg.quote_ts, msg.quote_author, len(msg.quote_text)), (123, USER2, 2000))
+        msg = parse_signal_event(signal_event(text='hi'), BOT, USERS, {GROUP})
+        self.assertEqual((msg.quote_ts, msg.quote_text), (0, ''))

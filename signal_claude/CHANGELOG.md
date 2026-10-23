@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.1 — 2026-10-23
+
+### Added
+- **Replies understood**: a request that quotes an earlier message gets it
+  as context ("what was the peak here?"); the history records which card or
+  camera picture a bot message showed.
+
 ## 0.18.0 — 2026-10-23
 
 ### Changed

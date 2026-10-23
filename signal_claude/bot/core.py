@@ -72,6 +72,7 @@ class Incoming:
     quote_ts: int = 0          # timestamp of the message this one replies to
     quote_author: str = ''     # ACI of that message's author
     images: tuple[str, ...] = ()  # signal-cli attachment ids of photos sent with it
+    quote_text: str = ''       # the quoted message's text as the sender's app shows it
 
 
 @dataclass(frozen=True)
@@ -172,8 +173,10 @@ def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_ids: se
             ('[photo]' if len(images) == 1 else f'[{len(images)} photos]')
     quote = dm.get('quote') if isinstance(dm.get('quote'), dict) else {}
     quote_ts = quote.get('id') if _valid_ts(quote.get('id')) else 0
+    quote_text = quote.get('text') if isinstance(quote.get('text'), str) else ''
     return Incoming(sender, conv, is_group, ts, text.strip()[:MAX_TEXT], expires,
-                    server_ts, mentions_bot, quote_ts, str(quote.get('authorUuid') or '').lower(), images)
+                    server_ts, mentions_bot, quote_ts, str(quote.get('authorUuid') or '').lower(), images,
+                    quote_text[:2000] if quote_ts else '')
 
 
 def _images(attachments: object) -> tuple[str, ...]:
@@ -704,7 +707,7 @@ def _check_output(obj: dict) -> dict:
 
 # ---------------------------------------------------------------- storage
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class Store:
@@ -763,6 +766,8 @@ class Store:
                               ('outbox', 'attachments TEXT'),
                               # v6: the status message a message with pictures replaces (deleted after).
                               ('outbox', 'delete_ts INTEGER'),
+                              # v7: what the pictures showed, for the history (e.g. which card).
+                              ('outbox', 'history_note TEXT'),
                               # v4: repeating scheduled actions ('once', 'daily', ...).
                               ('approvals', 'repeat TEXT'), ('actions', 'repeat TEXT')):
             have = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
@@ -1072,23 +1077,31 @@ class Store:
 
     def _enqueue(self, outgoing: list[tuple], now: int, approval_code: str | None = None,
                  edit_ts: int | None = None) -> None:
-        """Queue (dest, text) or (dest, text, [data URIs of pictures]) messages. An edit
-        can't add pictures: such a message is sent anew and replaces (deletes) the
-        status message ``edit_ts`` instead."""
+        """Queue (dest, text) or (dest, text, [data URIs of pictures], note) messages; the
+        note says what the pictures show, for the history. An edit can't add
+        pictures: such a message is sent anew and replaces (deletes) the status
+        message ``edit_ts`` instead."""
         for dest, text, *rest in outgoing:
             pictures = rest[0] if rest else []
+            note = rest[1] if len(rest) > 1 else None
             if text.strip() or pictures:
                 self.db.execute('INSERT INTO outbox(dest,text,created_at,next_attempt,approval_code,edit_ts,'
-                                'attachments,delete_ts) VALUES(?,?,?,?,?,?,?,?)',
+                                'attachments,delete_ts,history_note) VALUES(?,?,?,?,?,?,?,?,?)',
                                 (dest, text[:MAX_TEXT], now, now, approval_code, None if pictures else edit_ts,
-                                 json.dumps(pictures) if pictures else None, edit_ts if pictures else None))
+                                 json.dumps(pictures) if pictures else None, edit_ts if pictures else None, note))
 
     def due_outbox(self, now: int, limit: int = 20) -> list[tuple]:
-        """(id, dest, text, attempts, created_at, edit_ts, pictures, delete_ts) of messages due to be sent."""
-        return [(*row[:6], json.loads(row[6]) if row[6] else [], row[7])
-                for row in self.db.execute("SELECT id,dest,text,attempts,created_at,edit_ts,attachments,delete_ts "
-                                           "FROM outbox WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT ?",
-                                           (now, limit)).fetchall()]
+        """(id, dest, text, attempts, created_at, edit_ts, pictures, delete_ts, note) of messages due."""
+        return [(*row[:6], json.loads(row[6]) if row[6] else [], row[7], row[8])
+                for row in self.db.execute("SELECT id,dest,text,attempts,created_at,edit_ts,attachments,delete_ts,"
+                                           "history_note FROM outbox WHERE status='pending' AND next_attempt<=? "
+                                           "ORDER BY id LIMIT ?", (now, limit)).fetchall()]
+
+    def message_at(self, conv: str, timestamp: int) -> tuple[str, str] | None:
+        """(sender, text) of a stored message, e.g. the one a reply quotes."""
+        row = self.db.execute("SELECT sender, text FROM messages WHERE conv=? AND timestamp=? AND text != ''",
+                              (conv, timestamp)).fetchone()
+        return (row[0], row[1]) if row else None
 
     def outbox_unedit(self, item_id: int) -> None:
         """Editing the status message failed: send the text as a new message."""

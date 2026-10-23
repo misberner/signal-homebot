@@ -220,6 +220,7 @@ class ConversationTests(Integration):
 
     async def test_read_receipt_and_typing_while_answering(self):
         await self.deliver(sender=USER1, text='hi')
+        await self.until(lambda: len(self.signal.indicators) >= 3)  # "stop typing" is sent asynchronously
         methods = [m for m, _ in self.signal.indicators]
         self.assertEqual(methods[0], 'sendReceipt')
         self.assertEqual(self.signal.indicators[0][1]['recipient'], USER1)
@@ -502,7 +503,8 @@ class PictureTests(Integration):
         self.assertEqual(base64.b64decode(msg['attachments'][0].split('base64,')[1]), PNG)
         self.assertEqual(len(self.signal.deleted), 1)
         # The history only notes that pictures were sent.
-        self.assertIn('[sent 2 picture(s)]', self.bot.store.context(f'dm:{USER1}', self.bot.now()))
+        self.assertIn('[sent: picture of camera.front_door; picture of image.vacuum_map]',
+                      self.bot.store.context(f'dm:{USER1}', self.bot.now()))
         self.assertEqual(self.bot.store.db.execute(
             'SELECT COUNT(*) FROM outbox WHERE attachments IS NOT NULL').fetchone()[0], 0)
 
@@ -531,6 +533,25 @@ class CardTests(Integration):
                                                                                 '/usr/bin/chromium'))
         self.assertEqual(second['request']['card']['cards'][0]['type'], 'history-graph')
         self.assertEqual(len(self.signal.deleted), 1)                   # the status message
+
+    async def test_reply_to_a_card_knows_what_it_showed(self):
+        self.answer(reply='Hier der Energiefluss.', cards=[{'card': {'type': 'energy-sankey'}, 'period': 'today'}])
+        await self.deliver(sender=USER1, text='energiefluss heute')
+        [shown] = self.signal.messages_to(f'dm:{USER1}')
+        self.answer(reply='Der Peak war um 13 Uhr.')
+        await self.deliver(sender=USER1, text='was war hier der peak?',
+                           quote={'id': shown['_ts'], 'authorUuid': BOT, 'text': 'Hier der Energiefluss.'})
+        prompt = self.claude.calls[-1]['prompt']
+        self.assertIn('It replies to this earlier message from HomeBot (you)', prompt)
+        self.assertIn('Hier der Energiefluss. [sent: card {"type": "energy-sankey"} for today]', prompt)
+        # A quote the bot has no record of: the text from the sender's app.
+        await self.deliver(sender=USER1, text='und das?', quote={'id': 12345, 'authorUuid': USER1,
+                                                                 'text': 'Wie warm ist es im Bad?'})
+        prompt = self.claude.calls[-1]['prompt']
+        self.assertIn('earlier message from user1', prompt)
+        self.assertIn('Wie warm ist es im Bad?', prompt)
+        await self.deliver(sender=USER1, text='ohne zitat')
+        self.assertNotIn('It replies to', self.claude.calls[-1]['prompt'])
 
     async def test_unsafe_or_broken_cards_explained(self):
         bad = [{'type': 'markdown', 'content': '{{ states.sensor | list }}'},

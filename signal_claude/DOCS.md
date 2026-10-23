@@ -250,6 +250,9 @@ line too (e.g. `deny climate.*` and `review script.heizung_*`).
   Chromium as its own `render` user, logged in with `ha_token`; it may only
   load Home Assistant's own pages. The cards show what that HA user may see,
   in Home Assistant's language. A picture takes a few seconds.
+- **Replies**: when you reply to (quote) a message, Claude gets that
+  message too, so "what was the peak here?" on a chart works; for the
+  bot's own pictures the history notes which card or camera they showed.
 - While working, the bot marks your message read, shows "typing…" and posts
   one "⏳ Looking into it…" message. It updates that message as Claude looks
   things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.
