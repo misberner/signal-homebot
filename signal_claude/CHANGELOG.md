@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.1 — 2026-10-23
+
+### Added
+- Claude can send **dashboard screenshots** to the chat
+  (`dashboard:<url_path>[/<view_path>]` in `images`), e.g. for graphs. Needs
+  ha-mcp's dashboard screenshot beta; if it is off, the answer says so.
+
 ## 0.15.0 — 2026-10-23
 
 ### Added

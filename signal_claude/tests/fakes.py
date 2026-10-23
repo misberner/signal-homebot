@@ -261,6 +261,7 @@ class FakeHomeAssistant:
         self.call_tokens: list[str] = []      # the token each service call used
         self.ws_subscriptions: list[tuple[web.WebSocketResponse, int, str]] = []
         self.ws_auth_ok = 0
+        self.screenshots = True  # ha-mcp's dashboard screenshot beta
 
     @property
     def mcp_url(self) -> str:
@@ -455,6 +456,9 @@ def _start_mcp(read_only: bool) -> str:
         fake.mcp_args.append({'url_path': url_path, 'list_only': list_only, 'include_screenshot': include_screenshot})
         text = json.dumps({'success': True, 'url_path': url_path,
                            'config': {'views': [{'title': 'Heizung', 'cards': [{'type': 'tile'}]}]}})
+        if include_screenshot and not fake.screenshots:
+            return [text[:-1] + ', "warnings": ["Screenshot requested but dashboard screenshot mode is disabled. '
+                    'Enable the \'dashboard screenshot\' beta feature to use it."]}']
         return [text, Image(data=PNG, format='png')] if include_screenshot else [text]
 
     @server.tool(name='ha_search')

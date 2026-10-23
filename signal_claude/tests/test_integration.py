@@ -477,6 +477,27 @@ class PictureTests(Integration):
             'SELECT COUNT(*) FROM outbox WHERE attachments IS NOT NULL').fetchone()[0], 0)
 
 
+class DashboardPictureTests(Integration):
+    async def test_dashboard_screenshot_sent_or_explained(self):
+        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
+        out = {'reply': 'Hier der Verlauf.', 'actions': [], 'images': ['dashboard:dashboard-energy/strom']}
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': out}))
+        await self.deliver(sender=USER1, text='zeig mir den stromverbrauch')
+        msgs = self.signal.messages_to(f'dm:{USER1}')
+        self.assertEqual(msgs[-1]['attachments'][0].split(';')[:2],
+                         ['data:image/png', 'filename=dashboard_dashboard-energy_strom.png'])
+        self.assertEqual(self.ha.mcp_args[-1], {'url_path': 'dashboard-energy', 'list_only': False,
+                                                'include_screenshot': True})
+        self.ha.screenshots = False
+        await self.deliver(sender=USER1, text='nochmal')
+        self.assertIn("dashboard screenshots are switched off in ha-mcp", self.dm(USER1)[-1])
+        for bad in ('dashboard:../x', 'dashboard:', 'dashboard:a/b/c'):
+            out['images'] = [bad]
+            self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': out}))
+            await self.deliver(sender=USER1, text=bad)
+            self.assertIn('could not get a picture', self.dm(USER1)[-1])
+
+
 class ToolTests(Integration):
     """Claude reads HA through the bot's local MCP proxy (real MCP on both sides)."""
 

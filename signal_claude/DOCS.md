@@ -233,9 +233,12 @@ line too (e.g. `deny climate.*` and `review script.heizung_*`).
   that one request sees them: the history keeps just "[photo]". signal-cli
   keeps received attachments in its data folder (`/data/signal`). View-once
   photos, voice notes and other files are ignored.
-- Claude can **send pictures** back: camera snapshots and `image.*`
-  entities (e.g. "show me the front door"), up to 3, as a message after the
-  answer (needs ha-mcp). The history notes only that pictures were sent.
+- Claude can **send pictures** back: camera snapshots, `image.*` entities
+  ("show me the front door") and dashboard screenshots ("show me the power
+  use today": a dashboard or one of its views), up to 3, as a message after
+  the answer (needs ha-mcp). The history notes only that pictures were sent.
+  Dashboard screenshots need ha-mcp's *dashboard screenshot* beta feature and
+  its rendering engine (balloob's Puppet app), see ha-mcp's `docs/beta.md`.
 - While working, the bot marks your message read, shows "typing…" and posts
   one "⏳ Looking into it…" message. It updates that message as Claude looks
   things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.

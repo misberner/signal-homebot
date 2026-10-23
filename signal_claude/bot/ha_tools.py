@@ -175,9 +175,19 @@ class HaTools:
         return Image(data=bytes(data), format=fmt)
 
     async def picture(self, entity_id: str) -> bytes:
-        """The current picture of an image.* or camera.* entity (to send to the chat)."""
+        """The current picture of an image.* or camera.* entity, or a screenshot of
+        "dashboard:<url_path>[/<view_path>]" (to send to the chat)."""
         if self.cfg.mcp_kind != 'ha_mcp':
             raise UpstreamError('pictures need ha-mcp')
+        if m := re.fullmatch(r'dashboard:([a-z0-9_-]{1,64})(?:/([A-Za-z0-9_-]{1,64}))?', entity_id):
+            args = {'url_path': m.group(1), 'include_screenshot': True}
+            if m.group(2):
+                args['view_path'] = m.group(2)
+            text, images = await self.call_content('ha_config_get_dashboard', args)
+            if not images:
+                raise UpstreamError('screenshots are switched off in ha-mcp' if 'screenshot mode is disabled'
+                                    in text else 'no screenshot')
+            return images[0].data
         if re.fullmatch(r'camera\.[a-z0-9_]+', entity_id):
             _, images = await self.call_content('ha_get_camera_image', {'entity_id': entity_id})
             if not images:
