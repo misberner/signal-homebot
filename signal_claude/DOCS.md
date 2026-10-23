@@ -215,6 +215,12 @@ account or devices (an unlocked phone, a linked Signal Desktop).
 - Claude runs for every private message, and for group messages that start
   with `/ha` or `!ha`, mention `@HomeBot`, or @-mention the bot. Other group
   messages are only kept as context.
+- **Photos** (JPEG, PNG, GIF, WebP; up to 4 per message, 5 MB each) go to
+  Claude with the message, with or without text ("what does this error code
+  mean?"). The bot checks the real file type, not the sender's claim. Only
+  that one request sees them: the history keeps just "[photo]". signal-cli
+  keeps received attachments in its data folder (`/data/signal`). View-once
+  photos, voice notes and other files are ignored.
 - While working, the bot marks your message read, shows "typing…" and posts
   one "⏳ Looking into it…" message. It updates that message as Claude looks
   things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.

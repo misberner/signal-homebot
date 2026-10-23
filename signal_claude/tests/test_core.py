@@ -546,3 +546,24 @@ class TriggerTests(unittest.TestCase):
         task = build_schema(True)['properties']['tasks']['items']
         self.assertIn('when', task['required'])
         self.assertIn('always', task['properties']['repeat']['enum'])
+
+
+class PhotoParseTests(unittest.TestCase):
+    def test_photos_are_parsed_and_marked(self):
+        att = lambda i, t='image/jpeg', size=10: {'id': i, 'contentType': t, 'size': size, 'isVoiceNote': False}
+        msg = parse_signal_event(signal_event(text='was ist das?', attachments=[att('a.jpg'), att('b.pdf', 'application/pdf')]),
+                                 BOT, USERS, {GROUP})
+        self.assertEqual((msg.text, msg.images), ('was ist das? [photo]', ('a.jpg',)))
+        msg = parse_signal_event(signal_event(text=None, attachments=[att('a.jpg'), att('b.png', 'image/png')]),
+                                 BOT, USERS, {GROUP})
+        self.assertEqual((msg.text, msg.images), ('[2 photos]', ('a.jpg', 'b.png')))
+        for attachments in ([att('../etc/passwd')], [att('x.jpg', size=50 << 20)], [att('v.m4a', 'audio/aac')]):
+            self.assertIsNone(parse_signal_event(signal_event(text=None, attachments=attachments), BOT, USERS, {GROUP}))
+        self.assertIsNone(parse_signal_event(signal_event(text='x', viewOnce=True, attachments=[att('a.jpg')]),
+                                             BOT, USERS, {GROUP}))
+
+    def test_image_type_from_bytes(self):
+        from bot.core import image_type
+        self.assertEqual(image_type(b'\xff\xd8\xff\xe0rest'), 'image/jpeg')
+        self.assertEqual(image_type(b'RIFF1234WEBPVP8 '), 'image/webp')
+        self.assertIsNone(image_type(b'<svg xmlns="http://www.w3.org/2000/svg"/>'))

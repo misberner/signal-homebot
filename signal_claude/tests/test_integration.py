@@ -3,6 +3,7 @@
 Every scenario that must not write asserts ``self.ha.calls == []``.
 """
 import asyncio
+import base64
 import dataclasses
 import json
 import os
@@ -379,6 +380,50 @@ class ConversationTests(Integration):
         await self.deliver(sender=USER2, group=GROUP, text=None,
                            remoteDelete={'targetTimestamp': ts, 'timestamp': ts + 5})
         self.assertFalse(self.bot.store.has_message(f'group:{GROUP}', USER2, ts))
+
+
+class PhotoTests(Integration):
+    JPEG = b'\xff\xd8\xff\xe0' + b'x' * 100
+
+    def photo(self, attachment_id, content_type='image/jpeg', size=104):
+        return {'contentType': content_type, 'filename': None, 'id': attachment_id, 'size': size,
+                'width': 10, 'height': 10, 'caption': None, 'uploadTimestamp': 1, 'isVoiceNote': False}
+
+    async def test_photo_reaches_claude_as_image(self):
+        self.signal.attachments['a1.jpg'] = self.JPEG
+        self.claude.set(reply='Das ist ein Fehlercode E21.')
+        await self.deliver(sender=USER1, text='was bedeutet das?', attachments=[self.photo('a1.jpg')])
+        [call] = self.claude.calls
+        self.assertEqual(call['images'], [['image/jpeg', len(base64.b64encode(self.JPEG))]])
+        self.assertIn('was bedeutet das? [photo]', call['prompt'])
+        self.assertIn('The photo user1 sent with it follows after this text', call['prompt'])
+        self.assertIn('--input-format', call['argv'])
+        self.assertEqual(self.dm(USER1), ['Das ist ein Fehlercode E21.'])
+        # The history keeps the marker, never the picture; a later question is plain text again.
+        await self.deliver(sender=USER1, text='und jetzt?')
+        self.assertIn('was bedeutet das? [photo]', self.claude.calls[-1]['prompt'])
+        self.assertEqual(self.claude.calls[-1]['images'], [])
+        self.assertNotIn('--input-format', self.claude.calls[-1]['argv'])
+
+    async def test_photo_without_text_and_bad_files(self):
+        self.signal.attachments['a.png'] = b'\x89PNG\r\n\x1a\n' + b'p' * 50
+        self.signal.attachments['fake.jpg'] = b'MZ this is an exe'
+        await self.deliver(sender=USER1, text=None, attachments=[
+            self.photo('a.png', 'image/png'), self.photo('fake.jpg'), self.photo('doc.pdf', 'application/pdf'),
+            self.photo('huge.jpg', size=50 << 20)])
+        [call] = self.claude.calls
+        self.assertEqual([i[0] for i in call['images']], ['image/png'])   # real type checked, PDF/huge skipped
+        self.assertIn('[2 photos]', call['prompt'])
+        self.assertIn('could not open 1 of the photos', self.dm(USER1)[-1])
+
+    async def test_group_photo_needs_addressing(self):
+        self.signal.attachments['g.jpg'] = self.JPEG
+        await self.deliver(sender=USER1, group=GROUP, text='schaut mal', attachments=[self.photo('g.jpg')])
+        self.assertEqual(self.claude.calls, [])
+        self.claude.set(reply='Schöne Lampe.')
+        await self.deliver(sender=USER1, group=GROUP, text='/ha was ist das?', attachments=[self.photo('g.jpg')])
+        self.assertEqual(len(self.claude.calls[-1]['images']), 1)
+        self.assertIn('Schöne Lampe.', self.group()[-1])
 
 
 class ToolTests(Integration):

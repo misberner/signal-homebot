@@ -34,6 +34,10 @@ TRIGGER_KEYS = frozenset({'entity_id', 'attribute', 'to', 'from', 'above', 'belo
 OUTBOX_MAX_AGE = 3600
 OUTBOX_MAX_ATTEMPTS = 8
 OBJECT_REPLACEMENT = '￼'  # Signal puts this where an @mention was
+IMAGE_TYPES = ('image/jpeg', 'image/png', 'image/gif', 'image/webp')  # what Claude can look at
+MAX_IMAGES = 4                   # photos per message passed to Claude
+MAX_IMAGE_BYTES = 5 << 20        # Claude's limit per image
+ATTACHMENT_ID_RE = r'[A-Za-z0-9._-]{1,128}'
 
 # Domains whose services a policy may allow. Everything else (locks, alarms,
 # cameras, notify, HA/Supervisor administration, shell/REST commands, automation
@@ -65,6 +69,7 @@ class Incoming:
     mentions_bot: bool = False
     quote_ts: int = 0          # timestamp of the message this one replies to
     quote_author: str = ''     # ACI of that message's author
+    images: tuple[str, ...] = ()  # signal-cli attachment ids of photos sent with it
 
 
 @dataclass(frozen=True)
@@ -155,13 +160,41 @@ def parse_signal_event(event: dict, bot_aci: str, users: set[str], group_ids: se
                         reaction.get('isRemove') is True, server_ts, expires)
 
     text = dm.get('message')
-    if not isinstance(text, str) or not text.strip() or dm.get('viewOnce'):
+    images = _images(dm.get('attachments'))
+    if dm.get('viewOnce') or not ((isinstance(text, str) and text.strip()) or images):
         return None
-    text, mentions_bot = _resolve_mentions(text, dm.get('mentions'), bot_aci, bot_name)
+    text, mentions_bot = _resolve_mentions(text if isinstance(text, str) else '', dm.get('mentions'),
+                                           bot_aci, bot_name)
+    if images:  # the history keeps only this marker, never the picture
+        text = (text.strip() + ' ' if text.strip() else '') + \
+            ('[photo]' if len(images) == 1 else f'[{len(images)} photos]')
     quote = dm.get('quote') if isinstance(dm.get('quote'), dict) else {}
     quote_ts = quote.get('id') if _valid_ts(quote.get('id')) else 0
     return Incoming(sender, conv, is_group, ts, text.strip()[:MAX_TEXT], expires,
-                    server_ts, mentions_bot, quote_ts, str(quote.get('authorUuid') or '').lower())
+                    server_ts, mentions_bot, quote_ts, str(quote.get('authorUuid') or '').lower(), images)
+
+
+def _images(attachments: object) -> tuple[str, ...]:
+    """Ids of attached photos Claude can look at (attachment.schema.json)."""
+    if not isinstance(attachments, list):
+        return ()
+    return tuple(a['id'] for a in attachments
+                 if isinstance(a, dict) and a.get('contentType') in IMAGE_TYPES
+                 and isinstance(a.get('id'), str) and re.fullmatch(ATTACHMENT_ID_RE, a['id'])
+                 and not (isinstance(a.get('size'), int) and a['size'] > MAX_IMAGE_BYTES))[:MAX_IMAGES]
+
+
+def image_type(data: bytes) -> str | None:
+    """The image's real type from its first bytes (not the sender's claim)."""
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'image/gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp'
+    return None
 
 
 def _valid_ts(ts: object) -> bool:

@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 import asyncio
+import base64
 import json
 import os
 import socket
@@ -79,6 +80,7 @@ class FakeSignalDaemon:
         self.indicators: list[tuple[str, dict]] = []
         self.reject_edits = False
         self.profile_names: dict[str, str] = {}
+        self.attachments: dict[str, bytes] = {}  # downloaded attachments by id
         self.edits: list[tuple[int, str]] = []
         self.runner: web.AppRunner | None = None
         self.url = ''
@@ -132,6 +134,10 @@ class FakeSignalDaemon:
                         'safetyNumber': ' '.join(sn[i:i + 5] for i in range(0, 60, 5)),
                         'scannableSafetyNumber': None, 'trustLevel': self.identities[aci],
                         'addedTimestamp': 1}] if aci in self.identities else [])
+        if method == 'getAttachment':  # GetAttachmentCommand: id + recipient|groupId -> {data}
+            if params.get('id') not in self.attachments or not (params.get('recipient') or params.get('groupId')):
+                return error(f'Could not find attachment with ID: {params.get("id")}')
+            return ok({'data': base64.b64encode(self.attachments[params['id']]).decode()})
         if method in ('sendTyping', 'sendReceipt'):
             self.indicators.append((method, params))
             return ok({})
@@ -552,13 +558,17 @@ def _start_mcp(read_only: bool) -> str:
 FAKE_CLAUDE = r'''#!{python}
 import asyncio, json, os, sys, time
 spec = json.load(open({spec!r}))
-prompt = sys.stdin.read()
 argv = sys.argv[1:]
+prompt, images = sys.stdin.read(), []
+if '--input-format' in argv:  # stream-json: one user message with text and image blocks
+    content = json.loads(prompt)['message']['content']
+    prompt = ''.join(b['text'] for b in content if b['type'] == 'text')
+    images = [[b['source']['media_type'], len(b['source']['data'])] for b in content if b['type'] == 'image']
 mcp_config = json.load(open(argv[argv.index('--mcp-config') + 1])) if '--mcp-config' in argv else None
 # The action reviewer is a separate call whose schema asks for a decision.
 reviewer = '--json-schema' in argv and '"decision"' in argv[argv.index('--json-schema') + 1]
 with open({record!r}, 'a') as f:
-    f.write(json.dumps({{'argv': argv, 'env': dict(os.environ), 'prompt': prompt, 'reviewer': reviewer,
+    f.write(json.dumps({{'argv': argv, 'env': dict(os.environ), 'prompt': prompt, 'reviewer': reviewer, 'images': images,
                         'cwd': os.getcwd(), 'mcp_config': mcp_config}}) + '\n')
 tool_text = None
 if spec.get('call_tool') and mcp_config:

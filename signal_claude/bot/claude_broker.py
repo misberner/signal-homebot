@@ -28,7 +28,10 @@ import tempfile
 from dataclasses import dataclass
 
 LOG = logging.getLogger('claude-broker')
-MAX_REQUEST = 1 << 20   # bytes per request line
+MAX_REQUEST = 40 << 20  # bytes per request line (photos included)
+IMAGE_TYPES = ('image/jpeg', 'image/png', 'image/gif', 'image/webp')
+MAX_IMAGES = 4
+MAX_IMAGE_B64 = 7 << 20  # 5 MB images, base64-encoded
 MAX_PROMPT = 200_000    # characters
 MAX_OUTPUT = 1 << 20    # bytes of Claude stdout returned
 MAX_LINE = 8 << 20      # bytes per stream-json line (one tool result)
@@ -43,7 +46,8 @@ MODELS = ('opus', 'fable', 'sonnet', 'haiku')
 
 
 def claude_command(claude_bin: str, schema: dict, mcp_config: str | None = None,
-                   tools: list[str] = (), system: str = '', model: str = '') -> list[str]:
+                   tools: list[str] = (), system: str = '', model: str = '',
+                   stream_input: bool = False) -> list[str]:
     """Verified with Claude Code 2.1.306. --tools '' removes every built-in tool
     (shell, files, web); --setting-sources '' loads no user/project settings
     (hooks, permissions, MCP servers); --strict-mcp-config limits MCP servers
@@ -57,6 +61,8 @@ def claude_command(claude_bin: str, schema: dict, mcp_config: str | None = None,
         cmd += ['--append-system-prompt', system]
     if model:
         cmd += ['--model', model]
+    if stream_input:  # the prompt arrives as one stream-json user message (text + photos)
+        cmd += ['--input-format', 'stream-json']
     # stream-json (needs --verbose) reports tool calls as they happen; its final
     # "result" event is the same envelope as --output-format json.
     return cmd + ['--permission-mode', 'dontAsk', '--permission-prompts', 'none',
@@ -137,7 +143,7 @@ class Broker:
                 await self.reply(writer, await self.run(request['prompt'], request['schema'],
                                                         request.get('mcp_token'), request.get('tools') or [],
                                                         request.get('system', ''), request.get('model', ''),
-                                                        progress))
+                                                        progress, request.get('images') or []))
         except (ConnectionError, OSError):
             pass
         finally:
@@ -146,7 +152,12 @@ class Broker:
     def valid_request(self, request: object) -> bool:
         import re
         if (not isinstance(request, dict) or not {'prompt', 'schema'} <= set(request)
-                or set(request) - {'prompt', 'schema', 'mcp_token', 'tools', 'system', 'model'}):
+                or set(request) - {'prompt', 'schema', 'mcp_token', 'tools', 'system', 'model', 'images'}):
+            return False
+        images = request.get('images', [])
+        if not isinstance(images, list) or len(images) > MAX_IMAGES or not all(
+                isinstance(i, dict) and set(i) == {'media_type', 'data'} and i['media_type'] in IMAGE_TYPES
+                and isinstance(i['data'], str) and 0 < len(i['data']) <= MAX_IMAGE_B64 for i in images):
             return False
         if (not isinstance(request['prompt'], str) or len(request['prompt']) > MAX_PROMPT
                 or not isinstance(request['schema'], dict)):
@@ -165,7 +176,8 @@ class Broker:
         return True
 
     async def run(self, prompt: str, schema: dict, mcp_token: str | None = None,
-                  tools: list[str] = (), system: str = '', model: str = '', progress=None) -> dict:
+                  tools: list[str] = (), system: str = '', model: str = '', progress=None,
+                  images: list[dict] = ()) -> dict:
         # A fixed, emptied working directory: Claude Code puts the cwd into its
         # system prompt, so a random one per request defeats prompt caching
         # (measured: 1.1k vs 2.8k cached tokens). Requests are serialized.
@@ -188,7 +200,8 @@ class Broker:
                         'headers': {'Authorization': f'Bearer {mcp_token}'}}}}, f)
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *claude_command(self.claude_bin, schema, mcp_config, tools, system, model), cwd=work, env=env,
+                    *claude_command(self.claude_bin, schema, mcp_config, tools, system, model, bool(images)),
+                    cwd=work, env=env,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                     # stream-json puts each tool result on one line; HA reads
@@ -198,7 +211,7 @@ class Broker:
                 LOG.error('Cannot start Claude: %s', type(err).__name__)
                 return {'error': 'spawn'}
             try:
-                result = await asyncio.wait_for(self.collect(proc, prompt, set(tools), progress),
+                result = await asyncio.wait_for(self.collect(proc, prompt, set(tools), progress, images),
                                                 timeout=self.timeout)
             except asyncio.TimeoutError:
                 return {'error': 'timeout'}
@@ -211,10 +224,16 @@ class Broker:
                     await proc.wait()
             return {'returncode': proc.returncode, 'stdout': result}
 
-    async def collect(self, proc, prompt: str, tools: set[str], progress) -> str:
+    async def collect(self, proc, prompt: str, tools: set[str], progress, images: list[dict] = ()) -> str:
         """Feed the prompt, relay allowed tool calls as progress, return the
         final "result" event (or '' if Claude produced none)."""
-        proc.stdin.write(prompt.encode())
+        if images:
+            content = [{'type': 'text', 'text': prompt}] + [
+                {'type': 'image', 'source': {'type': 'base64', **image}} for image in images]
+            proc.stdin.write(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': content}})
+                             .encode() + b'\n')
+        else:
+            proc.stdin.write(prompt.encode())
         await proc.stdin.drain()
         proc.stdin.close()
         result, read = '', 0

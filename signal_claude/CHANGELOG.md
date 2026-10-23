@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.0 — 2026-10-23
+
+### Added
+- **Photos as input**: up to 4 photos per message (with or without text) go
+  to Claude as images, via signal-cli's `getAttachment` and Claude Code's
+  stream-json input. The real type is checked from the bytes; the history
+  keeps only a "[photo]" marker.
+
 ## 0.13.0 — 2026-10-23
 
 ### Added
