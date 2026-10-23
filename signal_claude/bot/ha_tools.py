@@ -219,6 +219,72 @@ class HaTools:
                 'minimal_response': True}), meta))
         return [found[e] for e in entity_ids if e in found]
 
+    async def energy_totals(self, start: str | None, end: str | None) -> tuple[dict, str, set]:
+        """What solar, grid and battery delivered between start and end (ISO, kWh,
+        from the energy dashboard's sensors and HA's hourly statistics), or with
+        start None the current power (kW) of the configured power sensors.
+        The energy prefs are only ever read here (mode 'get'), never by Claude."""
+        from .charts import ChartError, energy_sensors, find_energy_sources
+        roles = energy_sensors(find_energy_sources(await self.call('ha_manage_energy_prefs', {'mode': 'get'})))
+        has = {name for name, keys in (('solar', ('solar',)), ('grid', ('grid_in', 'grid_out')),
+                                       ('battery', ('battery_in', 'battery_out'))) if any(roles[k] for k in keys)}
+        if not has:
+            raise ChartError('the energy dashboard has no solar, grid or battery sensors')
+        if start is None:
+            rates = {k: roles[f'{k}_rate'] for k in has}
+            if not all(rates.values()):
+                raise ChartError('the energy dashboard has no power sensors for a live view; ask for today instead')
+            ids = [e for ids in rates.values() for e in ids if re.fullmatch(ENTITY_RE, e)]
+            values = await self.numbers(ids, {'W': 0.001, 'kW': 1.0, 'MW': 1000.0})
+            power = {k: sum(values.get(e, 0.0) for e in ids) for k, ids in rates.items()}
+            grid, battery = power.get('grid', 0.0), power.get('battery', 0.0)
+            # HA's power sensors: grid positive = import, battery positive = discharging.
+            return ({'solar': power.get('solar', 0.0), 'grid_in': max(grid, 0.0), 'grid_out': max(-grid, 0.0),
+                     'battery_out': max(battery, 0.0), 'battery_in': max(-battery, 0.0)}, 'kW', has)
+        ids = [e for k in ('solar', 'grid_in', 'grid_out', 'battery_in', 'battery_out') for e in roles[k]
+               if re.fullmatch(ENTITY_RE, e)]
+        scale = await self.units(ids, {'Wh': 0.001, 'kWh': 1.0, 'MWh': 1000.0})
+        stats = json.loads(await self.call('ha_get_history', {
+            'entity_ids': ids, 'source': 'statistics', 'start_time': start, 'end_time': end,
+            'period': 'hour', 'limit': 1000}))
+        data = stats.get('data', stats) if isinstance(stats, dict) else {}
+        change = {}
+        for entity in data.get('entities') or []:
+            if isinstance(entity, dict) and entity.get('entity_id') in ids:
+                change[entity['entity_id']] = scale.get(entity['entity_id'], 1.0) * sum(
+                    r['change'] for r in entity.get('statistics') or []
+                    if isinstance(r, dict) and isinstance(r.get('change'), (int, float)))
+        return ({k: sum(change.get(e, 0.0) for e in roles[k])
+                 for k in ('solar', 'grid_in', 'grid_out', 'battery_in', 'battery_out')}, 'kWh', has)
+
+    async def units(self, entity_ids: list[str], factors: dict[str, float]) -> dict[str, float]:
+        """Each entity's conversion factor from its unit_of_measurement."""
+        if not entity_ids:
+            return {}
+        state = json.loads(await self.call('ha_get_state', {
+            'entity_id': entity_ids, 'fields': ['entity_id', 'attributes'],
+            'attribute_keys': ['unit_of_measurement']}))
+        states = (state.get('data') or state).get('states') or {}
+        return {e: factors.get(((states.get(e) or {}).get('attributes') or {}).get('unit_of_measurement'), 1.0)
+                for e in entity_ids}
+
+    async def numbers(self, entity_ids: list[str], factors: dict[str, float]) -> dict[str, float]:
+        """Current numeric states, converted by unit; unavailable ones are left out."""
+        if not entity_ids:
+            return {}
+        state = json.loads(await self.call('ha_get_state', {
+            'entity_id': entity_ids, 'fields': ['entity_id', 'state', 'attributes'],
+            'attribute_keys': ['unit_of_measurement']}))
+        states = (state.get('data') or state).get('states') or {}
+        out = {}
+        for e in entity_ids:
+            st = states.get(e) or {}
+            try:
+                out[e] = float(st.get('state')) * factors.get((st.get('attributes') or {}).get('unit_of_measurement'), 1.0)
+            except (TypeError, ValueError):
+                continue
+        return out
+
     # ---------------------------------------------------------------- MCP server
 
     def asgi_app(self):

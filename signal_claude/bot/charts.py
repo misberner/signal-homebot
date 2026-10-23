@@ -40,8 +40,8 @@ class Series:
 
 
 def check_spec(spec: object) -> tuple[str, list[str], int]:
-    """A chart Claude asked for: {"title", "entity_ids", "hours"}."""
-    if not isinstance(spec, dict) or set(spec) - {'title', 'entity_ids', 'hours'}:
+    """A line chart Claude asked for: {"title", "entity_ids", "hours"} (and "kind": "line")."""
+    if not isinstance(spec, dict) or set(spec) - {'title', 'entity_ids', 'hours', 'kind'}:
         raise ChartError('a chart has a title, entity_ids and hours')
     title, ids, hours = spec.get('title') or '', spec.get('entity_ids'), spec.get('hours')
     if not isinstance(title, str) or len(title) > 80:
@@ -52,6 +52,18 @@ def check_spec(spec: object) -> tuple[str, list[str], int]:
     if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= MAX_HOURS:
         raise ChartError(f'a chart covers 1-{MAX_HOURS} hours')
     return title.strip(), list(dict.fromkeys(ids)), hours
+
+
+def check_flow_spec(spec: object) -> tuple[str, str]:
+    """An energy flow chart: {"title", "kind": "energy_flow", "span"}."""
+    if not isinstance(spec, dict) or set(spec) - {'title', 'kind', 'span', 'entity_ids', 'hours'}:
+        raise ChartError('an energy flow chart has a title and a span')
+    title, span = spec.get('title') or '', spec.get('span') or 'today'
+    if not isinstance(title, str) or len(title) > 80:
+        raise ChartError('chart title: at most 80 characters')
+    if span not in FLOW_SPANS:
+        raise ChartError(f'span must be one of {", ".join(FLOW_SPANS)}')
+    return title.strip(), span
 
 
 def period_for(hours: int) -> str:
@@ -179,6 +191,143 @@ def render(title: str, series: list[Series], start: datetime, end: datetime) -> 
         zero_formats=['', '%m.%Y', '%d.%m.', '%d.%m.', '%H:%M', '%H:%M'],
         offset_formats=['', '%Y', '%m.%Y', '%d.%m.%Y', '%d.%m.%Y', '%d.%m.%Y %H:%M']))
     axes[-1].set_xlim(start, end)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- energy flow
+
+FLOW_SPANS = ('now', 'today', 'yesterday', 'week', 'month')
+
+
+def find_energy_sources(text: str) -> list[dict]:
+    """The energy_sources list from the energy dashboard prefs, wherever the
+    tool result nests it."""
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get('energy_sources'), list):
+                return node['energy_sources']
+            for value in node.values():
+                if (found := walk(value)) is not None:
+                    return found
+        return None
+    found = walk(json.loads(text))
+    return [s for s in found if isinstance(s, dict)] if found else []
+
+
+def energy_sensors(sources: list[dict]) -> dict[str, list[str]]:
+    """Statistic ids per role from the energy prefs: solar, grid_in, grid_out,
+    battery_in (charging), battery_out (discharging), and the power sensors
+    (solar_rate, grid_rate, battery_rate) where HA has them configured."""
+    roles = {k: [] for k in ('solar', 'grid_in', 'grid_out', 'battery_in', 'battery_out',
+                             'solar_rate', 'grid_rate', 'battery_rate')}
+
+    def add(role, value):
+        if isinstance(value, str) and re.fullmatch(ENTITY_RE + r'|[a-z_]+:[a-z0-9_]+', value) \
+                and value not in roles[role]:
+            roles[role].append(value)
+    for source in sources:
+        kind = source.get('type')
+        if kind == 'solar':
+            add('solar', source.get('stat_energy_from'))
+            add('solar_rate', source.get('stat_rate'))
+        elif kind == 'battery':
+            add('battery_out', source.get('stat_energy_from'))
+            add('battery_in', source.get('stat_energy_to'))
+            add('battery_rate', source.get('stat_rate'))
+        elif kind == 'grid':
+            # Older prefs list flows; newer ones put the sensors on the source itself.
+            add('grid_in', source.get('stat_energy_from'))
+            add('grid_out', source.get('stat_energy_to'))
+            add('grid_rate', source.get('stat_rate'))
+            for flow in source.get('flow_from') or []:
+                if isinstance(flow, dict):
+                    add('grid_in', flow.get('stat_energy_from'))
+            for flow in source.get('flow_to') or []:
+                if isinstance(flow, dict):
+                    add('grid_out', flow.get('stat_energy_to'))
+    return roles
+
+
+def split_flows(solar: float, grid_in: float, grid_out: float, battery_in: float,
+                battery_out: float) -> dict[str, float]:
+    """Who supplied whom, as HA's energy distribution card assumes: exports
+    come from solar first, the battery charges from solar first."""
+    solar, grid_in, grid_out, battery_in, battery_out = (max(0.0, v) for v in
+                                                         (solar, grid_in, grid_out, battery_in, battery_out))
+    solar_to_grid = min(grid_out, solar)
+    battery_to_grid = min(grid_out - solar_to_grid, battery_out)
+    solar_to_battery = min(battery_in, solar - solar_to_grid)
+    grid_to_battery = min(battery_in - solar_to_battery, grid_in)
+    return {
+        'solar_home': max(0.0, solar - solar_to_grid - solar_to_battery),
+        'solar_grid': solar_to_grid, 'solar_battery': solar_to_battery,
+        'grid_home': max(0.0, grid_in - grid_to_battery), 'grid_battery': grid_to_battery,
+        'battery_home': max(0.0, battery_out - battery_to_grid), 'battery_grid': battery_to_grid,
+    }
+
+
+def render_flow(title: str, totals: dict[str, float], unit: str, has: set[str]) -> bytes:
+    """Home in the middle, solar above, grid left, battery below; arrows from
+    box edge to box edge, sized by what flowed (no crossings)."""
+    from matplotlib.figure import Figure
+    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+    flows = split_flows(totals.get('solar', 0), totals.get('grid_in', 0), totals.get('grid_out', 0),
+                        totals.get('battery_in', 0), totals.get('battery_out', 0))
+    home = flows['solar_home'] + flows['grid_home'] + flows['battery_home']
+    w, h = 0.11, 0.065  # half box size
+    pos = {'solar': (0.5, 0.86), 'grid': (0.15, 0.5), 'home': (0.5, 0.5), 'battery': (0.5, 0.14)}
+    names = {'solar': 'Solar', 'grid': 'Grid', 'home': 'Home', 'battery': 'Battery'}
+    colors = {'solar': '#e3a008', 'grid': '#5b6b7f', 'home': '#1f6feb', 'battery': '#1a7f37'}
+
+    def side(node, where):
+        x, y = pos[node]
+        return {'top': (x, y + h), 'bottom': (x, y - h), 'left': (x - w, y), 'right': (x + w, y)}[where]
+    # (from, to, rad): solar→battery bends around the right of home.
+    routes = {'solar_home': (side('solar', 'bottom'), side('home', 'top'), 0),
+              'grid_home': (side('grid', 'right'), side('home', 'left'), 0),
+              'battery_home': (side('battery', 'top'), side('home', 'bottom'), 0),
+              'solar_grid': (side('solar', 'left'), side('grid', 'top'), 0.3),
+              'grid_battery': (side('grid', 'bottom'), side('battery', 'left'), 0.3),
+              'battery_grid': (side('battery', 'left'), side('grid', 'bottom'), -0.3),
+              'solar_battery': (side('solar', 'right'), side('battery', 'right'), -0.55)}
+    big = max([home, *totals.values(), 0])
+    fmt = (lambda v: f'{v:.2f} {unit}') if big < 10 else (lambda v: f'{v:.1f} {unit}')
+    fig = Figure(figsize=(6.6, 6.6), dpi=110, layout='constrained')
+    ax = fig.add_subplot()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    biggest = max([*flows.values(), 1e-9])
+    for key, ((x1, y1), (x2, y2), rad) in routes.items():
+        value = flows[key]
+        if value <= biggest * 0.005:
+            continue
+        ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2), connectionstyle=f'arc3,rad={rad}', arrowstyle='-|>',
+                                     mutation_scale=12 + 6 * value / biggest, shrinkA=2, shrinkB=2,
+                                     linewidth=1 + 6 * value / biggest, color=colors[key.split('_')[0]], alpha=0.8))
+        # Label on the curve's midpoint (matplotlib's arc3 control point, halfway).
+        dx, dy = x2 - x1, y2 - y1
+        lx, ly = (x1 + x2) / 2 + rad * dy / 2, (y1 + y2) / 2 - rad * dx / 2
+        if not rad and not dy:  # the short horizontal arrow: label above it
+            ly += 0.035
+        ax.text(lx, ly, fmt(value), ha='center', va='center', fontsize=9,
+                bbox={'boxstyle': 'round,pad=0.2', 'fc': 'white', 'ec': 'none', 'alpha': 0.9})
+    detail = {'solar': fmt(totals.get('solar', 0)),
+              'grid': f'in {fmt(totals.get("grid_in", 0))}\nout {fmt(totals.get("grid_out", 0))}',
+              'battery': f'in {fmt(totals.get("battery_in", 0))}\nout {fmt(totals.get("battery_out", 0))}',
+              'home': fmt(home)}
+    for key, (x, y) in pos.items():
+        if key != 'home' and key not in has:
+            continue
+        ax.add_patch(FancyBboxPatch((x - w, y - h), 2 * w, 2 * h, boxstyle='round,pad=0,rounding_size=0.025',
+                                    fc='white', ec=colors[key], linewidth=2.2))
+        ax.text(x, y + 0.028, names[key], ha='center', va='center', fontsize=11, weight='bold', color=colors[key])
+        ax.text(x, y - 0.022, detail[key], ha='center', va='center', fontsize=8)
     if title:
         fig.suptitle(title, fontsize=12)
     buf = io.BytesIO()

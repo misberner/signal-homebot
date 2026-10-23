@@ -245,6 +245,15 @@ line too (e.g. `deny climate.*` and `review script.heizung_*`).
   (5-minute, hourly or daily mean with min/max band; energy counters as bars
   per period) or, for entities without statistics such as on/off sensors,
   the state history. Needs ha-mcp.
+- **Energy flow** ("Energiefluss heute"): boxes for solar, grid, battery and
+  home with arrows sized by what flowed, for now, today, yesterday, the last
+  week or month. The sensors come from HA's energy dashboard settings (read
+  by the bot with ha-mcp's `ha_manage_energy_prefs` in mode `get` only; Claude
+  never gets that tool), the amounts from HA's hourly statistics. Who
+  supplied whom is split the way HA's energy card does it (exports and
+  battery charging come from solar first). "Now" needs power sensors for each
+  part in the energy settings (grid positive = import, battery positive =
+  discharging).
 - While working, the bot marks your message read, shows "typing…" and posts
   one "⏳ Looking into it…" message. It updates that message as Claude looks
   things up ("🔎 Searching", "📊 Reading", …), then edits it into the answer.

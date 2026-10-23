@@ -605,3 +605,44 @@ class ChartUnitTests(unittest.TestCase):
                     {'entity_ids': ['sensor.p'] * 7, 'hours': 1}, {'entity_ids': ['sensor.p'], 'hours': 1, 'x': 1}):
             with self.assertRaises(ChartError):
                 check_spec(bad)
+
+
+class EnergyFlowUnitTests(unittest.TestCase):
+    def test_split_flows(self):
+        from bot.charts import split_flows
+        f = split_flows(solar=18.4, grid_in=3.1, grid_out=6.2, battery_in=5.0, battery_out=4.2)
+        self.assertAlmostEqual(f['solar_grid'], 6.2)
+        self.assertAlmostEqual(f['solar_battery'], 5.0)
+        self.assertAlmostEqual(f['solar_home'], 7.2)
+        self.assertAlmostEqual(f['grid_home'], 3.1)
+        self.assertAlmostEqual(f['battery_home'], 4.2)
+        # Exports beyond solar come from the battery; charging beyond solar from the grid.
+        f = split_flows(solar=1.0, grid_in=2.0, grid_out=1.5, battery_in=0.5, battery_out=2.0)
+        self.assertEqual((f['solar_grid'], f['battery_grid'], f['solar_battery'], f['grid_battery']),
+                         (1.0, 0.5, 0.0, 0.5))
+        self.assertEqual((f['battery_home'], f['grid_home']), (1.5, 1.5))
+        self.assertTrue(all(v >= 0 for v in split_flows(-1, -1, 5, 5, -1).values()))
+
+    def test_energy_sensors_both_formats(self):
+        from bot.charts import energy_sensors, find_energy_sources
+        old = {'energy_sources': [{'type': 'grid', 'flow_from': [{'stat_energy_from': 'sensor.a'}],
+                                   'flow_to': [{'stat_energy_to': 'sensor.b'}]},
+                                  {'type': 'gas', 'stat_energy_from': 'sensor.gas'}]}
+        new = {'result': {'prefs': {'energy_sources': [{'type': 'grid', 'stat_energy_from': 'sensor.a',
+                                                        'stat_energy_to': 'sensor.b', 'stat_rate': 'sensor.p'}]}}}
+        for prefs in (old, new):
+            roles = energy_sensors(find_energy_sources(json.dumps(prefs)))
+            self.assertEqual((roles['grid_in'], roles['grid_out']), (['sensor.a'], ['sensor.b']))
+        self.assertEqual(roles['grid_rate'], ['sensor.p'])
+        self.assertEqual(energy_sensors(find_energy_sources('{"energy_sources": [{"type": "solar", '
+                                                            '"stat_energy_from": "x; rm"}]}'))['solar'], [])
+
+    def test_render_flow(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest('matplotlib not installed')
+        from bot.charts import render_flow
+        png = render_flow('t', {'solar': 1, 'grid_in': 2, 'grid_out': 0, 'battery_in': 0, 'battery_out': 0},
+                          'kWh', {'solar', 'grid'})
+        self.assertTrue(png.startswith(b'\x89PNG'))

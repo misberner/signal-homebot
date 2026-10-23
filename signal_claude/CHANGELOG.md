@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.17.0 — 2026-10-23
+
+### Added
+- **Energy flow chart**: solar, grid, battery and home with the amounts that
+  flowed (now, today, yesterday, week, month), from the energy dashboard's
+  sensors and HA's statistics.
+
 ## 0.16.0 — 2026-10-23
 
 ### Added

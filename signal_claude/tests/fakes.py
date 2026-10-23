@@ -262,6 +262,8 @@ class FakeHomeAssistant:
         self.ws_subscriptions: list[tuple[web.WebSocketResponse, int, str]] = []
         self.ws_auth_ok = 0
         self.screenshots = True  # ha-mcp's dashboard screenshot beta
+        self.energy_prefs: dict = {'energy_sources': [], 'device_consumption': []}
+        self.energy_writes = 0
         self.statistics: dict[str, list[dict]] = {}       # entity -> 5-minute rows (mean/min/max or change)
         self.history: dict[str, list[tuple[int, str]]] = {}  # entity -> (seconds ago, state)
 
@@ -508,14 +510,26 @@ def _start_mcp(read_only: bool) -> str:
         fake.mcp_args.append({'automation_id': automation_id, 'run_id': run_id, 'limit': limit})
         return json.dumps({'success': True, 'traces': [{'run_id': '1.2', 'state': 'stopped'}]})
 
+    @server.tool(name='ha_manage_energy_prefs')
+    def ha_manage_energy_prefs(mode: str, config: dict | None = None) -> str:
+        """Energy dashboard prefs (ha-mcp offers set modes too; the bot only reads)."""
+        fake = FakeHomeAssistant.active
+        fake.mcp_calls.append('ha_manage_energy_prefs')
+        fake.mcp_args.append({'mode': mode, 'config': config})
+        if mode != 'get':
+            fake.energy_writes += 1
+            return json.dumps({'success': False})
+        return json.dumps({'data': {'success': True, 'prefs': fake.energy_prefs}})
+
     @server.tool(name='ha_get_history')
     def ha_get_history(entity_ids: str | list[str], start_time: str | None = None, limit: int | None = None,
-                       minimal_response: bool = True, source: str = 'history', period: str = 'day') -> str:
+                       minimal_response: bool = True, source: str = 'history', period: str = 'day',
+                       end_time: str | None = None) -> str:
         """State history, or long-term statistics (like ha-mcp 8.7)."""
         fake = FakeHomeAssistant.active
         fake.mcp_calls.append('ha_get_history')
         fake.mcp_args.append({'entity_ids': entity_ids, 'start_time': start_time, 'limit': limit,
-                              'source': source, 'period': period})
+                              'source': source, 'period': period, 'end_time': end_time})
         ids = entity_ids if isinstance(entity_ids, list) else [entity_ids]
         now_ms = int(time.time() * 1000)
         entities = []

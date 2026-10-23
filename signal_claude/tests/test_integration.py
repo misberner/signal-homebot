@@ -531,6 +531,65 @@ class ChartTests(Integration):
             self.assertIn(why, self.dm(USER1)[-1])
 
 
+class EnergyFlowTests(Integration):
+    PREFS = {'energy_sources': [
+        {'type': 'grid', 'flow_from': [{'stat_energy_from': 'sensor.grid_import', 'stat_cost': None}],
+         'flow_to': [{'stat_energy_to': 'sensor.grid_export'}], 'cost_adjustment_day': 0},
+        {'type': 'solar', 'stat_energy_from': 'sensor.pv_energy', 'stat_rate': 'sensor.pv_power'},
+        {'type': 'battery', 'stat_energy_from': 'sensor.bat_out', 'stat_energy_to': 'sensor.bat_in'}],
+        'device_consumption': []}
+
+    def ask(self, span):
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {
+            'reply': 'Bitte.', 'actions': [], 'charts': [{'title': 'Energie', 'kind': 'energy_flow', 'span': span}]}}))
+
+    async def test_energy_flow_today_from_prefs_and_statistics(self):
+        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
+        self.ha.energy_prefs = self.PREFS
+        for eid, unit, changes in (('sensor.grid_import', 'kWh', [1.0, 2.0]), ('sensor.grid_export', 'Wh', [3000.0]),
+                                   ('sensor.pv_energy', 'kWh', [8.0, 4.0]), ('sensor.bat_in', 'kWh', [2.0]),
+                                   ('sensor.bat_out', 'kWh', [1.5])):
+            self.ha.states[eid] = '1'
+            self.ha.attributes[eid] = {'unit_of_measurement': unit}
+            self.ha.statistics[eid] = [{'change': c, 'sum': 0} for c in changes]
+        self.ask('today')
+        await self.deliver(sender=USER1, text='energiefluss heute')
+        msgs = self.signal.messages_to(f'dm:{USER1}')
+        self.assertTrue(msgs[1]['attachments'][0].startswith('data:image/png;filename=energie.png;base64,'))
+        self.assertEqual(self.ha.mcp_args[[a.get('mode') for a in self.ha.mcp_args].index('get')]['mode'], 'get')
+        self.assertEqual(self.ha.energy_writes, 0)
+        stats = [a for a in self.ha.mcp_args if a.get('source') == 'statistics'][-1]
+        self.assertEqual((stats['period'], stats['start_time'][11:19]), ('hour', '00:00:00'))
+        self.assertIsNotNone(stats['end_time'])
+        totals, unit, has = await self.bot.tools.energy_totals(stats['start_time'], stats['end_time'])
+        self.assertEqual((unit, has), ('kWh', {'solar', 'grid', 'battery'}))
+        self.assertEqual(totals, {'solar': 12.0, 'grid_in': 3.0, 'grid_out': 3.0, 'battery_in': 2.0,
+                                  'battery_out': 1.5})   # Wh converted
+        # "now" needs a power sensor for every part: explained, not guessed.
+        self.ask('now')
+        await self.deliver(sender=USER1, text='energiefluss jetzt')
+        self.assertIn('no power sensors for a live view', self.dm(USER1)[-1])
+
+    async def test_energy_flow_now_and_no_energy_dashboard(self):
+        await self.restart_bot(mcp_kind='ha_mcp', mcp_url=self.ha.ha_mcp_readonly_url)
+        self.ha.energy_prefs = {'energy_sources': [
+            {'type': 'grid', 'stat_energy_from': 'sensor.gi', 'stat_energy_to': 'sensor.ge', 'stat_rate': 'sensor.grid_power'},
+            {'type': 'solar', 'stat_energy_from': 'sensor.pv', 'stat_rate': 'sensor.pv_power'}]}
+        self.ha.states.update({'sensor.grid_power': '-1200', 'sensor.pv_power': '2.5'})
+        self.ha.attributes.update({'sensor.grid_power': {'unit_of_measurement': 'W'},
+                                   'sensor.pv_power': {'unit_of_measurement': 'kW'}})
+        totals, unit, has = await self.bot.tools.energy_totals(None, None)
+        self.assertEqual((unit, has), ('kW', {'solar', 'grid'}))
+        self.assertEqual(totals, {'solar': 2.5, 'grid_in': 0.0, 'grid_out': 1.2, 'battery_out': 0.0, 'battery_in': 0.0})
+        self.ask('now')
+        await self.deliver(sender=USER1, text='jetzt')
+        self.assertEqual(len(self.signal.messages_to(f'dm:{USER1}')[-1]['attachments']), 1)
+        self.ha.energy_prefs = {'energy_sources': []}
+        self.ask('week')
+        await self.deliver(sender=USER1, text='woche')
+        self.assertIn('no solar, grid or battery sensors', self.dm(USER1)[-1])
+
+
 class ToolTests(Integration):
     claude_timeout = 30
     """Claude reads HA through the bot's local MCP proxy (real MCP on both sides)."""
