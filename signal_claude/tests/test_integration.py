@@ -153,7 +153,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         self.tasks.append(asyncio.create_task(ha_events.listen(
             self.http, self.bot.cfg.ha_url, self.bot.cfg.ha_token, self.bot.on_ha_event,
             self.bot.trigger_since.clear)))
-        await self.until(lambda: len(self.ha.ws_subscriptions) >= subscribed + 2)
+        await self.until(lambda: len(self.ha.ws_subscriptions) >= subscribed + (2 if self.ha.ws_admin else 1))
 
     async def restart_bot(self, house=None, **overrides):
         await self.stop_bot()
@@ -1519,6 +1519,23 @@ class HaEventTests(Integration):
         await self.settle()
         self.assertEqual(len(self.dm(USER1)) + len(self.dm(USER2)), 5)
 
+    async def test_non_admin_token_keeps_state_changes_without_reconnecting(self):
+        # HA refuses custom events to non-admins: that must not cost the trigger stream.
+        self.ha.ws_admin = False
+        self.ha.states['person.anna'] = 'not_home'
+        with self.assertLogs('homebot', level='WARNING') as logs:
+            await self.listen_to_ha()
+            await asyncio.sleep(1.5)
+        self.assertEqual((self.ha.ws_auth_ok, self.ha.ws_refused), (1, 1))   # one connection, asked once
+        self.assertTrue(any('use the /notify webhook' in line for line in logs.output))
+        self.claude.spec.write_text(json.dumps({'mode': 'ok', 'output': {
+            'reply': 'ok', 'actions': [], 'tasks': [{'at': None, 'when': {'entity_id': 'person.anna', 'to': 'home'},
+                                                     'repeat': 'once', 'prompt': 'Say welcome.', 'grants': []}]}}))
+        await self.deliver(sender=USER1, text='sag bescheid wenn anna heimkommt')
+        self.claude.set(reply='Anna ist da.')
+        await self.ha.change('person.anna', 'home')
+        await self.until(lambda: self.dm(USER1)[-1].endswith('Anna ist da.'))
+
     async def test_bad_ha_token_does_not_subscribe(self):
         await self.restart_bot(ha_token='wrong')
         from bot import ha_events
@@ -1530,6 +1547,30 @@ class HaEventTests(Integration):
 
 
 class NotifyTests(Integration):
+    async def test_webhook_prompt_and_presence_targets(self):
+        await self.restart_bot(household(persons={'user1': 'person.one', 'user2': 'person.two'}))
+        self.ha.states.update({'person.one': 'home', 'person.two': 'not_home'})
+        server = aiohttp.test_utils.TestServer(self.bot.webapp())
+        await server.start_server()
+        try:
+            async def post(body):
+                async with self.http.post(str(server.make_url('/notify')), json=body,
+                                          headers={'Authorization': 'Bearer ' + 'n' * 40}) as r:
+                    return r.status, (await r.json() if r.status < 400 else await r.text())
+            self.assertEqual((await post({'target': '@away', 'message': 'Fenster offen'}))[1]['recipients'], 1)
+            self.claude.set(reply='Im Bad sind 21 °C.')
+            status, body = await post({'target': 'user1', 'prompt': 'Wie warm ist es im Bad?', 'id': 'p1'})
+            self.assertEqual((status, body['queued']), (202, True))
+            self.assertEqual((await post({'target': 'user1', 'prompt': 'Wie warm ist es im Bad?', 'id': 'p1'}))[1],
+                             {'queued': False, 'duplicate': True, 'recipients': 1})
+            await self.until(lambda: self.dm(USER1) and self.dm(USER1)[-1] == '🔔 Im Bad sind 21 °C.')
+            self.assertEqual(len(self.claude.calls), 1)
+            self.assertEqual(self.dm(USER2), ['Fenster offen'])
+            status, text = await post({'target': 'user1', 'message': 'x', 'prompt': 'y'})
+            self.assertEqual((status, text), (400, 'Provide either a message or a prompt'))
+        finally:
+            await server.close()
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.server = aiohttp.test_utils.TestServer(self.bot.webapp())

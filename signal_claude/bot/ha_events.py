@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Awaitable, Callable
 
 import aiohttp
@@ -15,6 +16,11 @@ import aiohttp
 LOG = logging.getLogger('homebot')
 NOTIFY_EVENT = 'homebot_notify'
 EVENT_TYPES = ('state_changed', NOTIFY_EVENT)
+# Home Assistant lets non-admin users subscribe only to a fixed list of
+# events (state_changed is on it, custom events are not). Losing one of these
+# is not worth the connection: the rest keeps working.
+OPTIONAL = frozenset({NOTIFY_EVENT})
+HEALTHY_SECONDS = 60  # a connection that lasted this long resets the backoff
 
 
 class AuthFailed(RuntimeError):
@@ -27,22 +33,32 @@ async def listen(http: aiohttp.ClientSession, ha_url: str, token: str,
     """Deliver HA events to ``handler`` forever, reconnecting with backoff."""
     url = ha_url.replace('https://', 'wss://', 1).replace('http://', 'ws://', 1) + '/api/websocket'
     backoff = 1
+    refused: set[str] = set()  # optional events HA won't give this user: not asked for again
     while True:
+        connected = None
         try:
             async with http.ws_connect(url, heartbeat=30, max_msg_size=16 << 20,
                                        timeout=aiohttp.ClientWSTimeout(ws_close=10)) as ws:
                 await _authenticate(ws, token)
-                for n, event_type in enumerate(event_types, 1):
+                wanted = {n: t for n, t in enumerate(event_types, 1) if t not in refused}
+                for n, event_type in wanted.items():
                     await ws.send_json({'id': n, 'type': 'subscribe_events', 'event_type': event_type})
                 LOG.info('Listening to Home Assistant events')
                 on_connect()
-                backoff = 1
+                connected = time.monotonic()
                 async for message in ws:
                     if message.type != aiohttp.WSMsgType.TEXT:
                         break
                     for item in _items(message.data):
                         if item.get('type') == 'result' and not item.get('success'):
-                            raise RuntimeError('subscription refused')
+                            event_type = wanted.get(item.get('id'))
+                            if event_type not in OPTIONAL:
+                                raise RuntimeError(f'subscription to {event_type} refused')
+                            refused.add(event_type)
+                            LOG.warning('Home Assistant does not let the ha_token user receive %s events '
+                                        '(only admins may); use the /notify webhook instead (see the docs)',
+                                        event_type)
+                            continue
                         if item.get('type') == 'event' and isinstance(item.get('event'), dict):
                             try:
                                 await handler(item['event'])
@@ -57,6 +73,8 @@ async def listen(http: aiohttp.ClientSession, ha_url: str, token: str,
             continue
         except Exception as err:
             LOG.warning('Home Assistant event stream interrupted (%s); reconnecting', type(err).__name__)
+        if connected is not None and time.monotonic() - connected >= HEALTHY_SECONDS:
+            backoff = 1
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 60)
 

@@ -1316,6 +1316,8 @@ Task prompt:
     # ------------------------------------------------------------ webhook
 
     async def notify(self, req: web.Request) -> web.Response:
+        """The webhook: the same notifications as the homebot_notify event, for
+        automations whose HA user can't send that event to the bot (non-admin)."""
         expected = f'Bearer {self.cfg.notify_token}'.encode()
         if not secrets.compare_digest(req.headers.get('Authorization', '').encode(), expected):
             raise web.HTTPUnauthorized()
@@ -1323,19 +1325,47 @@ Task prompt:
             payload = await req.json()
         except ValueError:
             raise web.HTTPBadRequest(text='Invalid JSON') from None
-        if not isinstance(payload, dict) or set(payload) - {'target', 'message', 'id'}:
-            raise web.HTTPBadRequest(text='Expected {"target", "message", optional "id"}')
-        text, target, notify_id = payload.get('message'), payload.get('target'), payload.get('id')
-        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
-            raise web.HTTPBadRequest(text='Provide a message of 1-4000 characters')
+        try:
+            outcome, recipients = await self.notification(payload)
+        except ValueError as err:
+            raise web.HTTPBadRequest(text=str(err)) from None
+        return web.json_response({'queued': outcome == 'queued', 'duplicate': outcome == 'duplicate',
+                                  'recipients': recipients},
+                                 status=202 if outcome == 'queued' else 429 if outcome == 'limited' else 200)
+
+    async def notification(self, data: object) -> tuple[str, int]:
+        """Handle {"target", "message" | "prompt", optional "id"}: a message is sent
+        as is, a prompt lets Claude write it (read-only, rate limited). Returns
+        (queued | duplicate | limited | nobody, recipients); ValueError if invalid."""
+        if not isinstance(data, dict) or set(data) - {'target', 'message', 'prompt', 'id'}:
+            raise ValueError('Expected {"target", "message" or "prompt", optional "id"}')
+        message, prompt, notify_id = data.get('message'), data.get('prompt'), data.get('id')
+        if (message is None) == (prompt is None):
+            raise ValueError('Provide either a message or a prompt')
+        text = message if message is not None else prompt
+        limit = 4000 if message is not None else 1000
+        if not isinstance(text, str) or not text.strip() or len(text) > limit:
+            raise ValueError(f'The {"message" if message is not None else "prompt"} must be 1-{limit} characters')
         if notify_id is not None and (not isinstance(notify_id, str) or not 0 < len(notify_id) <= 128):
-            raise web.HTTPBadRequest(text='id must be a string of 1-128 characters')
-        if (dests := await self.notify_dests(target)) is None:
-            raise web.HTTPBadRequest(text='Invalid target')
-        queued = self.store.notify(notify_id, dests, text, self.now())
-        self.outbox_wake.set()
-        return web.json_response({'queued': queued, 'duplicate': not queued, 'recipients': len(dests)},
-                                 status=202 if queued else 200)
+            raise ValueError('id must be a string of 1-128 characters')
+        if (dests := await self.notify_dests(data.get('target'))) is None:
+            raise ValueError('Invalid target')
+        if not dests:
+            return 'nobody', 0
+        if message is not None:
+            queued = self.store.notify(notify_id, dests, text.strip(), self.now())
+            self.outbox_wake.set()
+            return ('queued' if queued else 'duplicate'), len(dests)
+        if not self.store.claim_notify_id(notify_id, self.now()):
+            return 'duplicate', len(dests)
+        started = 0
+        for dest in dests:  # each recipient gets a message written for them
+            if not self.unattended_ok():
+                LOG.warning('Skipped a notification prompt: too many unattended runs this hour')
+                break
+            self.spawn(self.run_event(dest, text.strip()))
+            started += 1
+        return ('queued' if started else 'limited'), started
 
     async def notify_dests(self, target: object) -> list[str] | None:
         """Destinations for a notification target: a user or group name,
@@ -1441,34 +1471,14 @@ Task prompt:
         self.spawn(self.run_task(job_id, sender, dest, {**data, 'fired': fired}))
 
     async def on_notify_event(self, data: dict) -> None:
-        """An automation fired homebot_notify: {"target", "message" | "prompt", optional "id"}.
-        A message is sent as is; a prompt lets Claude write it (read-only)."""
-        message, prompt, notify_id = data.get('message'), data.get('prompt'), data.get('id')
-        dests = await self.notify_dests(data.get('target'))
-        if (set(data) - {'target', 'message', 'prompt', 'id'} or dests is None
-                or (message is None) == (prompt is None)
-                or (notify_id is not None and not (isinstance(notify_id, str) and 0 < len(notify_id) <= 128))):
-            LOG.warning('Ignored a %s event: expected a configured target, and a message or a prompt',
-                        NOTIFY_EVENT)
+        """An automation fired homebot_notify (needs an admin ha_token)."""
+        try:
+            outcome, _ = await self.notification(data)
+        except ValueError as err:
+            LOG.warning('Ignored a %s event: %s', NOTIFY_EVENT, err)
             return
-        text = message if message is not None else prompt
-        if not isinstance(text, str) or not text.strip() or len(text) > (4000 if message is not None else 1000):
-            LOG.warning('Ignored a %s event: the message or prompt is empty or too long', NOTIFY_EVENT)
-            return
-        if not dests:
+        if outcome == 'nobody':
             LOG.info('A %s event had no recipients (presence)', NOTIFY_EVENT)
-            return
-        if message is not None:
-            self.store.notify(notify_id, dests, text.strip(), self.now())
-            self.outbox_wake.set()
-            return
-        if not self.store.claim_notify_id(notify_id, self.now()):
-            return
-        for dest in dests:  # each recipient gets a message written for them
-            if not self.unattended_ok():
-                LOG.warning('Skipped a %s prompt: too many unattended runs this hour', NOTIFY_EVENT)
-                return
-            self.spawn(self.run_event(dest, text.strip()))
 
     async def run_event(self, dest: str, prompt: str) -> None:
         """Let Claude write a notification an automation asked for (no changes possible)."""

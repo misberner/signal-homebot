@@ -270,6 +270,8 @@ class FakeHomeAssistant:
         self.call_tokens: list[str] = []      # the token each service call used
         self.ws_subscriptions: list[tuple[web.WebSocketResponse, int, str]] = []
         self.ws_auth_ok = 0
+        self.ws_admin = True   # the ha_token user is an admin (may receive custom events)
+        self.ws_refused = 0
         self.screenshots = True  # ha-mcp's dashboard screenshot beta
         self.energy_prefs: dict = {'energy_sources': [], 'device_consumption': []}
         self.energy_writes = 0
@@ -330,6 +332,12 @@ class FakeHomeAssistant:
         async for message in ws:
             item = json.loads(message.data)
             if item.get('type') == 'subscribe_events':
+                # Like HA's SUBSCRIBE_ALLOWLIST: non-admins get only some events.
+                if not self.ws_admin and item.get('event_type') != 'state_changed':
+                    self.ws_refused += 1
+                    await ws.send_json({'id': item['id'], 'type': 'result', 'success': False,
+                                        'error': {'code': 'unauthorized', 'message': 'Unauthorized'}})
+                    continue
                 self.ws_subscriptions.append((ws, item['id'], item.get('event_type')))
                 await ws.send_json({'id': item['id'], 'type': 'result', 'success': True, 'result': None})
             else:

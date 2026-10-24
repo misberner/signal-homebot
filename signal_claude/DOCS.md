@@ -308,41 +308,65 @@ and is reachable only inside this container.
 
 ## Notifications from Home Assistant
 
-An automation can message a person or group through the
-`homebot_notify` event (needs `ha_token`; the bot listens for it):
+Automations message a person or group in one of two ways. Both take the same
+fields:
+
+- `target`: a person or group name from the setup page, `@everyone` (each
+  person privately), `@home` or `@away` (each person whose HA person entity
+  is or isn't `home`; set it per person under "Set presence"), or a list such
+  as `[alex, "@away"]`. Nobody matching means nothing is sent.
+- `message`: sent as is; or `prompt`: Claude writes the message, looking
+  things up with its read tools first ("Which windows are open? Say nothing
+  if none."). A prompt run can only read: no changes, tasks or reminders.
+  Triggered tasks and prompts together start Claude at most 30 times an hour.
+- `id` (optional): deduplicates retries.
+
+**With the recommended non-admin `ha_token`: the webhook.** Home Assistant
+only lets admins receive custom events, so use `rest_command`. Set
+`notify_token` in the app's Configuration (≥ 32 random characters), put the
+header value `Bearer <notify_token>` into `secrets.yaml` as
+`homebot_notify_auth`, and add (the
+hostname is on the app's Info page; `<hash>-signal-claude`):
+
+```yaml
+rest_command:
+  homebot_notify:
+    url: http://<hash>-signal-claude:8999/notify
+    method: post
+    headers:
+      Authorization: !secret homebot_notify_auth   # "Bearer <notify_token>" in secrets.yaml
+    content_type: application/json
+    payload: "{{ {'target': target, 'message': message} | to_json }}"
+```
+
+and in an automation:
+
+```yaml
+actions:
+  - action: rest_command.homebot_notify
+    data:
+      target: alex
+      message: "Waschmaschine fertig"
+```
+
+(For a prompt, add a second `rest_command` whose payload sends `prompt`.)
+The webhook answers `202` (queued), `200` with `"duplicate": true` (that `id`
+was already handled), `429` (prompt rate limit) or `400` with the reason.
+
+**With an admin `ha_token`: the `homebot_notify` event**, no extra setup:
 
 ```yaml
 actions:
   - event: homebot_notify
     event_data:
-      target: alex             # a person or group name from the setup page
+      target: alex
       message: "Waschmaschine fertig"
 ```
 
-`target` can also be `@everyone` (each person privately), `@home` or `@away`
-(each person whose HA person entity is or isn't `home`; set it per person
-on the setup page under "Set presence"), or a list such as `[alex, "@away"]`.
-Nobody matching means nothing is sent.
-
-With `prompt` instead of `message`, Claude writes the message, looking things
-up with its read tools first ("prompt: Which windows are open? Say nothing if
-none."). Such a run can only read: no changes, tasks or reminders. An
-optional `id` deduplicates. Unknown targets and other fields are ignored.
-Triggered tasks and `prompt` events together start Claude at most 30 times
-an hour.
-
-### Webhook (optional, n8n)
-
-With `notify_token` set, `POST /notify` on port 8999 of the app's internal
-network sends a message:
-
-```
-Authorization: Bearer <notify_token>
-{"target": "<person or group name>", "message": "…", "id": "optional-dedupe-key"}
-```
-
-`202` means queued; `200 {"duplicate": true}` means that `id` was already
-accepted. Use a stable `id` (e.g. the HA event id) so retries don't duplicate.
+With a non-admin token Home Assistant refuses this event to the bot (its log
+says "Refusing to allow … to subscribe to event homebot_notify"); the bot
+then logs once that it uses the webhook and keeps listening for state
+changes (triggers).
 
 ## On-device checklist
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.19.1 — 2026-10-24
+
+### Fixed
+- **Event connection loop with a non-admin `ha_token`**: Home Assistant
+  refuses the custom `homebot_notify` event to non-admin users, and the bot
+  treated that as a broken connection: it reconnected every ~1.5 s (tens of
+  thousands of "Refusing to allow … to subscribe" lines in HA's log) and
+  never received state changes, so tasks waiting for a change never fired.
+  A refused optional event is now skipped (logged once); state changes keep
+  flowing; reconnects back off properly.
+
+### Changed
+- The `/notify` webhook takes the same fields as the event (`message` or
+  `prompt`, presence targets, lists): the way to notify with a non-admin
+  token. Docs show the `rest_command` setup.
+
 ## 0.19.0 — 2026-10-23
 
 ### Added
