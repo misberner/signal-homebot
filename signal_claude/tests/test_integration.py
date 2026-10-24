@@ -122,6 +122,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
             self.households.save(house)
         connects = len(self.signal.connects)
         self.bot = HomeBot(self.config(**overrides), self.households, clock=lambda: self.now)
+        self.bot.verify_delay = 0
         self.bot.store.recover(self.bot.now())
         self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
         self.bot.http = self.http
@@ -911,8 +912,8 @@ class WriteTests(Integration):
         self.assertIn('Confirm it in your private chat', self.group()[0])
         await self.deliver(sender=USER1, text='yes')
         self.assertEqual(self.ha.calls, [('light.turn_on', {'entity_id': 'light.test_lamp'})])
-        self.assertIn('Done: light.turn_on on light.test_lamp.', self.dm(USER1))
-        self.assertIn('Done: light.turn_on on light.test_lamp.', self.group())
+        self.assertIn('✅ light.turn_on on light.test_lamp (now: on)', self.dm(USER1))
+        self.assertIn('✅ light.turn_on on light.test_lamp (now: on)', self.group())
         self.assertEqual(len(self.claude.calls), 1)  # confirmations never reach Claude
 
     async def test_reaction_confirms_exact_question(self):
@@ -1028,7 +1029,7 @@ class WriteTests(Integration):
         self.bot.update_house(self.bot.house.change(auto_approve=True))
         await self.deliver(sender=USER1, text='lamp on')
         self.assertEqual(self.ha.calls, [('light.turn_on', {'entity_id': 'light.test_lamp'})])
-        self.assertIn('Done: light.turn_on on light.test_lamp. (auto-approved: Harmlos.)', self.dm(USER1)[-1])
+        self.assertIn('✅ light.turn_on on light.test_lamp (now: on) (auto-approved: Harmlos.)', self.dm(USER1)[-1])
         self.assertEqual(len(self.questions(USER1)), 1)
         self.assertEqual(self.bot.store.action_status(1), 'succeeded')
 
@@ -1045,7 +1046,7 @@ class WriteTests(Integration):
         # allow: done without review or question.
         self.assertEqual(await self.propose(), [])
         self.assertEqual(self.ha.calls, [('light.turn_on', {'entity_id': 'light.test_lamp'})])
-        self.assertIn('(always allowed (allow light.test_lamp))', self.dm(USER1)[-1])
+        self.assertTrue(self.dm(USER1)[-1].endswith('✅ light.turn_on on light.test_lamp (now: on)'))
         self.assertEqual(self.claude.reviews, [])
         # A later deny overrides the allow.
         self.assertEqual(await self.propose(actions=[lamp_off]), [])
@@ -1082,6 +1083,37 @@ class WriteTests(Integration):
             self.assertEqual(len(self.ha.calls), 1, mode)
         statuses = [r[0] for r in self.bot.store.db.execute('SELECT status FROM actions ORDER BY id')]
         self.assertEqual(statuses, ['failed', 'unknown', 'unknown', 'unknown'])
+
+    async def test_outcome_after_confirmation_in_german(self):
+        self.ha.language, self.bot._ha_language = 'de', None
+        done = 'Die Lampe im Wohnzimmer ist an.'
+        self.claude.set(reply='', actions=[{**LAMP_ON, 'done': done}])
+        await self.deliver(sender=USER1, text='/ha lampe an')
+        # Only the question: the empty answer removes the status message, no "OK.".
+        [q] = self.dm(USER1)
+        self.assertTrue(q.startswith('Soll ich das ausführen?\nTest Lamp: light.turn_on on light.test_lamp\n'))
+        self.assertIn('„ja“', q)
+        self.assertEqual(len(self.signal.deleted), 1)
+        await self.deliver(sender=USER1, text='ja')
+        self.assertEqual(self.dm(USER1)[-1], f'✅ {done} (jetzt: an)')
+
+    async def test_done_sentence_only_when_the_device_follows(self):
+        done = 'The lamp is on.'
+        self.ha.devices_follow = False
+        await self.propose(actions=[{**LAMP_ON, 'done': done}])
+        await self.deliver(sender=USER1, text='yes')
+        self.assertEqual(self.dm(USER1)[-1],
+                         '⚠️ Home Assistant accepted light.turn_on on light.test_lamp, but it now reports: off.')
+        self.ha.mode = '400'
+        await self.propose(actions=[{**LAMP_ON, 'done': done}])
+        await self.deliver(sender=USER1, text='yes')
+        self.assertEqual(self.dm(USER1)[-1], '❌ Home Assistant did not perform light.turn_on on light.test_lamp '
+                                             '(HTTP 400).')
+        self.ha.mode, self.ha.devices_follow = 'ok', True
+        self.ha.attributes['light.test_lamp'] = {'brightness': 102}
+        await self.propose(actions=[{**LAMP_ON, 'data': {'brightness_pct': 40}, 'done': done}])
+        await self.deliver(sender=USER1, text='yes')
+        self.assertEqual(self.dm(USER1)[-1], f'✅ {done} (now: on, brightness_pct 40)')
 
     async def test_ha_unreachable_or_no_token_is_definite_failure(self):
         await self.propose()
@@ -1130,7 +1162,7 @@ class ScheduleTests(Integration):
         self.assertEqual(self.ha.calls, [])
         await self.advance(1900)
         self.assertEqual(self.ha.calls, [('light.turn_on', {'entity_id': 'light.test_lamp'})])
-        self.assertIn(f'Scheduled #{job}: Done', self.dm(USER1)[-1])
+        self.assertIn(f'Scheduled #{job}: ✅', self.dm(USER1)[-1])
         await self.advance(60)
         self.assertEqual(len(self.ha.calls), 1)
 
@@ -1219,7 +1251,7 @@ class ScheduleTests(Integration):
         self.claude.set(reply='Okay.', actions=[{**LAMP_ON, 'at': self.at(600), 'repeat': 'daily'}])
         await self.deliver(sender=USER1, text='mach jeden Tag das Licht an')
         [q] = self.questions(USER1)
-        self.assertIn(', then daily (asked here)?', q['message'])
+        self.assertIn(', then daily\n(asked here)', q['message'])
         await self.deliver(sender=USER1, text='yes')
         self.assertRegex(self.dm(USER1)[-1], r'Scheduled #\d+: .* then daily')
         await self.advance(660)

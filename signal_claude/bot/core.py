@@ -22,6 +22,7 @@ from .cards import PERIODS
 
 MAX_TEXT = 4000
 APPROVAL_TTL = 120
+MAX_DONE_TEXT = 200              # Claude's sentence for a successful action
 SCHEDULE_MAX_AHEAD = 7 * 86400   # actions/reminders may be scheduled up to a week ahead
 SCHEDULE_GRACE = 600             # a job more than 10 min overdue (bot was down) is skipped, not run late
 REMIND = 'homebot.remind'        # internal "service" for reminders: a message, never an HA call
@@ -364,7 +365,7 @@ def validate_action(action: object, rules: list[tuple[str, str]]) -> tuple[str, 
     flat service data (no extra targets). Returns (service, service_data incl.
     entity_id); ``permission()`` tells whether it still needs review.
     """
-    if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at', 'repeat'}:
+    if not isinstance(action, dict) or set(action) - {'service', 'entity_id', 'data', 'at', 'repeat', 'done'}:
         raise Denied('unexpected action fields')
     service, entity_id, data = action.get('service'), action.get('entity_id'), action.get('data') or {}
     if not isinstance(service, str) or not isinstance(entity_id, str) or not isinstance(data, dict):
@@ -388,6 +389,14 @@ def validate_action(action: object, rules: list[tuple[str, str]]) -> tuple[str, 
                                          and all(_scalar(v, 100) for v in value))):
             raise Denied(f'field "{key}" must be a simple value')
     return service, {'entity_id': entity_id, **data}
+
+
+def done_text(value: object) -> str | None:
+    """Claude's sentence for a successful action, as one short line (or None)."""
+    if not isinstance(value, str):
+        return None
+    text = ' '.join(value.split())[:MAX_DONE_TEXT]
+    return text or None
 
 
 def describe(service: str, data: dict) -> str:
@@ -548,8 +557,9 @@ def build_schema(writes: bool) -> dict:
             'data': {'type': 'object'},
             'at': {'type': ['string', 'null']},
             'repeat': {'type': 'string', 'enum': list(REPEATS)},
+            'done': {'type': 'string'},
         },
-        'required': ['service', 'entity_id', 'data'],
+        'required': ['service', 'entity_id', 'data', 'done'],
         'additionalProperties': False,
     }
     actions = {'type': 'array', 'items': item, 'maxItems': 3 if writes else 0}
@@ -717,7 +727,7 @@ def _check_output(obj: dict) -> dict:
 
 # ---------------------------------------------------------------- storage
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class Store:
@@ -778,6 +788,8 @@ class Store:
                               ('outbox', 'delete_ts INTEGER'),
                               # v7: what the pictures showed, for the history (e.g. which card).
                               ('outbox', 'history_note TEXT'),
+                              # v8: Claude's sentence for the action's success ("done").
+                              ('approvals', 'done_text TEXT'), ('actions', 'done_text TEXT'),
                               # v4: repeating scheduled actions ('once', 'daily', ...).
                               ('approvals', 'repeat TEXT'), ('actions', 'repeat TEXT')):
             have = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
@@ -816,12 +828,18 @@ class Store:
     def finish_job(self, msg: Incoming, outgoing: list[tuple[str, str]], now: int,
                    edit_ts: int | None = None) -> None:
         """Mark the request done and queue its replies; the first reply to the
-        request's chat replaces the status message ``edit_ts`` if given."""
+        request's chat replaces the status message ``edit_ts`` if given (an
+        empty one deletes it)."""
         with self._tx():
             self.db.execute("UPDATE jobs SET status='done' WHERE conv=? AND sender=? AND timestamp=?",
                             (msg.conv, msg.sender, msg.timestamp))
             if edit_ts and outgoing and outgoing[0][0] == msg.conv:
-                self._enqueue(outgoing[:1], now, edit_ts=edit_ts)
+                first = outgoing[0]
+                if first[1].strip() or (len(first) > 2 and first[2]):
+                    self._enqueue(outgoing[:1], now, edit_ts=edit_ts)
+                else:  # an empty answer: just remove the status message
+                    self.db.execute("INSERT INTO outbox(dest,text,created_at,next_attempt,delete_ts) "
+                                    "VALUES(?,'',?,?,?)", (msg.conv, now, now, edit_ts))
                 outgoing = outgoing[1:]
             self._enqueue(outgoing, now)
 
@@ -878,13 +896,14 @@ class Store:
     # -- approvals and the action journal ---------------------------------
 
     def add_approval(self, code: str, sender: str, request_conv: str, service: str,
-                     data: dict, now: int, prompt: str, run_at: int | None = None, repeat: str = 'once') -> None:
+                     data: dict, now: int, prompt: str, run_at: int | None = None, repeat: str = 'once',
+                     done: str | None = None) -> None:
         """Record a pending approval and queue its private DM atomically."""
         with self._tx():
             self.db.execute('INSERT INTO approvals(code,sender,request_conv,service,data_json,created_at,'
-                            'expires_at,status,run_at,repeat) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                            'expires_at,status,run_at,repeat,done_text) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                             (code, sender, request_conv, service, json.dumps(data),
-                             now, now + APPROVAL_TTL, 'pending', run_at, repeat))
+                             now, now + APPROVAL_TTL, 'pending', run_at, repeat, done))
             self._enqueue([(f'dm:{sender}', prompt)], now, approval_code=code)
 
     PROMPT_AMBIGUOUS = 'ambiguous'
@@ -918,7 +937,7 @@ class Store:
         Returns (action_id, request_conv, service, data, run_at) or None.
         """
         with self._tx():
-            row = self.db.execute("SELECT request_conv,service,data_json,run_at,repeat FROM approvals "
+            row = self.db.execute("SELECT request_conv,service,data_json,run_at,repeat,done_text FROM approvals "
                                   "WHERE code=? AND sender=? AND status='pending' AND expires_at>?",
                                   (code, sender, now)).fetchone()
             if not row:
@@ -926,28 +945,29 @@ class Store:
             self.db.execute("UPDATE approvals SET status='consumed' WHERE code=?", (code,))
             later = row[3] or row[1] == TASK  # a time, or a task waiting for its trigger
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,"
-                                  "data_json,status,created_at,run_at,repeat) VALUES(?,?,?,?,?,?,?,?,?)",
+                                  "data_json,status,created_at,run_at,repeat,done_text) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                   (code, sender, row[0], row[1], row[2],
-                                   'scheduled' if later else 'executing', now, row[3], row[4] or 'once'))
+                                   'scheduled' if later else 'executing', now, row[3], row[4] or 'once', row[5]))
             return cur.lastrowid, row[0], row[1], json.loads(row[2]), row[3]
 
-    def add_action(self, sender: str, request_conv: str, service: str, data: dict, now: int) -> int:
+    def add_action(self, sender: str, request_conv: str, service: str, data: dict, now: int,
+                   done: str | None = None) -> int:
         """Journal an auto-approved action as executing (no confirmation step)."""
         with self._tx():
             return self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
-                                   "status,created_at) VALUES(?,?,?,?,?,'executing',?)",
+                                   "status,created_at,done_text) VALUES(?,?,?,?,?,'executing',?,?)",
                                    (f'auto-{now}-{os.urandom(6).hex()}', sender, request_conv, service,
-                                    json.dumps(data), now)).lastrowid
+                                    json.dumps(data), now, done)).lastrowid
 
     def add_scheduled(self, sender: str, request_conv: str, service: str, data: dict,
-                      run_at: int | None, now: int, repeat: str = 'once') -> int:
+                      run_at: int | None, now: int, repeat: str = 'once', done: str | None = None) -> int:
         """A job that needs no (further) confirmation: reminders, tasks, auto-approved
         actions. A task without run_at waits for its state trigger."""
         with self._tx():
             cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
-                                  "status,created_at,run_at,repeat) VALUES(?,?,?,?,?,'scheduled',?,?,?)",
+                                  "status,created_at,run_at,repeat,done_text) VALUES(?,?,?,?,?,'scheduled',?,?,?,?)",
                                   (f'job-{now}-{os.urandom(6).hex()}', sender, request_conv, service,
-                                   json.dumps(data), now, run_at, repeat))
+                                   json.dumps(data), now, run_at, repeat, done))
             return cur.lastrowid
 
     def scheduled(self, sender: str | None = None) -> list[tuple[int, str, str, str, dict, int | None]]:
@@ -957,6 +977,10 @@ class Store:
         rows = self.db.execute(query + (' AND sender=?' if sender else '') + ' ORDER BY run_at IS NULL, run_at, id',
                                (sender,) if sender else ()).fetchall()
         return [(i, s, c, svc, json.loads(d), r) for i, s, c, svc, d, r in rows]
+
+    def done_text(self, action_id: int) -> str | None:
+        row = self.db.execute('SELECT done_text FROM actions WHERE id=?', (action_id,)).fetchone()
+        return row[0] if row else None
 
     def repeat_of(self, action_id: int) -> str:
         """How a job repeats: a task's own setting, else the action's column."""
@@ -999,11 +1023,11 @@ class Store:
     def _repeat_task(self, action_id: int, now: int) -> int | None:
         """Schedule the next run of a repeating task or action (a confirmed
         action keeps its confirmation for the whole series)."""
-        row = self.db.execute('SELECT sender,request_conv,service,data_json,run_at,repeat FROM actions '
+        row = self.db.execute('SELECT sender,request_conv,service,data_json,run_at,repeat,done_text FROM actions '
                               'WHERE id=?', (action_id,)).fetchone()
         if not row:
             return None
-        sender, conv, service, data_json, run_at, repeat = row
+        sender, conv, service, data_json, run_at, repeat, done = row
         data = json.loads(data_json)
         if run_at is None:  # a triggered task: wait for the next time, after a pause
             if service != TASK or not data.get('trigger') or data.get('repeat') != 'always':
@@ -1017,9 +1041,9 @@ class Store:
         if when is None:
             return None
         cur = self.db.execute("INSERT INTO actions(approval_code,sender,request_conv,service,data_json,"
-                              "status,created_at,run_at,repeat) VALUES(?,?,?,?,?,'scheduled',?,?,?)",
+                              "status,created_at,run_at,repeat,done_text) VALUES(?,?,?,?,?,'scheduled',?,?,?,?)",
                               (f'job-{now}-{os.urandom(6).hex()}', sender, conv, service, data_json, now, when,
-                               repeat))
+                               repeat, done))
         return cur.lastrowid
 
     def cancel_scheduled(self, action_id: int, sender: str, now: int) -> bool:

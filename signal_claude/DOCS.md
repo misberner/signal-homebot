@@ -133,12 +133,12 @@ these checks:
    the request, the exact call and the entity's current state, and decides:
    - **deny**: the bot says why and does nothing;
    - **ask**: the bot asks the person who asked, in their private chat:
-     "Shall I light.turn_on on light.kitchen (brightness_pct=40)?" plus the
-     reviewer's note. Answer "yes" (or "ja", "ok", 👍), react 👍, or "no" /
+     "Shall I do this? Kitchen: light.turn_on on light.kitchen
+     (brightness_pct=40)" plus the reviewer's note. Answer "yes" (or "ja", "ok", 👍), react 👍, or "no" /
      👎. With several open questions, reply to the one you mean. Questions
      expire after 2 minutes and work once; nobody else can answer them;
    - **allow**: with **Auto mode** on, the bot does it right away and says
-     "Done: … (auto-approved: …)"; with Auto mode off it asks like above.
+     "✅ … (auto-approved: …)"; with Auto mode off it asks like above.
 
 Claude also sees your rules, so it proposes what fits them. The switch, the
 user and the permission list are checked again when a confirmed or scheduled
@@ -183,9 +183,23 @@ cancelling a repeating task stops the series. `/scheduled` lists your pending it
 durably, not by Claude: Claude Code's own scheduling only lives as long as
 one Claude process, and the bot starts a fresh one per message.
 
-Outcomes: **Done**, **did not perform** (HA rejected the call or was
-unreachable), or **UNKNOWN** (timeout, server error, restart mid-call).
-Unknown outcomes are reported and never retried.
+Outcomes are reported by the bot after the call, not guessed in advance:
+
+- **✅ done**: Home Assistant accepted the call. The message is a sentence
+  Claude wrote with the proposal ("The kitchen light is on, 40 %."), used only
+  now, followed by what the entity reports two seconds later, read back by
+  the bot: "(now: on, brightness_pct 40)". If a light, switch, fan, cover,
+  humidifier or helper plainly didn't follow (still off after turn_on, or
+  unavailable), you get "⚠️ Home Assistant accepted …, but it now reports: off"
+  instead.
+- **❌ did not perform**: HA rejected the call or was unreachable.
+- **⚠️ UNKNOWN**: timeout, server error, restart mid-call. Never retried.
+
+Failures are always the bot's own fixed text, never Claude's. Claude's
+answer doesn't talk about the action at all; if there is nothing else to
+say, you only get the question (or the result). The bot's own texts around
+actions are in German when Home Assistant's language is German, otherwise
+English.
 
 ## Trusted accounts
 

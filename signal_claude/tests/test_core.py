@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from bot.core import (Store, Incoming, Reaction, RemoteDelete, Settings, Denied, ClaudeError, addressed,
+from bot.core import (done_text, MAX_DONE_TEXT, Store, Incoming, Reaction, RemoteDelete, Settings, Denied, ClaudeError, addressed,
                       freshness, parse_signal_event, load_permissions, permission, validate_action, describe,
                       build_schema, parse_claude_output, parse_verdict, render_overview, ha_mcp_overview_args,
                       identity_trusted, group_roster_problem, APPROVAL_TTL)
@@ -168,6 +168,9 @@ class PolicyTests(unittest.TestCase):
                          ('light.turn_on', {'entity_id': 'light.kitchen', 'brightness_pct': 40,
                                             'color_name': 'warm white', 'flash': False, 'rgb_color': [255, 0, 0]}))
         self.assertEqual(validate_action({**good, 'data': {}}, [])[1], {'entity_id': 'light.kitchen'})
+        # The success sentence is for the user, never part of the service call.
+        self.assertEqual(validate_action({**good, 'data': {}, 'done': 'Licht an.'}, [])[1],
+                         {'entity_id': 'light.kitchen'})
         heater = {'service': 'water_heater.set_operation_mode', 'entity_id': 'water_heater.dhw',
                   'data': {'operation_mode': 'Manual'}, 'at': None}
         self.assertEqual(validate_action(heater, [])[0], 'water_heater.set_operation_mode')
@@ -372,6 +375,19 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.db.find_approval(USER1, self.now + APPROVAL_TTL))
         self.assertTrue(self.db.seen('dm:x', USER1, 1, self.now))
         self.assertFalse(self.db.seen('dm:x', USER1, 1, self.now))
+
+    def test_done_sentence_travels_with_the_action(self):
+        data = {'entity_id': 'light.test_lamp'}
+        self.db.add_approval('code', USER1, 'dm:' + USER1, 'light.turn_on', data, self.now, 'Shall I',
+                             self.now + 600, 'daily', 'The lamp is on.')
+        action_id = self.db.consume_approval('code', USER1, self.now)[0]
+        self.assertEqual(self.db.done_text(action_id), 'The lamp is on.')
+        nxt = self.db.repeat_task(action_id, self.now + 700)
+        self.assertEqual(self.db.done_text(nxt), 'The lamp is on.')  # every repeat says the same
+        self.assertEqual(done_text('  a\nb  '), 'a b')
+        self.assertIsNone(done_text(''))
+        self.assertIsNone(done_text(None))
+        self.assertEqual(len(done_text('x' * 999)), MAX_DONE_TEXT)
 
     def test_approval_bound_single_use_and_expiring(self):
         data = {'entity_id': 'light.test_lamp'}

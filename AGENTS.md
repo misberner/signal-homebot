@@ -23,6 +23,9 @@ This repository is an agent connected to **physical home devices**.
   only if an admin `allow` rule matches, the admin enabled Auto mode and the
   reviewer said "allow", or the user confirmed it once (repeating action, task
   grant); any reviewer failure means "ask". Never retry an `unknown` HA action.
+- Outcomes are reported by the bot after the call (`bot/texts.py`): Claude's
+  "done" sentence only for a success, plus the state read back; failed and
+  unknown outcomes are always the bot's own fixed text.
 - Claude reads HA only through the bot's local MCP proxy (`bot/ha_tools.py`):
   a fixed list of read tools with constrained arguments, a per-request token,
   and an upstream read-only check. Never expose write tools or HA credentials

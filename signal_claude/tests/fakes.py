@@ -255,6 +255,8 @@ class FakeHomeAssistant:
         self.live_text = live_text
         self.calls: list[tuple[str, dict]] = []
         self.mode = 'ok'  # ok | 400 | 500 | slow | drop
+        self.devices_follow = True  # turn_on/turn_off change the state, as a working device would
+        self.language = None  # Home Assistant's /api/config language
         self.mcp_calls: list[str] = []
         self.mcp_args: list[dict] = []
         self.mcp_auth_headers: list[str | None] = []
@@ -297,6 +299,7 @@ class FakeHomeAssistant:
         app.router.add_post('/api/services/{domain}/{service}', self.service)
         app.router.add_get('/api/image_proxy/{entity_id}', self.image_proxy)
         app.router.add_get('/api/states/{entity_id}', self.state)
+        app.router.add_get('/api/config', self.config)
         app.router.add_get('/api/websocket', self.websocket)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
@@ -385,7 +388,15 @@ class FakeHomeAssistant:
             await asyncio.sleep(1)
         if self.mode in ('400', '500'):
             return web.Response(status=int(self.mode))
+        entity_id = self.calls[-1][1].get('entity_id')
+        if self.devices_follow and entity_id in self.states and name.endswith(('.turn_on', '.turn_off')):
+            self.states[entity_id] = name.rsplit('_', 1)[1]  # the device does what it was told
         return web.json_response([])
+
+    async def config(self, req: web.Request) -> web.Response:
+        if req.headers.get('Authorization') != f'Bearer {self.token}':
+            return web.Response(status=401)
+        return web.json_response({'language': self.language, 'version': '2026.10.0'})
 
 
 def _start_mcp(read_only: bool) -> str:

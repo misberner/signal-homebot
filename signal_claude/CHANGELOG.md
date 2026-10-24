@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.20.0 — 2026-10-24
+
+### Changed
+- **Results instead of "you'll see whether it worked"**: Claude used to
+  write its answer before the bot had checked, asked about or run the
+  action, so it could only hedge. Now Claude's answer leaves the action out;
+  each proposed action carries a sentence for its success ("Die Lampe ist
+  an."), which the bot sends only after Home Assistant accepted the call,
+  followed by the state it reads back two seconds later ("(jetzt: an,
+  brightness_pct 40)"). A device that plainly didn't follow gets a warning
+  instead; failures and unknown outcomes stay the bot's own fixed texts.
+- Confirmation questions name the device ("Soll ich das ausführen? Lampe
+  Wohnzimmer: light.turn_on …"); in a private chat no extra "waiting for your
+  yes" line, and an answer with nothing else to say just removes the status
+  message.
+- The bot's texts around actions (questions, results, cancelled/expired)
+  follow Home Assistant's language: German or English.
+
 ## 0.19.1 — 2026-10-24
 
 ### Fixed
